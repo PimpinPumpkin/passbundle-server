@@ -10,6 +10,11 @@
 // key: the member waits to be confirmed, which the MSP console does. A client
 // can limit the command to accounts at its email domains, and its own owners
 // get an email about each join. See DESIGN.md, "Onboarding through the RMM".
+//
+// A company with its own IT has the same install command for its own
+// organization, managed by its owners and admins in the admin console. An
+// MSP's client's command stays in the MSP's console, where technicians' access
+// to it is decided. See DESIGN.md, "A company's own IT".
 
 use rocket::{Route, serde::json::Json};
 
@@ -21,19 +26,28 @@ use crate::{
     db::{
         DbConn,
         models::{
-            CollectionUser, EnrollmentDomains, Membership, MembershipStatus, MembershipType, MspClient,
-            MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, Organization, OrganizationId, User,
-            effective_joining, email_in_domains, parse_enrollment_domains,
+            CollectionId, CollectionUser, EnrollmentDomains, Membership, MembershipStatus, MembershipType, Msp,
+            MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
+            OrganizationId, User, effective_joining, email_in_domains, parse_enrollment_domains,
         },
     },
     mail,
 };
 
 pub fn routes() -> Vec<Route> {
-    routes![get_enrollment, replace_enrollment, set_enrollment_domains, enrollment_info, join]
+    routes![
+        get_enrollment,
+        replace_enrollment,
+        set_enrollment_domains,
+        get_org_enrollment,
+        replace_org_enrollment,
+        set_org_enrollment_domains,
+        enrollment_info,
+        join
+    ]
 }
 
-const INVALID_TOKEN: &str = "This install link isn't valid anymore. Ask your IT provider for a new one.";
+const INVALID_TOKEN: &str = "This install link isn't valid anymore. Ask your IT team for a new one.";
 
 /// One of this MSP's clients, or "not found".
 async fn msp_client(msp_id: &MspId, org_id: &OrganizationId, conn: &DbConn) -> Result<MspClient, crate::error::Error> {
@@ -44,12 +58,41 @@ async fn msp_client(msp_id: &MspId, org_id: &OrganizationId, conn: &DbConn) -> R
 }
 
 async fn enrollment_json(client: &MspClient, conn: &DbConn) -> serde_json::Value {
+    install_json(&client.org_uuid, client.enrollment_token.as_ref(), client.enrollment_token_created_at.as_ref(), conn)
+        .await
+}
+
+async fn install_json(
+    org_id: &OrganizationId,
+    token: Option<&String>,
+    created_at: Option<&chrono::NaiveDateTime>,
+    conn: &DbConn,
+) -> serde_json::Value {
     json!({
-        "token": client.enrollment_token,
-        "createdAt": client.enrollment_token_created_at.as_ref().map(crate::util::format_date),
-        "joins": MspEnrollmentJoin::count_by_org(&client.org_uuid, conn).await,
-        "domains": EnrollmentDomains::for_org(&client.org_uuid, conn).await,
+        "token": token,
+        "createdAt": created_at.map(crate::util::format_date),
+        "joins": MspEnrollmentJoin::count_by_org(org_id, conn).await,
+        "domains": EnrollmentDomains::for_org(org_id, conn).await,
     })
+}
+
+/// Saves a list of email domains for an organization's install command, or
+/// clears it. The limit trusts an account's email only once it's verified, so
+/// it needs a server that sends email.
+async fn save_domains(
+    org_id: &OrganizationId,
+    domains: &[String],
+    conn: &DbConn,
+) -> Result<Vec<String>, crate::error::Error> {
+    let domains = match parse_enrollment_domains(domains) {
+        Ok(domains) => domains,
+        Err(e) => err!(e),
+    };
+    if !domains.is_empty() && !CONFIG.mail_enabled() {
+        err!("Limiting the install command to email domains needs verified emails, and this server can't send email")
+    }
+    EnrollmentDomains::set(org_id, &domains, conn).await?;
+    Ok(domains)
 }
 
 /// A client's enrollment token, for its install command. MSP admins, and
@@ -101,14 +144,7 @@ async fn set_enrollment_domains(
 ) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let client = msp_client(&msp_id, &org_id, &conn).await?;
-    let domains = match parse_enrollment_domains(&data.domains) {
-        Ok(domains) => domains,
-        Err(e) => err!(e),
-    };
-    if !domains.is_empty() && !CONFIG.mail_enabled() {
-        err!("Limiting the install command to email domains needs verified emails, and this server can't send email")
-    }
-    EnrollmentDomains::set(&org_id, &domains, &conn).await?;
+    let domains = save_domains(&org_id, &data.domains, &conn).await?;
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
     Audit::by("install_domains_set", &headers)
         .org(&org_id, &org_name)
@@ -116,6 +152,136 @@ async fn set_enrollment_domains(
         .record(&msp_id, &conn)
         .await?;
     Ok(Json(enrollment_json(&client, &conn).await))
+}
+
+/// An owner or admin of a company's own organization, managing its install
+/// command. An MSP's client's command is in the MSP's console instead, so its
+/// technicians' access to it holds: they're admins in the client too.
+async fn own_org_admin(
+    org_id: &OrganizationId,
+    headers: &Headers,
+    conn: &DbConn,
+) -> Result<OrgSetupOrNew, crate::error::Error> {
+    let Some(caller) = Membership::find_confirmed_by_user_and_org(&headers.user.uuid, org_id, conn).await else {
+        err_code!("Organization not found", rocket::http::Status::NotFound.code)
+    };
+    if caller.atype != MembershipType::Owner as i32 && caller.atype != MembershipType::Admin as i32 {
+        err_code!("Only owners and admins can manage the install command", rocket::http::Status::Forbidden.code)
+    }
+    if MspClient::find_by_org(org_id, conn).await.is_some() {
+        err_code!(
+            "This organization's IT provider manages its install command, in their MSP console",
+            rocket::http::Status::Forbidden.code
+        )
+    }
+    Ok(match OrgSetup::find_by_org(org_id, conn).await {
+        Some(setup) => OrgSetupOrNew::Saved(setup),
+        None => OrgSetupOrNew::New(OrgSetup::new(org_id.clone(), None, None, false)),
+    })
+}
+
+/// An organization's setup, or a new one not saved yet: an organization made
+/// before PassBundle kept setups, or without a preset, has none until its
+/// first install command.
+enum OrgSetupOrNew {
+    Saved(OrgSetup),
+    New(OrgSetup),
+}
+
+impl OrgSetupOrNew {
+    fn setup(&self) -> &OrgSetup {
+        match self {
+            Self::Saved(setup) | Self::New(setup) => setup,
+        }
+    }
+}
+
+/// A company's own organization's install command, for its owners and admins.
+/// For an MSP's client, only who manages it. The web vault reads this on every
+/// Settings page and signs out on 403, so refusals here are "not found", and an
+/// MSP's client gets an answer rather than a refusal.
+#[get("/keykeeper/organizations/<org_id>/enrollment")]
+async fn get_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+    let caller = Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, &conn).await;
+    if !caller.is_some_and(|c| c.atype == MembershipType::Owner as i32 || c.atype == MembershipType::Admin as i32) {
+        err_code!("Organization not found", rocket::http::Status::NotFound.code)
+    }
+    if let Some(client) = MspClient::find_by_org(&org_id, &conn).await {
+        let provider = Msp::find_by_uuid(&client.msp_uuid, &conn).await.map(|m| m.name).unwrap_or_default();
+        return Ok(Json(json!({ "provider": provider })));
+    }
+    let setup = OrgSetup::find_by_org(&org_id, &conn).await;
+    let setup = setup.as_ref();
+    Ok(Json(
+        install_json(
+            &org_id,
+            setup.and_then(|s| s.enrollment_token.as_ref()),
+            setup.and_then(|s| s.enrollment_token_created_at.as_ref()),
+            &conn,
+        )
+        .await,
+    ))
+}
+
+/// Makes a company's own organization's install command, or replaces it:
+/// commands with the old token stop letting new people join. Owners and admins.
+#[post("/keykeeper/organizations/<org_id>/enrollment")]
+async fn replace_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+    let setup = match own_org_admin(&org_id, &headers, &conn).await? {
+        OrgSetupOrNew::Saved(mut setup) => {
+            setup.replace_enrollment_token(&conn).await?;
+            setup
+        }
+        OrgSetupOrNew::New(_) => {
+            let setup = OrgSetup::new(org_id.clone(), None, None, true);
+            setup.insert(&conn).await?;
+            setup
+        }
+    };
+    Ok(Json(
+        install_json(&org_id, setup.enrollment_token.as_ref(), setup.enrollment_token_created_at.as_ref(), &conn).await,
+    ))
+}
+
+/// Limits a company's own organization's install command to accounts at these
+/// email domains, or with none, lets anyone with the command join again.
+/// Owners and admins.
+#[put("/keykeeper/organizations/<org_id>/enrollment/domains", data = "<data>")]
+async fn set_org_enrollment_domains(
+    org_id: OrganizationId,
+    data: Json<DomainsData>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    let found = own_org_admin(&org_id, &headers, &conn).await?;
+    save_domains(&org_id, &data.domains, &conn).await?;
+    let setup = found.setup();
+    Ok(Json(
+        install_json(&org_id, setup.enrollment_token.as_ref(), setup.enrollment_token_created_at.as_ref(), &conn).await,
+    ))
+}
+
+/// What an install command joins: one of an MSP's clients, or a company's own
+/// organization.
+struct Target {
+    org_uuid: OrganizationId,
+    everyone_collection: Option<CollectionId>,
+    msp_uuid: Option<MspId>,
+}
+
+async fn target_by_token(token: &str, conn: &DbConn) -> Option<Target> {
+    if let Some(client) = MspClient::find_by_enrollment_token(token, conn).await {
+        return Some(Target {
+            org_uuid: client.org_uuid,
+            everyone_collection: client.everyone_collection,
+            msp_uuid: Some(client.msp_uuid),
+        });
+    }
+    OrgSetup::find_by_enrollment_token(token, conn).await.map(|setup| Target {
+        org_uuid: setup.org_uuid,
+        everyone_collection: setup.everyone_collection,
+        msp_uuid: None,
+    })
 }
 
 /// Refuses an account outside a client's email domains, or one whose email
@@ -155,10 +321,10 @@ struct EnrollmentTokenData {
 /// public key is for account recovery enrollment.
 #[post("/keykeeper/enrollment/info", data = "<data>")]
 async fn enrollment_info(data: Json<EnrollmentTokenData>, headers: Headers, conn: DbConn) -> JsonResult {
-    let Some(client) = MspClient::find_by_enrollment_token(&data.token, &conn).await else {
+    let Some(target) = target_by_token(&data.token, &conn).await else {
         err_code!(INVALID_TOKEN, rocket::http::Status::NotFound.code)
     };
-    let Some(org) = Organization::find_by_uuid(&client.org_uuid, &conn).await else {
+    let Some(org) = Organization::find_by_uuid(&target.org_uuid, &conn).await else {
         err_code!(INVALID_TOKEN, rocket::http::Status::NotFound.code)
     };
     // Said here too, so the extension says why before it does any work.
@@ -188,10 +354,10 @@ struct JoinData {
 #[post("/keykeeper/enrollment/join", data = "<data>")]
 async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data = data.into_inner();
-    let Some(client) = MspClient::find_by_enrollment_token(&data.token, &conn).await else {
+    let Some(target) = target_by_token(&data.token, &conn).await else {
         err_code!(INVALID_TOKEN, rocket::http::Status::NotFound.code)
     };
-    let Some(org) = Organization::find_by_uuid(&client.org_uuid, &conn).await else {
+    let Some(org) = Organization::find_by_uuid(&target.org_uuid, &conn).await else {
         err_code!(INVALID_TOKEN, rocket::http::Status::NotFound.code)
     };
     let joined =
@@ -229,16 +395,18 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
     let invited_by = member.invited_by_email.clone();
     super::accept_org_invite(&headers.user, member, reset_password_key, false, &conn).await?;
 
-    if let Some(collection) = &client.everyone_collection {
+    if let Some(collection) = &target.everyone_collection {
         CollectionUser::save(&headers.user.uuid, collection, false, false, false, &conn).await?;
     }
     MspEnrollmentJoin::new(member_id, org.uuid.clone()).insert(&conn).await?;
-    Audit::by("joined_with_install_command", &headers)
-        .org(&org.uuid, &org.name)
-        .target(&headers.user.email)
-        .record(&client.msp_uuid, &conn)
-        .await?;
-    tell_owners(&headers.user, &org, invited_by, &conn).await;
+    if let Some(msp_id) = &target.msp_uuid {
+        Audit::by("joined_with_install_command", &headers)
+            .org(&org.uuid, &org.name)
+            .target(&headers.user.email)
+            .record(msp_id, &conn)
+            .await?;
+    }
+    tell_owners(&headers.user, &org, invited_by, target.msp_uuid.is_some(), &conn).await;
 
     Ok(joined(MembershipStatus::Accepted as i32))
 }
@@ -247,8 +415,9 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
 /// with nobody clicking Confirm by default, this is how they hear of it. Its
 /// MSP's people aren't emailed, since a rollout would mean one email per
 /// machine; the console's Activity has every join. Someone who was invited by
-/// email is the inviter's to hear about, as for any invitation.
-async fn tell_owners(user: &User, org: &Organization, invited_by: Option<String>, conn: &DbConn) {
+/// email is the inviter's to hear about, as for any invitation. `provider`
+/// says the command was an MSP's rather than the company's own.
+async fn tell_owners(user: &User, org: &Organization, invited_by: Option<String>, provider: bool, conn: &DbConn) {
     if !CONFIG.mail_enabled() {
         return;
     }
@@ -270,7 +439,9 @@ async fn tell_owners(user: &User, org: &Organization, invited_by: Option<String>
         }
     }
     for address in to {
-        if let Err(e) = mail::send_member_joined(&address, &user.email, &org.name, &org.uuid, true, approve).await {
+        if let Err(e) =
+            mail::send_member_joined(&address, &user.email, &org.name, &org.uuid, true, provider, approve).await
+        {
             error!("Error sending the join email for {}: {e:#?}", org.name);
         }
     }
