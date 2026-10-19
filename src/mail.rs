@@ -393,6 +393,7 @@ pub async fn send_member_joined(
     org_name: &str,
     org_id: &OrganizationId,
     install: bool,
+    provider: bool,
     approve: bool,
 ) -> EmptyResult {
     let (subject, body_html, body_text) = get_text(
@@ -403,6 +404,7 @@ pub async fn send_member_joined(
             "email": new_user_email,
             "org_name": org_name,
             "install": install,
+            "provider": provider,
             "approve": approve,
         }),
     )?;

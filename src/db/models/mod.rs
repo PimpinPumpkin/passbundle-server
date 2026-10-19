@@ -12,6 +12,7 @@ mod group;
 // Keykeeper
 mod keykeeper_joining;
 mod keykeeper_msp;
+mod keykeeper_orgs;
 pub mod keykeeper_roles;
 mod org_policy;
 mod organization;
@@ -41,6 +42,7 @@ pub use self::keykeeper_msp::{
     MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains, exempt_from_member_policies,
     parse_enrollment_domains,
 };
+pub use self::keykeeper_orgs::OrgSetup;
 pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
 pub use self::organization::{
     Membership, MembershipId, MembershipStatus, MembershipType, OrgApiKeyId, Organization, OrganizationApiKey,

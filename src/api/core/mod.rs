@@ -11,6 +11,7 @@ mod keykeeper_joining;
 mod keykeeper_msp;
 mod keykeeper_msp_policies;
 mod keykeeper_msp_templates;
+mod keykeeper_orgs;
 mod organizations;
 mod public;
 mod sends;
@@ -55,6 +56,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_msp_policies::routes());
     routes.append(&mut keykeeper_msp_templates::routes());
     routes.append(&mut keykeeper_enrollment::routes());
+    routes.append(&mut keykeeper_orgs::routes());
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
     routes.append(&mut public::routes());
@@ -318,7 +320,7 @@ async fn accept_org_invite(
         // Keykeeper: where joining is automatic, nobody confirms them, so the
         // inviter hears that they're in. See DESIGN.md, "Joining".
         if crate::db::models::effective_joining(&org.uuid, conn).await.0.auto_confirm {
-            mail::send_member_joined(&inviter, &user.email, &org.name, &org.uuid, false, false).await?;
+            mail::send_member_joined(&inviter, &user.email, &org.name, &org.uuid, false, false, false).await?;
         } else {
             // User was invited to an organization, so they must be confirmed manually after acceptance
             mail::send_invite_accepted(&user.email, &inviter, &org.name).await?;

@@ -26,8 +26,8 @@ use crate::{
         DbConn,
         models::{
             Collection, Membership, MembershipId, MembershipStatus, MembershipType, Msp, MspClient, MspEvent, MspId,
-            MspInvite, MspMembership, MspRole, MspStaff, Organization, OrganizationId, TechnicianAccess, User, UserId,
-            effective_joining,
+            MspInvite, MspMembership, MspRole, MspStaff, OrgSetup, Organization, OrganizationId, TechnicianAccess,
+            User, UserId, effective_joining,
             keykeeper_roles::{self, CustomPermissions, Permission},
         },
     },
@@ -55,7 +55,7 @@ pub fn routes() -> Vec<Route> {
 
 const MAX_NAME_LENGTH: usize = 100;
 
-fn clean_name(name: &str) -> Result<String, crate::error::Error> {
+pub(super) fn clean_name(name: &str) -> Result<String, crate::error::Error> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > MAX_NAME_LENGTH {
         err!(format!("Name must be 1 to {MAX_NAME_LENGTH} characters"))
@@ -1050,6 +1050,14 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
         }
     }
     let msp_id = client.msp_uuid.clone();
+    // The organization keeps its preset and the collection people who join
+    // get, as a company's own. Not the install command: its token was the
+    // MSP's, so the owners make a new one in the admin console.
+    if OrgSetup::find_by_org(&org_id, &conn).await.is_none() {
+        OrgSetup::new(org_id.clone(), client.preset.clone(), client.everyone_collection.clone(), false)
+            .insert(&conn)
+            .await?;
+    }
     client.delete(&conn).await?;
     // The MSP keeps a record that the client removed it.
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();

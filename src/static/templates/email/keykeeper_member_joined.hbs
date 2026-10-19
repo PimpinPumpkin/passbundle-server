@@ -1,6 +1,6 @@
 {{#if approve}}{{email}} is waiting to join {{{org_name}}}{{else}}{{email}} joined {{{org_name}}}{{/if}}
 <!---------------->
-{{#if install}}{{email}} {{#if approve}}asked to join{{else}}joined{{/if}} {{org_name}} with your IT provider's install command.{{else}}{{email}} accepted your invitation and joined {{org_name}}.{{/if}}
+{{#if install}}{{email}} {{#if approve}}asked to join{{else}}joined{{/if}} {{org_name}} with {{#if provider}}your IT provider's{{else}}your{{/if}} install command.{{else}}{{email}} accepted your invitation and joined {{org_name}}.{{/if}}
 
 
 {{#if approve}}They get access once an admin approves them on the Members page: {{{url}}}{{else}}They get access without anyone confirming them. If you don't know who that is, remove them on the Members page: {{{url}}}{{/if}}

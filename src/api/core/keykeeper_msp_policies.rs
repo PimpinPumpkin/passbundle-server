@@ -231,6 +231,22 @@ pub(super) async fn apply_defaults_to_new_client(
     Ok(())
 }
 
+/// Gives a company's own new organization the Business preset, through
+/// upstream's own policy code, as if the caller had saved each policy in the
+/// admin console. Single organization goes first, as for an MSP's client.
+pub(super) async fn apply_business_preset(org_id: &OrganizationId, headers: &Headers, conn: &DbConn) -> EmptyResult {
+    let mut preset = business_policies();
+    preset.sort_by_key(|(t, _)| *t != OrgPolicyType::SingleOrg);
+    for (t, options) in preset {
+        let data = PolicyData {
+            enabled: true,
+            data: (!options.is_null()).then_some(options),
+        };
+        set_policy(org_id, t, data, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn).await?;
+    }
+    Ok(())
+}
+
 /// The MSP's defaults, and for each client the caller reaches, the policies
 /// where it has its own setting.
 #[get("/keykeeper/msp/<msp_id>/policies")]
