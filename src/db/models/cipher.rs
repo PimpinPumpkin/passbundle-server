@@ -814,6 +814,15 @@ impl Cipher {
         cipher_uuids: &Vec<CipherId>,
         conn: &DbConn,
     ) -> Vec<Self> {
+        // Keykeeper: every way to see an item below needs the person to own it
+        // or to be a confirmed member of its organization (each one goes
+        // through the users_organizations join, which matches only that), so
+        // the query is first narrowed to those items. Its conditions are ORed
+        // across joins, which no index can serve: without this it read every
+        // item in the database on every sync. What it returns is unchanged.
+        // See DESIGN.md, "Capacity".
+        let orgs: Vec<OrganizationId> =
+            Membership::find_confirmed_by_user(user_uuid, conn).await.into_iter().map(|m| m.org_uuid).collect();
         if CONFIG.org_groups_enabled() {
             conn.run(move |conn| {
                 let mut query = ciphers::table
@@ -857,6 +866,10 @@ impl Cipher {
                     );
                 }
 
+                // Keykeeper: the narrowing above, after every OR.
+                query =
+                    query.filter(ciphers::user_uuid.eq(user_uuid).or(ciphers::organization_uuid.eq_any(orgs.clone())));
+
                 // Only filter for one specific cipher
                 if !cipher_uuids.is_empty() {
                     query = query.filter(ciphers::uuid.eq_any(cipher_uuids));
@@ -891,6 +904,10 @@ impl Cipher {
                         users_organizations::atype.le(MembershipType::Admin as i32), // Org admin/owner
                     );
                 }
+
+                // Keykeeper: the narrowing above, after every OR.
+                query =
+                    query.filter(ciphers::user_uuid.eq(user_uuid).or(ciphers::organization_uuid.eq_any(orgs.clone())));
 
                 // Only filter for one specific cipher
                 if !cipher_uuids.is_empty() {
