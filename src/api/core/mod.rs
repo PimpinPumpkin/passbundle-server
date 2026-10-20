@@ -13,6 +13,7 @@ mod keykeeper_msp_policies;
 mod keykeeper_msp_templates;
 mod keykeeper_orgs;
 mod keykeeper_seals;
+mod keykeeper_site_fixes;
 mod organizations;
 mod public;
 mod sends;
@@ -59,6 +60,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
     routes.append(&mut keykeeper_seals::routes());
+    routes.append(&mut keykeeper_site_fixes::routes());
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
     routes.append(&mut public::routes());

@@ -1,0 +1,60 @@
+<main class="container-xxl">
+    <div id="problems-block" class="my-3 p-3 rounded shadow">
+        <h6 class="border-bottom pb-2 mb-3">Sites people reported problems with</h6>
+        <p class="small text-body-secondary">From the extension's "Report a problem with this site": the site and the shape of its sign-in fields, never values, and no account. At most 20 per site a day.</p>
+        <div class="table-responsive-xl small">
+            <table id="problems-table" class="table table-sm table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th>Site</th>
+                        <th>Fields (type, id, name, label, hint)</th>
+                        <th>Note</th>
+                        <th>When</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{#each page_data.problems}}
+                    <tr>
+                        <td><strong>{{host}}</strong></td>
+                        <td>
+                            {{#each fields}}
+                            <span class="d-block font-monospace">{{type}} {{id}} {{name}} {{label}} {{autocomplete}}</span>
+                            {{/each}}
+                        </td>
+                        <td>{{note}}</td>
+                        <td>{{createdAt}}</td>
+                    </tr>
+                    {{/each}}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div id="fixes-block" class="my-3 p-3 rounded shadow">
+        <h6 class="border-bottom pb-2 mb-3">Fixes people shared</h6>
+        <p class="small text-body-secondary">From people who turned on sharing: how to recognize a field and which kind of value goes there. A fix fills for everyone on this server once {{page_data.threshold}} different people sent it.</p>
+        <div class="table-responsive-xl small">
+            <table id="fixes-table" class="table table-sm table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th>Site</th>
+                        <th>Field (id, name, label)</th>
+                        <th>Fills</th>
+                        <th>People</th>
+                        <th>Last sent</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{#each page_data.fixes}}
+                    <tr>
+                        <td><strong>{{host}}</strong></td>
+                        <td class="font-monospace">{{field.id}} {{field.name}} {{field.label}}</td>
+                        <td>{{fill}}</td>
+                        <td>{{reporters}}</td>
+                        <td>{{lastSeen}}</td>
+                    </tr>
+                    {{/each}}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</main>

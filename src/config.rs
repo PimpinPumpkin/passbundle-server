@@ -792,6 +792,8 @@ make_config! {
         login_ratelimit_account_anywhere_seconds:   u64, false, def, 36;
         /// Max burst size for login requests for one account from anywhere |> Allow a burst of requests for one email address, from any address, of up to this size
         login_ratelimit_account_anywhere_max_burst: u32, false, def, 100;
+        /// People who share the same site fix before it applies to everyone |> A fix made with the fill picker and shared fills for everyone on this server once this many different people sent it (Keykeeper: DESIGN.md, "Site fixes")
+        site_fix_reporters: u32, true, def, 3;
 
         /// Seconds between unauthenticated requests |> Number of seconds, on average, between requests from the same IP address to any of the rate limited unauthenticated endpoints
         unauthenticated_ratelimit_seconds:   u64, false, def, 60;
@@ -1761,6 +1763,7 @@ where
     reg!("admin/settings");
     reg!("admin/users");
     reg!("admin/organizations");
+    reg!("admin/sites");
     reg!("admin/diagnostics");
 
     reg!("404");

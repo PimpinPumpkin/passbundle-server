@@ -181,3 +181,68 @@ table! {
         seal -> Text,
     }
 }
+
+table! {
+    site_fixes (uuid) {
+        uuid -> Text,
+        host -> Text,
+        field_id -> Text,
+        field_name -> Text,
+        field_label -> Text,
+        fill -> Text,
+        reporters -> Integer,
+        first_seen -> Timestamp,
+        last_seen -> Timestamp,
+    }
+}
+
+table! {
+    site_fix_reporters (fix_uuid, reporter_hash) {
+        fix_uuid -> Text,
+        reporter_hash -> Text,
+    }
+}
+
+table! {
+    site_problems (uuid) {
+        uuid -> Text,
+        host -> Text,
+        fields -> Text,
+        note -> Nullable<Text>,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
+    msp_site_fix_reports (uuid) {
+        uuid -> Text,
+        msp_uuid -> Text,
+        host -> Text,
+        field_id -> Text,
+        field_name -> Text,
+        field_label -> Text,
+        fill -> Text,
+        reporter_email -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
+    msp_site_rules (uuid) {
+        uuid -> Text,
+        msp_uuid -> Text,
+        host -> Text,
+        field_id -> Text,
+        field_name -> Text,
+        field_label -> Text,
+        fill -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
+    keykeeper_secrets (name) {
+        name -> Text,
+        value -> Text,
+    }
+}
