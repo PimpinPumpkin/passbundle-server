@@ -62,6 +62,9 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
     };
 
     let user = if let Some(email) = email {
+        // Keykeeper: this checks a master password too, so the account's own
+        // limits apply here as at login (DESIGN.md, "Login limits").
+        crate::ratelimit::check_limit_login_account(email, &client_headers.ip.ip)?;
         let Some(user) = User::find_by_mail(email, &conn).await else {
             err!(
                 "Username or password is incorrect. Try again",

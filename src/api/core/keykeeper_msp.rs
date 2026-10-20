@@ -60,6 +60,10 @@ pub(super) fn clean_name(name: &str) -> Result<String, crate::error::Error> {
     if name.is_empty() || name.chars().count() > MAX_NAME_LENGTH {
         err!(format!("Name must be 1 to {MAX_NAME_LENGTH} characters"))
     }
+    // Names go into email subjects and logs.
+    if name.chars().any(char::is_control) {
+        err!("Names can't contain line breaks or other control characters")
+    }
     Ok(name.to_owned())
 }
 
@@ -486,6 +490,22 @@ struct CreateClientData {
 #[post("/keykeeper/msp/<msp_id>/clients", data = "<data>")]
 async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientData>, conn: DbConn) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
+    // Upstream's own checks for creating an organization.
+    if !CONFIG.is_org_creation_allowed(&headers.user.email) {
+        err!("User not allowed to create organizations")
+    }
+    if crate::db::models::OrgPolicy::is_applicable_to_user(
+        &headers.user.uuid,
+        crate::db::models::OrgPolicyType::SingleOrg,
+        None,
+        &conn,
+    )
+    .await
+    {
+        err!(
+            "You may not create an organization. You belong to an organization which has a policy that prohibits you from being a member of any other organization."
+        )
+    }
     let data = data.into_inner();
     let name = clean_name(&data.name)?;
     let business = match data.preset.as_deref() {
@@ -572,6 +592,15 @@ async fn add_to_staff(
 ) -> EmptyResult {
     let mut staff = MspStaff::new(msp_id.clone(), user.uuid.clone(), role);
     staff.insert(conn).await?;
+    // No organization may recover a staff account (DESIGN.md, "MSP staff and
+    // account recovery"), so any enrollment they had ends now.
+    for mut member in Membership::find_by_user(&user.uuid, conn).await {
+        if member.reset_password_key.is_some() {
+            member.reset_password_key = None;
+            member.save(conn).await?;
+        }
+    }
+    MspInvite::delete_by_msp_and_email(msp_id, &user.email, conn).await?;
     if role == MspRole::Technician
         && let Some(access) = access
     {
@@ -600,6 +629,9 @@ async fn validate_access(
     }
     if access.custom.as_ref().is_some_and(|c| !c.permissions.any()) {
         err!("Choose at least one permission for the custom role")
+    }
+    if let Some(custom) = &access.custom {
+        keykeeper_roles::ensure_export_needs_items(Some(&custom.permissions), custom.vault_items)?;
     }
     Ok(access)
 }
@@ -649,9 +681,9 @@ fn invite_url(token: &str) -> String {
     format!("{}/#/msp?invite={token}", CONFIG.domain())
 }
 
-/// Adds someone to the MSP and every client. Someone without an account yet is
-/// invited instead: emailed a link when the server sends email, and the link
-/// is returned so the admin can pass it on.
+/// Invites someone to the MSP's staff: emailed a link when the server sends
+/// email, and the link is returned so the admin can pass it on. They join the
+/// staff, and every client they reach, when they accept it.
 #[post("/keykeeper/msp/<msp_id>/staff", data = "<data>")]
 async fn add_staff(msp_id: MspId, headers: Headers, data: Json<AddStaffData>, conn: DbConn) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
@@ -669,55 +701,45 @@ async fn add_staff(msp_id: MspId, headers: Headers, data: Json<AddStaffData>, co
         err!("Enter an email address")
     }
 
-    let Some(user) = User::find_by_mail(&email, &conn).await else {
-        if MspInvite::find_by_msp_and_email(&msp_id, &email, &conn).await.is_some() {
-            err!("They're already invited. Cancel the invitation to send a new one.")
-        }
-        let Some(msp) = Msp::find_by_uuid(&msp_id, &conn).await else {
-            err_code!("MSP not found", rocket::http::Status::NotFound.code)
-        };
-        let invite = MspInvite::new(msp_id.clone(), &email, role, access.as_ref(), &headers.user.email);
-        invite.insert(&conn).await?;
-        let url = invite_url(&invite.token);
-        let emailed = CONFIG.mail_enabled();
-        if emailed {
-            let role_name = if role == MspRole::Admin {
-                "an admin"
-            } else {
-                "a technician"
-            };
-            crate::mail::send_msp_invite(&email, &msp.name, role_name, &headers.user.email, &url).await?;
-        }
-        Audit::by("staff_invited", &headers).target(&email).detail(role.as_str()).record(&msp_id, &conn).await?;
-        if let Some(access) = &access {
-            let detail = describe_access(access, &conn).await;
-            Audit::by("staff_access_changed", &headers).target(&email).detail(detail).record(&msp_id, &conn).await?;
-        }
-        return Ok(Json(json!({
-            "invited": true,
-            "inviteId": invite.uuid,
-            "email": email,
-            "role": role.as_str(),
-            "inviteUrl": url,
-            "emailed": emailed,
-        })));
-    };
-
-    if MspStaff::find(&msp_id, &user.uuid, &conn).await.is_some() {
+    // Everyone gets an invitation they accept themselves, whether or not they
+    // have an account yet, and the answer is the same either way: adding
+    // someone straight to the staff would make them an owner of every client
+    // without asking, and would tell anyone which emails have accounts.
+    if let Some(user) = User::find_by_mail(&email, &conn).await
+        && MspStaff::find(&msp_id, &user.uuid, &conn).await.is_some()
+    {
         err!("They're already on your staff")
     }
-    add_to_staff(&msp_id, &user, role, access.as_ref(), &headers.user.email, &conn).await?;
-    Audit::by("staff_added", &headers).target(&user.email).detail(role.as_str()).record(&msp_id, &conn).await?;
+    if MspInvite::find_by_msp_and_email(&msp_id, &email, &conn).await.is_some() {
+        err!("They're already invited. Cancel the invitation to send a new one.")
+    }
+    let Some(msp) = Msp::find_by_uuid(&msp_id, &conn).await else {
+        err_code!("MSP not found", rocket::http::Status::NotFound.code)
+    };
+    let invite = MspInvite::new(msp_id.clone(), &email, role, access.as_ref(), &headers.user.email);
+    invite.insert(&conn).await?;
+    let url = invite_url(&invite.token);
+    let emailed = CONFIG.mail_enabled();
+    if emailed {
+        let role_name = if role == MspRole::Admin {
+            "an admin"
+        } else {
+            "a technician"
+        };
+        crate::mail::send_msp_invite(&email, &msp.name, role_name, &headers.user.email, &url).await?;
+    }
+    Audit::by("staff_invited", &headers).target(&email).detail(role.as_str()).record(&msp_id, &conn).await?;
     if let Some(access) = &access {
         let detail = describe_access(access, &conn).await;
-        Audit::by("staff_access_changed", &headers).target(&user.email).detail(detail).record(&msp_id, &conn).await?;
+        Audit::by("staff_access_changed", &headers).target(&email).detail(detail).record(&msp_id, &conn).await?;
     }
     Ok(Json(json!({
-        "invited": false,
-        "userId": user.uuid,
-        "email": user.email,
-        "name": user.name,
+        "invited": true,
+        "inviteId": invite.uuid,
+        "email": email,
         "role": role.as_str(),
+        "inviteUrl": url,
+        "emailed": emailed,
     })))
 }
 
@@ -744,7 +766,7 @@ const INVALID_INVITE: &str = "This invitation isn't valid anymore. Ask the MSP f
 /// What an invitation is for, before accepting it.
 #[post("/keykeeper/msp/invites/info", data = "<data>")]
 async fn invite_info(data: Json<InviteTokenData>, headers: Headers, conn: DbConn) -> JsonResult {
-    let Some(invite) = MspInvite::find_by_token(&data.token, &conn).await else {
+    let Some(invite) = MspInvite::find_by_token(&data.token, &conn).await.filter(|i| !i.expired()) else {
         err_code!(INVALID_INVITE, rocket::http::Status::NotFound.code)
     };
     let Some(msp) = Msp::find_by_uuid(&invite.msp_uuid, &conn).await else {
@@ -766,8 +788,17 @@ async fn accept_invite(data: Json<InviteTokenData>, headers: Headers, conn: DbCo
     let Some(invite) = MspInvite::find_by_token(&data.token, &conn).await else {
         err_code!(INVALID_INVITE, rocket::http::Status::NotFound.code)
     };
+    if invite.expired() {
+        invite.delete(&conn).await?;
+        err_code!(INVALID_INVITE, rocket::http::Status::NotFound.code)
+    }
     if invite.email != headers.user.email.to_lowercase() {
         err!(format!("This invitation is for {}. Sign in with that account to accept it.", invite.email))
+    }
+    // Where the server sends email, only someone who proved the address can
+    // take an invitation to it.
+    if CONFIG.mail_enabled() && headers.user.verified_at.is_none() {
+        err!("Verify your email address first: Settings, then My account, sends the email.")
     }
     let Some(role) = invite.role() else {
         err_code!(INVALID_INVITE, rocket::http::Status::NotFound.code)
@@ -888,6 +919,8 @@ async fn remove_staff(msp_id: MspId, user_id: UserId, headers: Headers, conn: Db
     }
     staff.delete(&conn).await?;
     let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
+    // An old invitation link mustn't bring them back.
+    MspInvite::delete_by_msp_and_email(&msp_id, &email, &conn).await?;
     Audit::by("staff_removed", &headers).target(&email).record(&msp_id, &conn).await
 }
 
@@ -935,7 +968,7 @@ async fn pending_confirmations(msp_id: MspId, headers: Headers, conn: DbConn) ->
                 "name": user.name,
                 "publicKey": public_key,
                 "fromMsp": ours.contains(&member.uuid),
-                "autoConfirm": auto_confirm,
+                "autoConfirm": crate::db::models::confirms_automatically(auto_confirm, &member, &conn).await,
             }));
         }
     }
@@ -969,9 +1002,17 @@ async fn list_events(
     let only = caller.reach(&conn).await.map(|r| r.into_iter().collect());
     let before_time = parse_before(before.as_deref())?;
     let limit = limit.unwrap_or(100).clamp(1, MAX_EVENTS);
+    // Technicians see their clients' activity without where it came from,
+    // and of the MSP's own changes to its staff, only their own.
+    let technician = caller.role() != Some(MspRole::Admin);
     let events: Vec<Value> = MspEvent::find_by_msp(&msp_id, before_time, only, limit, &conn)
         .await
         .into_iter()
+        .filter(|e| {
+            !technician
+                || !e.event.starts_with("staff_")
+                || e.target_email.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&headers.user.email))
+        })
         .map(|e| {
             json!({
                 "id": e.uuid,
@@ -982,7 +1023,7 @@ async fn list_events(
                 "organizationName": e.org_name,
                 "targetEmail": e.target_email,
                 "detail": e.detail,
-                "ip": e.ip,
+                "ip": if technician { None } else { e.ip },
             })
         })
         .collect();
@@ -1043,11 +1084,20 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
     if caller.atype != MembershipType::Owner as i32 || caller_is_msp {
         err_code!("Only the organization's own owners can remove its MSP", rocket::http::Status::Forbidden.code)
     }
-    let ours = msp_membership_ids(&client.msp_uuid, &conn).await;
+    // Fails closed: if the MSP's memberships can't be read, nothing changes
+    // and the owner can try again.
+    let ours: HashSet<MembershipId> =
+        MspMembership::try_find_by_msp(&client.msp_uuid, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();
     for member in Membership::find_by_org(&org_id, &conn).await {
         if ours.contains(&member.uuid) {
             member.delete(&conn).await?;
         }
+    }
+    // How people join stays as it was: a client that followed its MSP's
+    // default keeps it as its own, rather than falling back to the server's.
+    let (joining, _) = effective_joining(&org_id, &conn).await;
+    if crate::db::models::OrgJoining::find(&org_id, &conn).await.is_none() {
+        crate::db::models::OrgJoining::new(org_id.clone(), joining).save(&conn).await?;
     }
     let msp_id = client.msp_uuid.clone();
     // The organization keeps its preset and the collection people who join
@@ -1059,6 +1109,14 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
             .await?;
     }
     client.delete(&conn).await?;
+    // A staff change that ran at the same moment may have added one back.
+    let ours: HashSet<MembershipId> =
+        MspMembership::try_find_by_msp(&msp_id, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();
+    for member in Membership::find_by_org(&org_id, &conn).await {
+        if ours.contains(&member.uuid) {
+            member.delete(&conn).await?;
+        }
+    }
     // The MSP keeps a record that the client removed it.
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
     Audit::by("client_removed_msp", &headers).org(&org_id, &org_name).record(&msp_id, &conn).await

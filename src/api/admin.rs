@@ -572,6 +572,9 @@ async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToke
     }
 
     member_to_edit.atype = new_type;
+    // Keykeeper: a new type here ends any custom role, as an edit in the
+    // admin console would.
+    crate::db::models::keykeeper_roles::set(&member_to_edit.uuid, None, &conn).await?;
     // This check is also done at api::organizations::{accept_invite, _confirm_invite, _activate_member, edit_member}, update_membership_type
     OrgPolicy::check_user_allowed(&member_to_edit, "modify", &conn).await?;
 

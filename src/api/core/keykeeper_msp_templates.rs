@@ -290,10 +290,22 @@ async fn set_templates_collection(
         _ => err!("Client not found"),
     };
     let collection_id = data.into_inner().collection_id;
-    if Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await.is_none() {
+    let Some(collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
         err!("Collection not found")
+    };
+    // Set once: every regular member of the client gets to read it, so it
+    // can't later be pointed at a collection they shouldn't see.
+    if client.templates_collection.as_ref().is_some_and(|c| c != &collection_id) {
+        err!("This client already has its Templates collection")
     }
     client.set_templates_collection(collection_id.clone(), &conn).await?;
+    let org_name =
+        crate::db::models::Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
+    Audit::by("templates_collection_set", &headers)
+        .org(&org_id, &org_name)
+        .detail(collection.uuid.to_string())
+        .record(&msp_id, &conn)
+        .await?;
     for member in Membership::find_by_org(&org_id, &conn).await {
         give_templates(&member, &client, &conn).await?;
     }

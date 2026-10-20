@@ -18,7 +18,8 @@ use crate::{
         DbConn,
         models::{
             INVITE_HOURS, Joining, JoiningSource, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId,
-            MspJoining, OrgJoining, Organization, OrganizationId, User, effective_joining, msp_default,
+            MspJoining, OrgJoining, Organization, OrganizationId, User, confirms_automatically, effective_joining,
+            msp_default,
         },
     },
 };
@@ -152,9 +153,14 @@ async fn reset_org_joining(org_id: OrganizationId, headers: Headers, conn: DbCon
 /// The MSP's default, and which clients follow it. Any of its staff can see it.
 #[get("/keykeeper/msp/<msp_id>/joining")]
 async fn get_msp_joining(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
-    staff_member(&msp_id, &headers.user.uuid, &conn).await?;
+    let caller = staff_member(&msp_id, &headers.user.uuid, &conn).await?;
+    // A technician limited to some clients sees only those.
+    let reach = caller.reach(&conn).await;
     let mut own = Vec::new();
     for client in MspClient::find_by_msp(&msp_id, &conn).await {
+        if reach.as_ref().is_some_and(|r| !r.contains(&client.org_uuid)) {
+            continue;
+        }
         if let Some(setting) = OrgJoining::find(&client.org_uuid, &conn).await {
             let name = Organization::find_by_uuid(&client.org_uuid, &conn).await.map(|o| o.name).unwrap_or_default();
             own.push(json!({
@@ -208,7 +214,7 @@ async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
                 "memberId": member.uuid,
                 "email": user.email,
                 "publicKey": public_key,
-                "autoConfirm": joining.auto_confirm,
+                "autoConfirm": confirms_automatically(joining.auto_confirm, &member, &conn).await,
             }));
         }
     }

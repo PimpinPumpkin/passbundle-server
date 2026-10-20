@@ -304,6 +304,14 @@ async fn accept_org_invite(
         err!("User already accepted the invitation");
     }
 
+    // Keykeeper: an MSP's staff never join any organization's account
+    // recovery: their account reaches every client they work in. See
+    // DESIGN.md, "MSP staff and account recovery".
+    if reset_password_key.is_some() && crate::db::models::MspStaff::is_staff_anywhere(&user.uuid, conn).await {
+        err!(
+            "MSP staff can't join an organization's account recovery. Ask its admins to turn off automatic enrollment for you, or join with another account."
+        )
+    }
     member.status = MembershipStatus::Accepted as i32;
     member.reset_password_key = reset_password_key;
 
