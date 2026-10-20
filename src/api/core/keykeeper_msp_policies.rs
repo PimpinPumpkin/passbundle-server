@@ -293,13 +293,17 @@ async fn get_policies(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResu
 struct DefaultPolicyData {
     enabled: bool,
     data: Option<Value>,
+    /// Clients that follow the default but stay as they are this time; their
+    /// policy then counts as their own setting.
+    #[serde(default)]
+    keep: Vec<OrganizationId>,
 }
 
-/// Changes one default, and with it every client that follows it. Clients
-/// with their own setting keep it. A client whose policy code refuses the
-/// change (for example a server that needs single organization before account
-/// recovery) is named in the response and keeps its policy, which then counts
-/// as its own setting.
+/// Changes one default, and with it every client that follows it, except
+/// those the admin chose to keep as they are. Clients with their own setting
+/// keep it. A client whose policy code refuses the change (for example a
+/// server that needs single organization before account recovery) is named in
+/// the response and keeps its policy, which then counts as its own setting.
 #[put("/keykeeper/msp/<msp_id>/policies/<pol_type>", data = "<data>")]
 async fn set_default(
     msp_id: MspId,
@@ -315,6 +319,10 @@ async fn set_default(
     if !(options.is_null() || options.is_object()) {
         err!("Policy options must be an object")
     }
+    let clients = MspClient::find_by_msp(&msp_id, &conn).await;
+    if data.keep.iter().any(|org| !clients.iter().any(|c| &c.org_uuid == org)) {
+        err!("Client not found")
+    }
 
     let old = default_effect(&defaults(&msp_id, &conn).await, t);
     let default = MspPolicy::new(msp_id.clone(), t as i32, data.enabled, options.to_string());
@@ -322,7 +330,7 @@ async fn set_default(
     default.save(&conn).await?;
 
     let (mut changed, mut kept, mut refused) = (Vec::new(), Vec::new(), Vec::new());
-    for client in MspClient::find_by_msp(&msp_id, &conn).await {
+    for client in clients {
         let Some(org) = Organization::find_by_uuid(&client.org_uuid, &conn).await else {
             continue;
         };
@@ -330,7 +338,7 @@ async fn set_default(
         if current == new {
             continue;
         }
-        if current != old {
+        if current != old || data.keep.contains(&org.uuid) {
             kept.push(client_json(&org));
             continue;
         }
