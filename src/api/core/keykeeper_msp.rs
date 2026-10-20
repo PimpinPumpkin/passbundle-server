@@ -885,6 +885,16 @@ async fn set_staff_access(
     staff.set_access(&access, &conn).await?;
     sync_staff_memberships(&msp_id, &staff, &headers.user.email, &conn).await?;
     let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
+    // Clients they no longer reach lose their staff seal there too.
+    if let Some(reach) = staff.reach(&conn).await {
+        let unreached = MspClient::find_by_msp(&msp_id, &conn)
+            .await
+            .into_iter()
+            .map(|c| c.org_uuid)
+            .filter(|org| !reach.contains(org))
+            .collect();
+        crate::db::models::JoinSeal::delete_staff(unreached, &email, &conn).await?;
+    }
     let detail = describe_access(&access, &conn).await;
     Audit::by("staff_access_changed", &headers).target(&email).detail(detail).record(&msp_id, &conn).await?;
     Ok(Json(json!(access)))
@@ -919,8 +929,10 @@ async fn remove_staff(msp_id: MspId, user_id: UserId, headers: Headers, conn: Db
     }
     staff.delete(&conn).await?;
     let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
-    // An old invitation link mustn't bring them back.
+    // An old invitation link mustn't bring them back, nor an old seal vouch for them.
     MspInvite::delete_by_msp_and_email(&msp_id, &email, &conn).await?;
+    let clients = MspClient::find_by_msp(&msp_id, &conn).await.into_iter().map(|c| c.org_uuid).collect();
+    crate::db::models::JoinSeal::delete_staff(clients, &email, &conn).await?;
     Audit::by("staff_removed", &headers).target(&email).record(&msp_id, &conn).await
 }
 
@@ -960,16 +972,22 @@ async fn pending_confirmations(msp_id: MspId, headers: Headers, conn: DbConn) ->
             let Some(public_key) = user.public_key.clone() else {
                 continue;
             };
-            pending.push(json!({
+            let from_msp = ours.contains(&member.uuid);
+            let mut entry = json!({
                 "organizationId": client.org_uuid,
                 "memberId": member.uuid,
                 "userId": user.uuid,
                 "email": user.email,
                 "name": user.name,
                 "publicKey": public_key,
-                "fromMsp": ours.contains(&member.uuid),
+                "fromMsp": from_msp,
                 "autoConfirm": crate::db::models::confirms_automatically(auto_confirm, &member, &conn).await,
-            }));
+            });
+            super::keykeeper_joining::extend(
+                &mut entry,
+                super::keykeeper_joining::vouching(&client.org_uuid, &member, &user.email, from_msp, &conn).await,
+            );
+            pending.push(entry);
         }
     }
     Ok(Json(json!({ "data": pending })))

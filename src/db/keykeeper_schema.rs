@@ -31,6 +31,7 @@ table! {
         enrollment_token_created_at -> Nullable<Timestamp>,
         everyone_collection -> Nullable<Text>,
         templates_collection -> Nullable<Text>,
+        enrollment_secret -> Nullable<Text>,
     }
 }
 
@@ -39,6 +40,7 @@ table! {
         membership_uuid -> Text,
         org_uuid -> Text,
         joined_at -> Timestamp,
+        proof -> Nullable<Text>,
     }
 }
 
@@ -160,5 +162,22 @@ table! {
         enrollment_token -> Nullable<Text>,
         enrollment_token_created_at -> Nullable<Timestamp>,
         everyone_collection -> Nullable<Text>,
+        enrollment_secret -> Nullable<Text>,
+    }
+}
+
+table! {
+    join_seals (org_uuid, email, kind) {
+        org_uuid -> Text,
+        email -> Text,
+        kind -> Text,
+        seal -> Text,
+    }
+}
+
+table! {
+    joining_seals (org_uuid) {
+        org_uuid -> Text,
+        seal -> Text,
     }
 }

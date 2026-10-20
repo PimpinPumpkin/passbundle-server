@@ -190,6 +190,9 @@ pub struct MspClient {
     pub everyone_collection: Option<CollectionId>,
     /// Where the MSP's templates go in this client. See DESIGN.md, "MSP templates".
     pub templates_collection: Option<CollectionId>,
+    /// The install command's join secret, encrypted with the client's key by
+    /// the MSP admin's browser. See DESIGN.md, "Joins a hacked server can't forge".
+    pub enrollment_secret: Option<String>,
 }
 
 /// Someone who joined a client through its enrollment token, and when.
@@ -200,6 +203,8 @@ pub struct MspEnrollmentJoin {
     pub membership_uuid: MembershipId,
     pub org_uuid: OrganizationId,
     pub joined_at: NaiveDateTime,
+    /// The proof the join came with, that it knew the command's join secret.
+    pub proof: Option<String>,
 }
 
 #[derive(Identifiable, Queryable, Insertable)]
@@ -453,6 +458,7 @@ impl MspClient {
             enrollment_token_created_at: Some(Utc::now().naive_utc()),
             everyone_collection,
             templates_collection: None,
+            enrollment_secret: None,
         }
     }
 
@@ -461,17 +467,40 @@ impl MspClient {
         crate::crypto::encode_random_bytes::<32>(&data_encoding::BASE64URL_NOPAD)
     }
 
-    /// Replaces the enrollment token. Install commands with the old one stop
-    /// letting new people join.
-    pub async fn replace_enrollment_token(&mut self, conn: &DbConn) -> EmptyResult {
+    /// Sets the install command's join secret, encrypted by the browser,
+    /// keeping the token.
+    pub async fn set_enrollment_secret(&mut self, secret: Option<String>, conn: &DbConn) -> EmptyResult {
+        let org = self.org_uuid.clone();
+        let saved = secret.clone();
+        conn.run(move |conn| {
+            diesel::update(msp_clients::table.filter(msp_clients::org_uuid.eq(org)))
+                .set(msp_clients::enrollment_secret.eq(saved))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error saving the join secret")
+        })
+        .await?;
+        self.enrollment_secret = secret;
+        Ok(())
+    }
+
+    /// Replaces the enrollment token, with the new command's join secret
+    /// (encrypted, from the browser that made it; none from an older app).
+    /// Install commands with the old one stop letting new people join.
+    pub async fn replace_enrollment_token(&mut self, secret: Option<String>, conn: &DbConn) -> EmptyResult {
         let token = Self::new_enrollment_token();
         let now = Utc::now().naive_utc();
         let org = self.org_uuid.clone();
         let saved = token.clone();
+        let saved_secret = secret.clone();
         let updated: EmptyResult = conn
             .run(move |conn| {
                 diesel::update(msp_clients::table.filter(msp_clients::org_uuid.eq(org)))
-                    .set((msp_clients::enrollment_token.eq(saved), msp_clients::enrollment_token_created_at.eq(now)))
+                    .set((
+                        msp_clients::enrollment_token.eq(saved),
+                        msp_clients::enrollment_token_created_at.eq(now),
+                        msp_clients::enrollment_secret.eq(saved_secret),
+                    ))
                     .execute(conn)
                     .map_res("Error replacing the enrollment token")
             })
@@ -479,6 +508,7 @@ impl MspClient {
         updated?;
         self.enrollment_token = Some(token);
         self.enrollment_token_created_at = Some(now);
+        self.enrollment_secret = secret;
         Ok(())
     }
 
@@ -716,12 +746,26 @@ impl EnrollmentDomains {
 }
 
 impl MspEnrollmentJoin {
-    pub fn new(membership_uuid: MembershipId, org_uuid: OrganizationId) -> Self {
+    pub fn new(membership_uuid: MembershipId, org_uuid: OrganizationId, proof: Option<String>) -> Self {
         Self {
             membership_uuid,
             org_uuid,
             joined_at: Utc::now().naive_utc(),
+            proof,
         }
+    }
+
+    /// The proof a membership's install command join came with, if any.
+    pub async fn proof_for(membership_uuid: &MembershipId, conn: &DbConn) -> Option<String> {
+        conn.run(move |conn| {
+            msp_enrollment_joins::table
+                .filter(msp_enrollment_joins::membership_uuid.eq(membership_uuid))
+                .select(msp_enrollment_joins::proof)
+                .first::<Option<String>>(conn)
+                .ok()
+                .flatten()
+        })
+        .await
     }
 
     pub async fn insert(&self, conn: &DbConn) -> EmptyResult {
