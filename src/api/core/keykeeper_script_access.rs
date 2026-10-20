@@ -13,13 +13,14 @@ use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapSta
 use ring::digest;
 use rocket::{
     Request, Route,
-    http::Status,
+    http::{ContentType, Status},
     request::{FromRequest, Outcome},
     serde::json::Json,
 };
 use serde_json::{Value, json};
 
 use crate::{
+    CONFIG,
     api::{EmptyResult, JsonResult},
     auth::{ClientIp, Headers},
     crypto::ct_eq,
@@ -46,7 +47,8 @@ pub fn routes() -> Vec<Route> {
         token_reads,
         stale_grants,
         script_items,
-        script_item
+        script_item,
+        script_module
     ]
 }
 
@@ -603,6 +605,13 @@ async fn script_item(item_id: CipherId, caller: ScriptCaller, conn: DbConn) -> J
     mark_used(&caller, &conn).await?;
     ScriptRead::record(&caller.token.uuid, Some(&item_id), &caller.ip, true, "read", &conn).await?;
     Ok(Json(copy_json(&grant, &cipher)))
+}
+
+/// The PowerShell module scripts use, with this server's address filled in.
+#[get("/keykeeper/script/PassBundle.psm1")]
+fn script_module() -> (ContentType, String) {
+    let module = include_str!("../../static/scripts/PassBundle.psm1");
+    (ContentType::Plain, module.replace("{{SERVER}}", &CONFIG.domain().replace('\'', "")))
 }
 
 #[cfg(test)]
