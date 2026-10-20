@@ -66,6 +66,7 @@ pub fn routes() -> Vec<Route> {
         test_smtp,
         users_overview,
         organizations_overview,
+        sites_overview,
         delete_organization,
         diagnostics,
         get_diagnostics_config,
@@ -393,6 +394,21 @@ async fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<Stri
     }
 
     let text = AdminTemplateData::new("admin/users", json!(users_json)).render()?;
+    Ok(Html(text))
+}
+
+/// Keykeeper: the sites people reported problems with and the fixes they
+/// shared, newest first: the private list of what needs work. See DESIGN.md,
+/// "Site fixes (opt-in)".
+#[get("/sites/overview")]
+async fn sites_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
+    use crate::db::models::{SiteFix, SiteProblem};
+    let data = json!({
+        "threshold": CONFIG.site_fix_reporters(),
+        "problems": SiteProblem::recent(&conn).await,
+        "fixes": SiteFix::all(&conn).await,
+    });
+    let text = AdminTemplateData::new("admin/sites", data).render()?;
     Ok(Html(text))
 }
 
