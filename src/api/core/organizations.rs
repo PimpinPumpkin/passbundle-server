@@ -1038,6 +1038,16 @@ async fn send_invite(
         custom_role.as_ref(),
         access_all,
     )?;
+    // Keykeeper: and only to collections it reaches, without groups.
+    if headers.custom_permissions.is_some() {
+        if !data.groups.is_empty() {
+            err!("Your role can't add people to groups")
+        }
+        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await;
+        for col in data.collections.iter().flatten() {
+            reach.ensure_grant(&col.id, col.read_only, col.hide_passwords, col.manage)?;
+        }
+    }
 
     let mut user_created: bool;
     for email in &data.emails {
@@ -1174,7 +1184,12 @@ async fn bulk_reinvite_members(
 
     let mut bulk_response = Vec::new();
     for member_id in data.ids {
-        let err_msg = match reinvite_member_impl(&org_id, &member_id, &headers.user.email, &conn).await {
+        let err_msg = match async {
+            ensure_may_reinvite(&org_id, &member_id, &headers, &conn).await?;
+            reinvite_member_impl(&org_id, &member_id, &headers.user.email, &conn).await
+        }
+        .await
+        {
             Ok(()) => String::new(),
             Err(e) => format!("{e:?}"),
         };
@@ -1205,7 +1220,27 @@ async fn reinvite_member(
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
+    ensure_may_reinvite(&org_id, &member_id, &headers, &conn).await?;
     reinvite_member_impl(&org_id, &member_id, &headers.user.email, &conn).await
+}
+
+/// Keykeeper: a custom role resends invitations only to regular members.
+async fn ensure_may_reinvite(
+    org_id: &OrganizationId,
+    member_id: &MembershipId,
+    headers: &AdminHeaders,
+    conn: &DbConn,
+) -> EmptyResult {
+    if let Some(member) = Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
+        crate::db::models::keykeeper_roles::ensure_regular_target(
+            headers.custom_permissions.as_ref(),
+            &headers.user.uuid,
+            &member,
+            conn,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn reinvite_member_impl(
@@ -1587,6 +1622,23 @@ async fn edit_member(
         custom_role.as_ref(),
         access_all,
     )?;
+    // Keykeeper: a custom role changes only collections it reaches, giving no
+    // more than it has, and leaves groups alone.
+    let reach = if headers.custom_permissions.is_some() {
+        let current: HashSet<GroupId> =
+            GroupUser::find_by_member(&member_to_edit.uuid, &conn).await.into_iter().map(|g| g.groups_uuid).collect();
+        let requested: HashSet<GroupId> = data.groups.iter().flatten().cloned().collect();
+        if current != requested {
+            err!("Your role can't change someone's groups")
+        }
+        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await;
+        for col in data.collections.iter().flatten() {
+            reach.ensure_grant(&col.id, col.read_only, col.hide_passwords, col.manage)?;
+        }
+        Some(reach)
+    } else {
+        None
+    };
 
     if new_type != member_to_edit.atype
         && (member_to_edit.atype >= MembershipType::Admin || new_type >= MembershipType::Admin)
@@ -1617,8 +1669,11 @@ async fn edit_member(
     OrgPolicy::check_user_allowed(&member_to_edit, "modify", &conn).await?;
 
     // Delete all the odd collections
+    // Keykeeper: a custom role only the ones it reaches.
     for c in CollectionUser::find_by_organization_and_user_uuid(&org_id, &member_to_edit.user_uuid, &conn).await {
-        c.delete(&conn).await?;
+        if reach.as_ref().is_none_or(|r| r.contains(&c.collection_uuid)) {
+            c.delete(&conn).await?;
+        }
     }
 
     // If no accessAll, add the collections received
@@ -1641,14 +1696,17 @@ async fn edit_member(
         }
     }
 
-    GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
+    // Keykeeper: groups stay as they were for a custom role (checked above).
+    if reach.is_none() {
+        GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
 
-    for group_id in data.groups.iter().flatten() {
-        if Group::find_by_uuid_and_org(group_id, &org_id, &conn).await.is_none() {
-            err!("Group not found in Organization")
+        for group_id in data.groups.iter().flatten() {
+            if Group::find_by_uuid_and_org(group_id, &org_id, &conn).await.is_none() {
+                err!("Group not found in Organization")
+            }
+            let mut group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
+            group_entry.save(&conn).await?;
         }
-        let mut group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
-        group_entry.save(&conn).await?;
     }
 
     log_event(
@@ -3033,9 +3091,13 @@ async fn check_reset_password_applicable_and_permissions(
         err!("Reset target user not found")
     };
 
-    // Keykeeper: an MSP's staff are never reset by a client (see keykeeper_msp).
-    if super::keykeeper_msp::is_msp_membership(member_id, conn).await {
-        err!("MSP staff can't be recovered by a client organization")
+    // Keykeeper: an MSP's staff are never recovered, through any membership:
+    // their account reaches every client they work in. See DESIGN.md, "MSP
+    // staff and account recovery".
+    if super::keykeeper_msp::is_msp_membership(member_id, conn).await
+        || crate::db::models::MspStaff::is_staff_anywhere(&target_user.user_uuid, conn).await
+    {
+        err!("MSP staff can't be recovered by an organization")
     }
     // Keykeeper: a custom role only recovers regular members.
     crate::db::models::keykeeper_roles::ensure_regular_target(
@@ -3098,9 +3160,13 @@ async fn put_reset_password_enrollment(
         err!("Reset password can't be withdrawn due to an enterprise policy");
     }
 
-    // Keykeeper: an MSP's staff never join a client's account recovery (see keykeeper_msp).
-    if reset_password_key.is_some() && super::keykeeper_msp::is_msp_membership(&membership.uuid, &conn).await {
-        err!("MSP staff can't join a client organization's account recovery")
+    // Keykeeper: an MSP's staff never join any organization's account
+    // recovery (see DESIGN.md, "MSP staff and account recovery").
+    if reset_password_key.is_some()
+        && (super::keykeeper_msp::is_msp_membership(&membership.uuid, &conn).await
+            || crate::db::models::MspStaff::is_staff_anywhere(&membership.user_uuid, &conn).await)
+    {
+        err!("MSP staff can't join an organization's account recovery")
     }
 
     if reset_password_key.is_some() {
@@ -3137,6 +3203,17 @@ async fn put_reset_password_enrollment(
 async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
+    }
+    // Keykeeper: the export holds every item, so a custom role exports only
+    // with access to all items. A client's own custom roles can't have that
+    // yet, so for them import and export covers import.
+    if headers.custom_permissions.is_some()
+        && !matches!(
+            crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await,
+            crate::db::models::keykeeper_roles::Reach::All
+        )
+    {
+        err!("Exporting the organization's vault needs access to all items")
     }
 
     Ok(Json(json!({

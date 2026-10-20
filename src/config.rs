@@ -784,10 +784,14 @@ make_config! {
         login_ratelimit_seconds:       u64, false, def, 6;
         /// Max burst size for login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `login_ratelimit_seconds`. Note that this applies to both the login and the 2FA, so it's recommended to allow a burst size of at least 2
         login_ratelimit_max_burst:     u32, false, def, 100;
-        /// Seconds between login requests for one account |> Number of seconds, on average, between login and 2FA requests for the same email address, from anywhere, before rate limiting kicks in
+        /// Seconds between login requests for one account |> Number of seconds, on average, between login and 2FA requests for the same email address from one network (an IPv4 /24 or IPv6 /64), before rate limiting kicks in. A device already signed in to the account isn't limited
         login_ratelimit_account_seconds:   u64, false, def, 60;
         /// Max burst size for login requests for one account |> Allow a burst of requests for one email address of up to this size, while maintaining the average indicated by `login_ratelimit_account_seconds`
         login_ratelimit_account_max_burst: u32, false, def, 10;
+        /// Seconds between login requests for one account from anywhere |> Keykeeper: the account limit above counts per network; this one counts across every network, so guesses spread over many addresses stop too
+        login_ratelimit_account_anywhere_seconds:   u64, false, def, 36;
+        /// Max burst size for login requests for one account from anywhere |> Allow a burst of requests for one email address, from any address, of up to this size
+        login_ratelimit_account_anywhere_max_burst: u32, false, def, 100;
 
         /// Seconds between unauthenticated requests |> Number of seconds, on average, between requests from the same IP address to any of the rate limited unauthenticated endpoints
         unauthenticated_ratelimit_seconds:   u64, false, def, 60;

@@ -16,8 +16,8 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            Device, DeviceType, EventType, Membership, OrgPolicyType, Organization, OrganizationId, TwoFactor,
-            TwoFactorIncomplete, TwoFactorType, User, UserId, exempt_from_member_policies,
+            Device, DeviceType, EventType, Membership, MembershipType, OrgPolicyType, Organization, OrganizationId,
+            TwoFactor, TwoFactorIncomplete, TwoFactorType, User, UserId, exempt_from_two_step_policy,
         },
     },
     mail,
@@ -170,8 +170,10 @@ pub async fn enforce_2fa_policy(
 ) -> EmptyResult {
     for member in Membership::find_by_user_and_policy(&user.uuid, OrgPolicyType::TwoFactorAuthentication, conn).await {
         // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
-        // Keykeeper: and not to MSP staff.
-        if !exempt_from_member_policies(&member, conn).await {
+        // Keykeeper: and to an MSP's staff, except an MSP's owners, so a
+        // client is never left without one; they can't be confirmed again
+        // until they turn two-step login back on.
+        if !exempt_from_two_step_policy(&member, conn).await && member.atype != MembershipType::Owner as i32 {
             if CONFIG.mail_enabled() {
                 let org = Organization::find_by_uuid(&member.org_uuid, conn).await.unwrap();
                 mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
@@ -206,8 +208,9 @@ pub async fn enforce_2fa_policy_for_org(
     let org = Organization::find_by_uuid(org_id, conn).await.unwrap();
     for member in Membership::find_confirmed_by_org(org_id, conn).await {
         // Don't enforce the policy for Admins and Owners.
-        // Keykeeper: or MSP staff.
-        if !exempt_from_member_policies(&member, conn).await
+        // Keykeeper: but do for an MSP's staff, except its owners (see above).
+        if !exempt_from_two_step_policy(&member, conn).await
+            && member.atype != MembershipType::Owner as i32
             && TwoFactor::find_by_user(&member.user_uuid, conn).await.is_empty()
         {
             if CONFIG.mail_enabled() {

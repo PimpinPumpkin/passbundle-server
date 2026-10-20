@@ -30,7 +30,7 @@ use crate::{
     error::MapResult,
 };
 
-use super::{Membership, MembershipId, MembershipType, UserId};
+use super::{CollectionId, CollectionUser, Membership, MembershipId, MembershipType, OrganizationId, UserId};
 
 /// What a custom role can be allowed to do, by upstream's permission names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,6 +325,74 @@ pub fn ensure_regular_grant(
 ) -> EmptyResult {
     if acting_as.is_some() && (new_type != MembershipType::User as i32 || custom_role.is_some() || access_all) {
         err!("Your role can only add regular members, without access to all items")
+    }
+    Ok(())
+}
+
+/// The collections a custom member can give others: the ones they reach
+/// themselves, every one for a member with access to all items. A custom role
+/// never grants more than it has (DESIGN.md, "Roles and permissions"):
+/// otherwise a role that manages users could give a second account of its own
+/// every item, and "no vault items" for a technician would mean nothing.
+pub enum Reach {
+    All,
+    Only(HashMap<CollectionId, CollectionUser>),
+}
+
+impl Reach {
+    pub async fn of(actor: &UserId, org_id: &OrganizationId, conn: &DbConn) -> Self {
+        match Membership::find_confirmed_by_user_and_org(actor, org_id, conn).await {
+            Some(member) if member.access_all => Self::All,
+            _ => Self::Only(
+                CollectionUser::find_by_organization_and_user_uuid(org_id, actor, conn)
+                    .await
+                    .into_iter()
+                    .map(|c| (c.collection_uuid.clone(), c))
+                    .collect(),
+            ),
+        }
+    }
+
+    pub fn contains(&self, collection: &CollectionId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(mine) => mine.contains_key(collection),
+        }
+    }
+
+    /// Refuses giving a collection the actor doesn't reach, more rights there
+    /// than the actor has, or the right to manage it.
+    pub fn ensure_grant(
+        &self,
+        collection: &CollectionId,
+        read_only: bool,
+        hide_passwords: bool,
+        manage: bool,
+    ) -> EmptyResult {
+        if manage {
+            err!("Your role can't give others the right to manage a collection")
+        }
+        match self {
+            Self::All => Ok(()),
+            Self::Only(mine) => match mine.get(collection) {
+                None => err!("Your role can only give access to collections it can reach"),
+                Some(own) if (own.read_only && !read_only) || (own.hide_passwords && !hide_passwords) => {
+                    err!("Your role can't give more access to a collection than it has")
+                }
+                Some(_) => Ok(()),
+            },
+        }
+    }
+}
+
+/// Refuses a technician role that could export a client's vault without
+/// access to all items: the export holds every item, so it's the same as
+/// access to all items, and the org key decrypts it. A client's own custom
+/// roles can't have access to all items yet, so they keep import and the
+/// export itself refuses them (get_org_export).
+pub fn ensure_export_needs_items(custom_role: Option<&CustomPermissions>, access_all: bool) -> EmptyResult {
+    if custom_role.is_some_and(|r| r.access_import_export) && !access_all {
+        err!("Import and export gives every item in the organization, so it needs access to all items too")
     }
     Ok(())
 }

@@ -35,12 +35,13 @@ pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
 pub use self::keykeeper_joining::{
-    INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, effective_joining, invite_hours, msp_default,
+    INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, confirms_automatically, effective_joining,
+    invite_hours, msp_default,
 };
 pub use self::keykeeper_msp::{
     EnrollmentDomains, Msp, MspClient, MspEnrollmentJoin, MspEvent, MspId, MspInvite, MspMembership, MspPolicy,
     MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains, exempt_from_member_policies,
-    parse_enrollment_domains,
+    exempt_from_two_step_policy, parse_enrollment_domains,
 };
 pub use self::keykeeper_orgs::OrgSetup;
 pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};

@@ -21,6 +21,18 @@ use crate::{
 
 use super::{MspClient, MspId, OrganizationId};
 
+/// Whether someone waiting to join gets in without an owner or admin
+/// approving them: the organization confirms automatically, and if they
+/// joined with the install command, the command is limited to the
+/// organization's email domains. A command without domains can be copied off
+/// any machine it ran on and used with any account, so those joins wait for
+/// approval. See DESIGN.md, "Onboarding through the RMM".
+pub async fn confirms_automatically(org_auto_confirm: bool, member: &super::Membership, conn: &DbConn) -> bool {
+    org_auto_confirm
+        && (!super::MspEnrollmentJoin::exists_for(&member.uuid, conn).await
+            || !super::EnrollmentDomains::for_org(&member.org_uuid, conn).await.is_empty())
+}
+
 /// Invitations last between an hour and 30 days.
 pub const INVITE_HOURS: std::ops::RangeInclusive<i32> = 1..=720;
 

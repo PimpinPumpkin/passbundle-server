@@ -15,6 +15,7 @@ use crate::{
 
 use super::{
     Membership, MembershipId, MembershipStatus, OrganizationId, TwoFactor, UserId, exempt_from_member_policies,
+    exempt_from_two_step_policy,
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -306,20 +307,22 @@ impl OrgPolicy {
     }
 
     pub async fn check_user_allowed(m: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
-        // Keykeeper: owners, admins, and MSP staff are exempt.
-        if m.status > (MembershipStatus::Invited as i32) && !exempt_from_member_policies(m, conn).await {
-            // Enforce TwoFactor/TwoStep login
-            if let Some(p) = Self::find_by_org_and_type(&m.org_uuid, OrgPolicyType::TwoFactorAuthentication, conn).await
-                && p.enabled
-                && TwoFactor::find_by_user(&m.user_uuid, conn).await.is_empty()
-            {
-                if CONFIG.email_2fa_auto_fallback() {
-                    two_factor::email::find_and_activate_email_2fa(&m.user_uuid, conn).await?;
-                } else {
-                    err!(format!("Cannot {} because 2FA is required (membership {})", action, m.uuid));
-                }
+        // Keykeeper: owners and admins are exempt from two-step login, as
+        // upstream, but an MSP's staff aren't (exempt_from_two_step_policy).
+        if m.status > (MembershipStatus::Invited as i32)
+            && !exempt_from_two_step_policy(m, conn).await
+            && let Some(p) = Self::find_by_org_and_type(&m.org_uuid, OrgPolicyType::TwoFactorAuthentication, conn).await
+            && p.enabled
+            && TwoFactor::find_by_user(&m.user_uuid, conn).await.is_empty()
+        {
+            if CONFIG.email_2fa_auto_fallback() {
+                two_factor::email::find_and_activate_email_2fa(&m.user_uuid, conn).await?;
+            } else {
+                err!(format!("Cannot {} because 2FA is required (membership {})", action, m.uuid));
             }
-
+        }
+        // Keykeeper: owners, admins, and MSP staff are exempt from the rest.
+        if m.status > (MembershipStatus::Invited as i32) && !exempt_from_member_policies(m, conn).await {
             // Check if the user is part of another Organization with SingleOrg activated
             if Self::is_applicable_to_user(&m.user_uuid, OrgPolicyType::SingleOrg, Some(&m.org_uuid), conn).await {
                 err!(format!(

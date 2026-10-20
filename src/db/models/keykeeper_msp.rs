@@ -420,6 +420,21 @@ impl MspStaff {
         })
         .await
     }
+
+    /// Whether someone is on any MSP's staff. Their account reaches every
+    /// client they work in, so no organization may recover it: see
+    /// DESIGN.md, "MSP staff and account recovery". A database error counts
+    /// as staff, so the check fails closed.
+    pub async fn is_staff_anywhere(user_uuid: &UserId, conn: &DbConn) -> bool {
+        conn.run(move |conn| {
+            msp_staff::table
+                .filter(msp_staff::user_uuid.eq(user_uuid))
+                .count()
+                .get_result::<i64>(conn)
+                .map_or(true, |n| n > 0)
+        })
+        .await
+    }
 }
 
 impl MspClient {
@@ -552,6 +567,15 @@ pub async fn exempt_from_member_policies(member: &Membership, conn: &DbConn) -> 
     member.atype >= MembershipType::Admin || MspMembership::find_by_membership(&member.uuid, conn).await.is_some()
 }
 
+/// Whether a client's "Require two-step login" policy skips this membership.
+/// Upstream exempts owners and admins; an MSP's staff aren't exempt, whatever
+/// their role, since they reach the client's items: they can't be confirmed
+/// into a client that requires it until they've set it up. See DESIGN.md,
+/// "MSP staff and two-step login".
+pub async fn exempt_from_two_step_policy(member: &Membership, conn: &DbConn) -> bool {
+    member.atype >= MembershipType::Admin && MspMembership::find_by_membership(&member.uuid, conn).await.is_none()
+}
+
 impl MspMembership {
     pub fn new(membership_uuid: MembershipId, msp_uuid: MspId) -> Self {
         Self {
@@ -580,6 +604,18 @@ impl MspMembership {
     pub async fn find_by_msp(msp_uuid: &MspId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             msp_memberships::table.filter(msp_memberships::msp_uuid.eq(msp_uuid)).load::<Self>(conn).unwrap_or_default()
+        })
+        .await
+    }
+
+    /// The same, but a database error is an error, not an empty list: for
+    /// removals, where an empty list would leave the MSP's people in place.
+    pub async fn try_find_by_msp(msp_uuid: &MspId, conn: &DbConn) -> Result<Vec<Self>, crate::error::Error> {
+        conn.run(move |conn| {
+            msp_memberships::table
+                .filter(msp_memberships::msp_uuid.eq(msp_uuid))
+                .load::<Self>(conn)
+                .map_res("Error loading MSP memberships")
         })
         .await
     }
@@ -694,6 +730,18 @@ impl MspEnrollmentJoin {
                 .values(self)
                 .execute(conn)
                 .map_res("Error recording an enrollment join")
+        })
+        .await
+    }
+
+    /// Whether a membership came from the install command.
+    pub async fn exists_for(membership_uuid: &MembershipId, conn: &DbConn) -> bool {
+        conn.run(move |conn| {
+            msp_enrollment_joins::table
+                .filter(msp_enrollment_joins::membership_uuid.eq(membership_uuid))
+                .count()
+                .get_result::<i64>(conn)
+                .is_ok_and(|n| n > 0)
         })
         .await
     }
@@ -847,6 +895,27 @@ impl MspInvite {
     pub async fn find_by_token(token: &str, conn: &DbConn) -> Option<Self> {
         let token = token.to_owned();
         conn.run(move |conn| msp_invites::table.filter(msp_invites::token.eq(token)).first::<Self>(conn).ok()).await
+    }
+
+    /// Whether the invitation is older than the server's invitation lifetime.
+    pub fn expired(&self) -> bool {
+        let hours = i64::from(crate::CONFIG.invitation_expiration_hours());
+        Utc::now().naive_utc() - self.created_at > chrono::TimeDelta::hours(hours)
+    }
+
+    /// Removes an MSP's invitations for an email: once someone joins or
+    /// leaves the staff, an old link must not bring them back.
+    pub async fn delete_by_msp_and_email(msp_uuid: &MspId, email: &str, conn: &DbConn) -> EmptyResult {
+        let email = email.trim().to_lowercase();
+        conn.run(move |conn| {
+            diesel::delete(
+                msp_invites::table.filter(msp_invites::msp_uuid.eq(msp_uuid)).filter(msp_invites::email.eq(email)),
+            )
+            .execute(conn)
+            .map(|_| ())
+            .map_res("Error removing MSP invites")
+        })
+        .await
     }
 
     pub async fn find_by_msp_and_email(msp_uuid: &MspId, email: &str, conn: &DbConn) -> Option<Self> {

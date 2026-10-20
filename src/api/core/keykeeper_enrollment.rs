@@ -371,8 +371,25 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
             err!(format!("Your access to {} was turned off. Ask its admins.", org.name))
         }
         // Invited by email, joining through the install command instead. An
-        // admin chose them, so the client's domains don't apply.
-        Some(member) => member,
+        // admin chose them, so the client's domains don't apply. Only a
+        // regular invitation, and from a verified address where the server
+        // sends email: otherwise anyone with the command could register an
+        // invited address and take its invitation, an admin's included.
+        Some(member) => {
+            if member.atype != MembershipType::User as i32
+                || member.access_all
+                || crate::db::models::keykeeper_roles::find(&member.uuid, &conn).await.is_some()
+            {
+                err!(format!("Accept your emailed invitation to {} instead.", org.name))
+            }
+            if CONFIG.mail_enabled() && headers.user.verified_at.is_none() {
+                err!(format!(
+                    "Verify your email address first, then join {}. Settings, then My account, sends the email.",
+                    org.name
+                ))
+            }
+            member
+        }
         None => {
             check_domains(&headers.user, &org, &EnrollmentDomains::for_org(&org.uuid, &conn).await)?;
             let mut member = Membership::new(headers.user.uuid.clone(), org.uuid.clone(), None);
@@ -421,7 +438,11 @@ async fn tell_owners(user: &User, org: &Organization, invited_by: Option<String>
     if !CONFIG.mail_enabled() {
         return;
     }
-    let approve = !effective_joining(&org.uuid, conn).await.0.auto_confirm;
+    let auto = effective_joining(&org.uuid, conn).await.0.auto_confirm;
+    let approve = match Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await {
+        Some(member) => !crate::db::models::confirms_automatically(auto, &member, conn).await,
+        None => !auto,
+    };
     let mut to: Vec<String> = Vec::new();
     if let Some(inviter) = invited_by {
         to.push(inviter);
