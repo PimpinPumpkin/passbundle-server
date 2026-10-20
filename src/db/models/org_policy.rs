@@ -306,6 +306,19 @@ impl OrgPolicy {
         false
     }
 
+    /// Keykeeper: whether a member can't be confirmed until they turn on
+    /// two-step login (the check below): their organization requires it, it
+    /// applies to them, they have none, and the server won't turn on email
+    /// codes for them. See DESIGN.md, "Joining".
+    pub async fn waits_for_two_step(m: &Membership, conn: &DbConn) -> bool {
+        !CONFIG.email_2fa_auto_fallback()
+            && !exempt_from_two_step_policy(m, conn).await
+            && Self::find_by_org_and_type(&m.org_uuid, OrgPolicyType::TwoFactorAuthentication, conn)
+                .await
+                .is_some_and(|p| p.enabled)
+            && TwoFactor::find_by_user(&m.user_uuid, conn).await.is_empty()
+    }
+
     pub async fn check_user_allowed(m: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
         // Keykeeper: owners and admins are exempt from two-step login, as
         // upstream, but an MSP's staff aren't (exempt_from_two_step_policy).

@@ -982,6 +982,7 @@ async fn pending_confirmations(msp_id: MspId, headers: Headers, conn: DbConn) ->
                 "publicKey": public_key,
                 "fromMsp": from_msp,
                 "autoConfirm": crate::db::models::confirms_automatically(auto_confirm, &member, &conn).await,
+                "needsTwoStep": crate::db::models::OrgPolicy::waits_for_two_step(&member, &conn).await,
             });
             super::keykeeper_joining::extend(
                 &mut entry,

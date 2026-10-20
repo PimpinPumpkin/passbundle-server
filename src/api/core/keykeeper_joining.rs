@@ -19,7 +19,7 @@ use crate::{
         models::{
             EnrollmentDomains, INVITE_HOURS, JoinSeal, Joining, JoiningSeal, JoiningSource, Membership,
             MembershipStatus, MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspJoining, MspMembership,
-            OrgJoining, OrgSetup, Organization, OrganizationId, SealKind, User, confirms_automatically,
+            OrgJoining, OrgPolicy, OrgSetup, Organization, OrganizationId, SealKind, User, confirms_automatically,
             effective_joining, msp_default,
         },
     },
@@ -28,7 +28,15 @@ use crate::{
 use super::keykeeper_msp::{Audit, require_admin, staff_member};
 
 pub fn routes() -> Vec<Route> {
-    routes![get_org_joining, set_org_joining, reset_org_joining, get_msp_joining, set_msp_joining, pending_for_caller]
+    routes![
+        get_org_joining,
+        set_org_joining,
+        reset_org_joining,
+        get_msp_joining,
+        set_msp_joining,
+        pending_for_caller,
+        two_step_needed
+    ]
 }
 
 #[derive(Deserialize)]
@@ -280,8 +288,9 @@ pub(super) fn extend(entry: &mut Value, more: Value) {
 
 /// Everyone waiting for an organization's key in organizations where the
 /// caller can confirm them, with whether each organization confirms
-/// automatically. Upstream's rules: owners confirm anyone, admins only
-/// regular members.
+/// automatically, and whether they first have to turn on two-step login
+/// (confirming them fails until they do). Upstream's rules: owners confirm
+/// anyone, admins only regular members.
 #[get("/keykeeper/organizations/pending")]
 async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
     let mut pending = Vec::new();
@@ -312,10 +321,27 @@ async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
                 "publicKey": public_key,
                 "fromMsp": from_msp,
                 "autoConfirm": confirms_automatically(joining.auto_confirm, &member, &conn).await,
+                "needsTwoStep": OrgPolicy::waits_for_two_step(&member, &conn).await,
             });
             extend(&mut entry, vouching(&caller.org_uuid, &member, &user.email, from_msp, &conn).await);
             pending.push(entry);
         }
     }
     Ok(Json(json!({ "data": pending })))
+}
+
+/// The caller's organizations that can't confirm them until they turn on
+/// two-step login, so their apps can say so.
+#[get("/keykeeper/organizations/two-step-needed")]
+async fn two_step_needed(headers: Headers, conn: DbConn) -> JsonResult {
+    let mut waiting = Vec::new();
+    for member in Membership::find_accepted_and_confirmed_by_user(&headers.user.uuid, &conn).await {
+        if member.status != MembershipStatus::Accepted as i32 || !OrgPolicy::waits_for_two_step(&member, &conn).await {
+            continue;
+        }
+        if let Some(org) = Organization::find_by_uuid(&member.org_uuid, &conn).await {
+            waiting.push(json!({ "organizationId": org.uuid, "name": org.name }));
+        }
+    }
+    Ok(Json(json!({ "data": waiting })))
 }
