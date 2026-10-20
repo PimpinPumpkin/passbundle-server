@@ -28,6 +28,10 @@ pub struct OrgSetup {
     pub enrollment_token_created_at: Option<NaiveDateTime>,
     /// The collection people who join get, such as "Everyone".
     pub everyone_collection: Option<CollectionId>,
+    /// The install command's join secret, encrypted with the organization's
+    /// key by an owner's or admin's browser. See DESIGN.md, "Joins a hacked
+    /// server can't forge".
+    pub enrollment_secret: Option<String>,
 }
 
 impl OrgSetup {
@@ -46,6 +50,7 @@ impl OrgSetup {
             enrollment_token: token.then(MspClient::new_enrollment_token),
             enrollment_token_created_at: token.then_some(now),
             everyone_collection,
+            enrollment_secret: None,
         }
     }
 
@@ -66,17 +71,41 @@ impl OrgSetup {
         .await
     }
 
-    /// Replaces the enrollment token, or makes the first one. Install commands
-    /// with the old one stop letting new people join.
-    pub async fn replace_enrollment_token(&mut self, conn: &DbConn) -> EmptyResult {
+    /// Sets the install command's join secret, encrypted by the browser,
+    /// keeping the token.
+    pub async fn set_enrollment_secret(&mut self, secret: Option<String>, conn: &DbConn) -> EmptyResult {
+        let org = self.org_uuid.clone();
+        let saved = secret.clone();
+        conn.run(move |conn| {
+            diesel::update(org_setups::table.filter(org_setups::org_uuid.eq(org)))
+                .set(org_setups::enrollment_secret.eq(saved))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error saving the join secret")
+        })
+        .await?;
+        self.enrollment_secret = secret;
+        Ok(())
+    }
+
+    /// Replaces the enrollment token, or makes the first one, with the new
+    /// command's join secret (encrypted, from the browser that made it; none
+    /// from an older app). Install commands with the old one stop letting new
+    /// people join.
+    pub async fn replace_enrollment_token(&mut self, secret: Option<String>, conn: &DbConn) -> EmptyResult {
         let token = MspClient::new_enrollment_token();
         let now = Utc::now().naive_utc();
         let org = self.org_uuid.clone();
         let saved = token.clone();
+        let saved_secret = secret.clone();
         let updated: EmptyResult = conn
             .run(move |conn| {
                 diesel::update(org_setups::table.filter(org_setups::org_uuid.eq(org)))
-                    .set((org_setups::enrollment_token.eq(saved), org_setups::enrollment_token_created_at.eq(now)))
+                    .set((
+                        org_setups::enrollment_token.eq(saved),
+                        org_setups::enrollment_token_created_at.eq(now),
+                        org_setups::enrollment_secret.eq(saved_secret),
+                    ))
                     .execute(conn)
                     .map_res("Error replacing the enrollment token")
             })
@@ -84,6 +113,7 @@ impl OrgSetup {
         updated?;
         self.enrollment_token = Some(token);
         self.enrollment_token_created_at = Some(now);
+        self.enrollment_secret = secret;
         Ok(())
     }
 }

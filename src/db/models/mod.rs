@@ -14,6 +14,7 @@ mod keykeeper_joining;
 mod keykeeper_msp;
 mod keykeeper_orgs;
 pub mod keykeeper_roles;
+mod keykeeper_seals;
 mod org_policy;
 mod organization;
 mod send;
@@ -44,6 +45,7 @@ pub use self::keykeeper_msp::{
     exempt_from_two_step_policy, parse_enrollment_domains,
 };
 pub use self::keykeeper_orgs::OrgSetup;
+pub use self::keykeeper_seals::{JoinSeal, JoiningSeal, SealKind, valid_encrypted_secret, valid_seal};
 pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
 pub use self::organization::{
     Membership, MembershipId, MembershipStatus, MembershipType, OrgApiKeyId, Organization, OrganizationApiKey,

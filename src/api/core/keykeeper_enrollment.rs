@@ -26,9 +26,10 @@ use crate::{
     db::{
         DbConn,
         models::{
-            CollectionId, CollectionUser, EnrollmentDomains, Membership, MembershipStatus, MembershipType, Msp,
-            MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
+            CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, Membership, MembershipStatus, MembershipType,
+            Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
             OrganizationId, User, effective_joining, email_in_domains, parse_enrollment_domains,
+            valid_encrypted_secret, valid_seal,
         },
     },
     mail,
@@ -58,33 +59,82 @@ async fn msp_client(msp_id: &MspId, org_id: &OrganizationId, conn: &DbConn) -> R
 }
 
 async fn enrollment_json(client: &MspClient, conn: &DbConn) -> serde_json::Value {
-    install_json(&client.org_uuid, client.enrollment_token.as_ref(), client.enrollment_token_created_at.as_ref(), conn)
-        .await
+    install_json(
+        &client.org_uuid,
+        client.enrollment_token.as_ref(),
+        client.enrollment_token_created_at.as_ref(),
+        client.enrollment_secret.as_ref(),
+        conn,
+    )
+    .await
 }
 
+async fn setup_json(setup: &OrgSetup, conn: &DbConn) -> serde_json::Value {
+    install_json(
+        &setup.org_uuid,
+        setup.enrollment_token.as_ref(),
+        setup.enrollment_token_created_at.as_ref(),
+        setup.enrollment_secret.as_ref(),
+        conn,
+    )
+    .await
+}
+
+/// The install command's parts: the token, the join secret (encrypted with the
+/// organization's key, for the browser to show in the command), the email
+/// domains, and how many joined with it.
 async fn install_json(
     org_id: &OrganizationId,
     token: Option<&String>,
     created_at: Option<&chrono::NaiveDateTime>,
+    secret: Option<&String>,
     conn: &DbConn,
 ) -> serde_json::Value {
     json!({
         "token": token,
+        "secret": secret,
         "createdAt": created_at.map(crate::util::format_date),
         "joins": MspEnrollmentJoin::count_by_org(org_id, conn).await,
         "domains": EnrollmentDomains::for_org(org_id, conn).await,
     })
 }
 
+/// A seal from an app, checked to look like one. None when there isn't one.
+pub(super) fn checked_seal(seal: Option<&String>) -> Result<Option<&str>, crate::error::Error> {
+    match seal {
+        Some(seal) if !valid_seal(seal) => err!("That seal isn't one"),
+        seal => Ok(seal.map(String::as_str)),
+    }
+}
+
+/// A join secret from the browser, checked to look like an encrypted one.
+pub(super) fn checked_secret(secret: Option<&String>) -> Result<Option<String>, crate::error::Error> {
+    match secret {
+        Some(secret) if !valid_encrypted_secret(secret) => err!("That join secret isn't an encrypted one"),
+        secret => Ok(secret.cloned()),
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceData {
+    /// The new command's join secret, encrypted with the organization's key.
+    secret: Option<String>,
+}
+
 /// Saves a list of email domains for an organization's install command, or
 /// clears it. The limit trusts an account's email only once it's verified, so
 /// it needs a server that sends email.
+///
+/// The seal, from the app that saved them, covers the joining setting and the
+/// domains together; a change without one means joins need approval.
 async fn save_domains(
     org_id: &OrganizationId,
-    domains: &[String],
+    data: &DomainsData,
     conn: &DbConn,
 ) -> Result<Vec<String>, crate::error::Error> {
-    let domains = match parse_enrollment_domains(domains) {
+    let seal = checked_seal(data.seal.as_ref())?;
+    let domains = match parse_enrollment_domains(&data.domains) {
         Ok(domains) => domains,
         Err(e) => err!(e),
     };
@@ -92,6 +142,7 @@ async fn save_domains(
         err!("Limiting the install command to email domains needs verified emails, and this server can't send email")
     }
     EnrollmentDomains::set(org_id, &domains, conn).await?;
+    JoiningSeal::set(org_id, seal, conn).await?;
     Ok(domains)
 }
 
@@ -114,11 +165,18 @@ async fn get_enrollment(msp_id: MspId, org_id: OrganizationId, headers: Headers,
 
 /// Replaces a client's enrollment token. MSP admins only: install commands with
 /// the old token stop letting new people join.
-#[post("/keykeeper/msp/<msp_id>/clients/<org_id>/enrollment")]
-async fn replace_enrollment(msp_id: MspId, org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+#[post("/keykeeper/msp/<msp_id>/clients/<org_id>/enrollment", data = "<data>")]
+async fn replace_enrollment(
+    msp_id: MspId,
+    org_id: OrganizationId,
+    data: Option<Json<ReplaceData>>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
+    let secret = checked_secret(data.map(Json::into_inner).unwrap_or_default().secret.as_ref())?;
     let mut client = msp_client(&msp_id, &org_id, &conn).await?;
-    client.replace_enrollment_token(&conn).await?;
+    client.replace_enrollment_token(secret, &conn).await?;
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
     Audit::by("install_token_replaced", &headers).org(&org_id, &org_name).record(&msp_id, &conn).await?;
     Ok(Json(enrollment_json(&client, &conn).await))
@@ -128,6 +186,8 @@ async fn replace_enrollment(msp_id: MspId, org_id: OrganizationId, headers: Head
 #[serde(rename_all = "camelCase")]
 struct DomainsData {
     domains: Vec<String>,
+    /// The seal over the joining setting and these domains.
+    seal: Option<String>,
 }
 
 /// Limits a client's install command to accounts at these email domains, or
@@ -144,7 +204,7 @@ async fn set_enrollment_domains(
 ) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let client = msp_client(&msp_id, &org_id, &conn).await?;
-    let domains = save_domains(&org_id, &data.domains, &conn).await?;
+    let domains = save_domains(&org_id, &data, &conn).await?;
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
     Audit::by("install_domains_set", &headers)
         .org(&org_id, &org_name)
@@ -217,6 +277,7 @@ async fn get_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbCo
             &org_id,
             setup.and_then(|s| s.enrollment_token.as_ref()),
             setup.and_then(|s| s.enrollment_token_created_at.as_ref()),
+            setup.and_then(|s| s.enrollment_secret.as_ref()),
             &conn,
         )
         .await,
@@ -225,22 +286,27 @@ async fn get_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbCo
 
 /// Makes a company's own organization's install command, or replaces it:
 /// commands with the old token stop letting new people join. Owners and admins.
-#[post("/keykeeper/organizations/<org_id>/enrollment")]
-async fn replace_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+#[post("/keykeeper/organizations/<org_id>/enrollment", data = "<data>")]
+async fn replace_org_enrollment(
+    org_id: OrganizationId,
+    data: Option<Json<ReplaceData>>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    let secret = checked_secret(data.map(Json::into_inner).unwrap_or_default().secret.as_ref())?;
     let setup = match own_org_admin(&org_id, &headers, &conn).await? {
         OrgSetupOrNew::Saved(mut setup) => {
-            setup.replace_enrollment_token(&conn).await?;
+            setup.replace_enrollment_token(secret, &conn).await?;
             setup
         }
         OrgSetupOrNew::New(_) => {
-            let setup = OrgSetup::new(org_id.clone(), None, None, true);
+            let mut setup = OrgSetup::new(org_id.clone(), None, None, true);
+            setup.enrollment_secret = secret;
             setup.insert(&conn).await?;
             setup
         }
     };
-    Ok(Json(
-        install_json(&org_id, setup.enrollment_token.as_ref(), setup.enrollment_token_created_at.as_ref(), &conn).await,
-    ))
+    Ok(Json(setup_json(&setup, &conn).await))
 }
 
 /// Limits a company's own organization's install command to accounts at these
@@ -254,11 +320,8 @@ async fn set_org_enrollment_domains(
     conn: DbConn,
 ) -> JsonResult {
     let found = own_org_admin(&org_id, &headers, &conn).await?;
-    save_domains(&org_id, &data.domains, &conn).await?;
-    let setup = found.setup();
-    Ok(Json(
-        install_json(&org_id, setup.enrollment_token.as_ref(), setup.enrollment_token_created_at.as_ref(), &conn).await,
-    ))
+    save_domains(&org_id, &data, &conn).await?;
+    Ok(Json(setup_json(found.setup(), &conn).await))
 }
 
 /// What an install command joins: one of an MSP's clients, or a company's own
@@ -347,6 +410,10 @@ struct JoinData {
     /// The person's user key encrypted to the organization's public key, when
     /// the organization enrolls members in account recovery automatically.
     reset_password_key: Option<String>,
+    /// That the extension knew the command's join secret, bound to the
+    /// person's public key, for the apps that confirm. See DESIGN.md, "Joins a
+    /// hacked server can't forge".
+    proof: Option<String>,
 }
 
 /// Joins the organization a token belongs to, as a regular member waiting to
@@ -354,6 +421,7 @@ struct JoinData {
 #[post("/keykeeper/enrollment/join", data = "<data>")]
 async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data = data.into_inner();
+    let proof = checked_seal(data.proof.as_ref())?.map(str::to_owned);
     let Some(target) = target_by_token(&data.token, &conn).await else {
         err_code!(INVALID_TOKEN, rocket::http::Status::NotFound.code)
     };
@@ -415,7 +483,7 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
     if let Some(collection) = &target.everyone_collection {
         CollectionUser::save(&headers.user.uuid, collection, false, false, false, &conn).await?;
     }
-    MspEnrollmentJoin::new(member_id, org.uuid.clone()).insert(&conn).await?;
+    MspEnrollmentJoin::new(member_id, org.uuid.clone(), proof).insert(&conn).await?;
     if let Some(msp_id) = &target.msp_uuid {
         Audit::by("joined_with_install_command", &headers)
             .org(&org.uuid, &org.name)

@@ -969,6 +969,11 @@ struct InviteData {
     collections: Option<Vec<CollectionData>>,
     #[serde(default)]
     permissions: HashMap<String, Value>,
+    /// Keykeeper: seals the inviter's app made, by email, so apps confirming
+    /// in the background know an admin invited each person. See DESIGN.md,
+    /// "Joins a hacked server can't forge".
+    #[serde(default)]
+    keykeeper_seals: HashMap<String, String>,
 }
 
 impl InviteData {
@@ -983,6 +988,11 @@ impl InviteData {
         let org_group_ids: HashSet<&GroupId> = org_groups.iter().map(|c| &c.uuid).collect();
         if let Some(e) = self.groups.iter().find(|g| !org_group_ids.contains(g)) {
             err!("Invalid group", format!("Group {} does not belong to organization {}!", e, org_id))
+        }
+
+        // Keykeeper: seals are checked before anyone is invited.
+        for seal in self.keykeeper_seals.values() {
+            super::keykeeper_enrollment::checked_seal(Some(seal))?;
         }
 
         Ok(())
@@ -1097,6 +1107,16 @@ async fn send_invite(
         if custom_role.is_some() {
             crate::db::models::keykeeper_roles::set(&new_member.uuid, custom_role.as_ref(), &conn).await?;
         }
+        // Keykeeper: the invitation's seal, or none, so an earlier one never vouches for this.
+        let seal = data.keykeeper_seals.iter().find(|(e, _)| e.eq_ignore_ascii_case(email)).map(|(_, seal)| seal);
+        crate::db::models::JoinSeal::set(
+            &org_id,
+            email,
+            crate::db::models::SealKind::Invite,
+            super::keykeeper_enrollment::checked_seal(seal)?,
+            &conn,
+        )
+        .await?;
 
         if CONFIG.mail_enabled() {
             let org_name = if let Some(org) = Organization::find_by_uuid(&org_id, &conn).await {

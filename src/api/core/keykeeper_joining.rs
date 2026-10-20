@@ -17,9 +17,10 @@ use crate::{
     db::{
         DbConn,
         models::{
-            INVITE_HOURS, Joining, JoiningSource, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId,
-            MspJoining, OrgJoining, Organization, OrganizationId, User, confirms_automatically, effective_joining,
-            msp_default,
+            EnrollmentDomains, INVITE_HOURS, JoinSeal, Joining, JoiningSeal, JoiningSource, Membership,
+            MembershipStatus, MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspJoining, MspMembership,
+            OrgJoining, OrgSetup, Organization, OrganizationId, SealKind, User, confirms_automatically,
+            effective_joining, msp_default,
         },
     },
 };
@@ -35,6 +36,18 @@ pub fn routes() -> Vec<Route> {
 struct JoiningData {
     auto_confirm: bool,
     invite_hours: i32,
+    /// For an organization's own setting: the seal over it and the
+    /// organization's email domains, from the app that saved it.
+    seal: Option<String>,
+    /// For an MSP's default: a seal per client that follows it.
+    #[serde(default)]
+    seals: std::collections::HashMap<OrganizationId, String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SealData {
+    seal: Option<String>,
 }
 
 impl JoiningData {
@@ -78,6 +91,10 @@ async fn org_view(org_id: &OrganizationId, conn: &DbConn) -> Value {
         JoiningSource::Msp => "msp",
         JoiningSource::Server => "server",
     });
+    // What the seal covers with the setting, and the seal, so an app saving a
+    // change can check what it's resealing.
+    view["domains"] = json!(EnrollmentDomains::for_org(org_id, conn).await);
+    view["seal"] = json!(JoiningSeal::find(org_id, conn).await);
     // For an MSP's client, the MSP and its default, whether the client
     // follows it or has its own: the admin console offers to go back to it.
     let msp = match MspClient::find_by_org(org_id, conn).await {
@@ -135,17 +152,28 @@ async fn set_org_joining(
     conn: DbConn,
 ) -> JsonResult {
     require_owner_or_admin(&org_id, &headers, &conn).await?;
-    let joining = data.into_inner().checked()?;
+    let data = data.into_inner();
+    let seal = super::keykeeper_enrollment::checked_seal(data.seal.as_ref())?;
+    let joining = data.checked()?;
     OrgJoining::new(org_id.clone(), joining).save(&conn).await?;
+    JoiningSeal::set(&org_id, seal, &conn).await?;
     record_for_msp(&org_id, "client_joining_set", describe(joining), &headers, &conn).await?;
     Ok(Json(org_view(&org_id, &conn).await))
 }
 
 /// Puts the organization back on its MSP's default, or the server's.
-#[delete("/keykeeper/organizations/<org_id>/joining")]
-async fn reset_org_joining(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+#[delete("/keykeeper/organizations/<org_id>/joining", data = "<data>")]
+async fn reset_org_joining(
+    org_id: OrganizationId,
+    data: Option<Json<SealData>>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
     require_owner_or_admin(&org_id, &headers, &conn).await?;
+    let data = data.map(Json::into_inner).unwrap_or_default();
+    let seal = super::keykeeper_enrollment::checked_seal(data.seal.as_ref())?;
     OrgJoining::delete(&org_id, &conn).await?;
+    JoiningSeal::set(&org_id, seal, &conn).await?;
     record_for_msp(&org_id, "client_joining_default", String::new(), &headers, &conn).await?;
     Ok(Json(org_view(&org_id, &conn).await))
 }
@@ -157,6 +185,9 @@ async fn get_msp_joining(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonR
     // A technician limited to some clients sees only those.
     let reach = caller.reach(&conn).await;
     let mut own = Vec::new();
+    // The clients that follow the default, with what an MSP admin's app
+    // reseals for each when the default changes.
+    let mut following = Vec::new();
     for client in MspClient::find_by_msp(&msp_id, &conn).await {
         if reach.as_ref().is_some_and(|r| !r.contains(&client.org_uuid)) {
             continue;
@@ -169,19 +200,82 @@ async fn get_msp_joining(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonR
                 "autoConfirm": setting.auto_confirm,
                 "inviteHours": setting.invite_hours,
             }));
+        } else {
+            following.push(json!({
+                "organizationId": client.org_uuid,
+                "domains": EnrollmentDomains::for_org(&client.org_uuid, &conn).await,
+                "seal": JoiningSeal::find(&client.org_uuid, &conn).await,
+            }));
         }
     }
-    Ok(Json(json!({ "default": joining_json(msp_default(&msp_id, &conn).await), "ownSettings": own })))
+    Ok(Json(json!({
+        "default": joining_json(msp_default(&msp_id, &conn).await),
+        "ownSettings": own,
+        "following": following,
+    })))
 }
 
 /// Sets the MSP's default. Clients with their own setting keep it.
 #[put("/keykeeper/msp/<msp_id>/joining", data = "<data>")]
 async fn set_msp_joining(msp_id: MspId, data: Json<JoiningData>, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
-    let joining = data.into_inner().checked()?;
+    let data = data.into_inner();
+    let joining = data.checked()?;
+    for seal in data.seals.values() {
+        super::keykeeper_enrollment::checked_seal(Some(seal))?;
+    }
     MspJoining::new(msp_id.clone(), joining).save(&conn).await?;
+    // Every client that follows the default gets the seal the app made for
+    // it, or none: then its joins need approval until an admin seals it.
+    for client in MspClient::find_by_msp(&msp_id, &conn).await {
+        if OrgJoining::find(&client.org_uuid, &conn).await.is_none() {
+            JoiningSeal::set(&client.org_uuid, data.seals.get(&client.org_uuid).map(String::as_str), &conn).await?;
+        }
+    }
     Audit::by("joining_default_set", &headers).detail(describe(joining)).record(&msp_id, &conn).await?;
     get_msp_joining(msp_id, headers, conn).await
+}
+
+/// What an app needs to decide on its own whether to let someone waiting in,
+/// without trusting the server: the organization's joining setting with its
+/// seal, and whatever vouches for the person (an invitation's seal, an MSP
+/// staff seal, or an install command join's proof with the command's
+/// encrypted join secret). The server can't make any of these. See DESIGN.md,
+/// "Joins a hacked server can't forge".
+pub(super) async fn vouching(
+    org_id: &OrganizationId,
+    member: &Membership,
+    email: &str,
+    from_msp: bool,
+    conn: &DbConn,
+) -> Value {
+    let (joining, _) = effective_joining(org_id, conn).await;
+    let proof = MspEnrollmentJoin::proof_for(&member.uuid, conn).await;
+    let secret = match &proof {
+        None => None,
+        Some(_) => match MspClient::find_by_org(org_id, conn).await {
+            Some(client) => client.enrollment_secret,
+            None => OrgSetup::find_by_org(org_id, conn).await.and_then(|s| s.enrollment_secret),
+        },
+    };
+    json!({
+        "joining": {
+            "autoConfirm": joining.auto_confirm,
+            "domains": EnrollmentDomains::for_org(org_id, conn).await,
+            "seal": JoiningSeal::find(org_id, conn).await,
+        },
+        "inviteSeal": JoinSeal::find(org_id, email, SealKind::Invite, conn).await,
+        "staffSeal": if from_msp { JoinSeal::find(org_id, email, SealKind::Staff, conn).await } else { None },
+        "joinProof": proof,
+        "enrollmentSecret": secret,
+    })
+}
+
+/// Adds the fields of `more` to `entry`.
+pub(super) fn extend(entry: &mut Value, more: Value) {
+    if let (Some(entry), Value::Object(more)) = (entry.as_object_mut(), more) {
+        entry.extend(more);
+    }
 }
 
 /// Everyone waiting for an organization's key in organizations where the
@@ -209,13 +303,18 @@ async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
             let Some(public_key) = user.public_key.clone() else {
                 continue;
             };
-            pending.push(json!({
+            let from_msp = MspMembership::find_by_membership(&member.uuid, &conn).await.is_some();
+            let mut entry = json!({
                 "organizationId": caller.org_uuid,
                 "memberId": member.uuid,
+                "userId": user.uuid,
                 "email": user.email,
                 "publicKey": public_key,
+                "fromMsp": from_msp,
                 "autoConfirm": confirms_automatically(joining.auto_confirm, &member, &conn).await,
-            }));
+            });
+            extend(&mut entry, vouching(&caller.org_uuid, &member, &user.email, from_msp, &conn).await);
+            pending.push(entry);
         }
     }
     Ok(Json(json!({ "data": pending })))
