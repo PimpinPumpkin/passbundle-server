@@ -25,11 +25,14 @@ use crate::{
 };
 
 pub fn routes() -> Vec<Route> {
-    if CONFIG.icon_service().as_str() == "internal" {
+    let mut routes = if CONFIG.icon_service().as_str() == "internal" {
         routes![icon_internal]
     } else {
         routes![icon_external]
-    }
+    };
+    // Keykeeper: the change-password page lookup upstream's apps ask the icons service for.
+    routes.extend(crate::api::keykeeper_change_password::routes());
+    routes
 }
 
 static CLIENT: LazyLock<Client> = LazyLock::new(|| {

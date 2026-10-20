@@ -2,6 +2,7 @@ mod admin;
 pub mod core;
 mod icons;
 mod identity;
+mod keykeeper_change_password;
 mod notifications;
 mod push;
 mod web;
