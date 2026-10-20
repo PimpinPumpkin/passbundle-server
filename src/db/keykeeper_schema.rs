@@ -246,3 +246,42 @@ table! {
         value -> Text,
     }
 }
+
+table! {
+    script_tokens (uuid) {
+        uuid -> Text,
+        org_uuid -> Text,
+        name -> Text,
+        created_by -> Text,
+        created_at -> Timestamp,
+        expires_at -> Timestamp,
+        revoked_at -> Nullable<Timestamp>,
+        auth_hash -> Text,
+        networks -> Text,
+        sealed_key -> Text,
+        last_used_at -> Nullable<Timestamp>,
+        last_used_ip -> Nullable<Text>,
+    }
+}
+
+table! {
+    script_grants (token_uuid, cipher_uuid) {
+        token_uuid -> Text,
+        cipher_uuid -> Text,
+        copy -> Text,
+        revision -> Text,
+        sealed_spec -> Text,
+    }
+}
+
+table! {
+    script_reads (uuid) {
+        uuid -> Text,
+        token_uuid -> Text,
+        cipher_uuid -> Nullable<Text>,
+        read_at -> Timestamp,
+        ip -> Text,
+        allowed -> Bool,
+        reason -> Text,
+    }
+}
