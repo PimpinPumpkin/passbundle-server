@@ -42,9 +42,9 @@ pub use self::keykeeper_joining::{
     invite_hours, msp_default,
 };
 pub use self::keykeeper_msp::{
-    EnrollmentDomains, Msp, MspClient, MspEnrollmentJoin, MspEvent, MspId, MspInvite, MspMembership, MspPolicy,
-    MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains, exempt_from_member_policies,
-    exempt_from_two_step_policy, parse_enrollment_domains,
+    CustomRole, EnrollmentDomains, Msp, MspClient, MspEnrollmentJoin, MspEvent, MspId, MspInvite, MspMembership,
+    MspPolicy, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,
+    exempt_from_member_policies, exempt_from_two_step_policy, parse_enrollment_domains,
 };
 pub use self::keykeeper_orgs::OrgSetup;
 pub use self::keykeeper_script_access::{ScriptGrant, ScriptRead, ScriptToken, parse_networks};

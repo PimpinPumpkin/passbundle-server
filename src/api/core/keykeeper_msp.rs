@@ -13,7 +13,7 @@
 // a staff member's client memberships in step with their role and access, so
 // every change applies to all of their clients at once.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rocket::{Route, serde::json::Json};
 use serde_json::Value;
@@ -25,9 +25,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Collection, Membership, MembershipId, MembershipStatus, MembershipType, Msp, MspClient, MspEvent, MspId,
-            MspInvite, MspMembership, MspRole, MspStaff, OrgSetup, Organization, OrganizationId, TechnicianAccess,
-            User, UserId, effective_joining,
+            Collection, CustomRole, Membership, MembershipId, MembershipStatus, MembershipType, Msp, MspClient,
+            MspEvent, MspId, MspInvite, MspMembership, MspRole, MspStaff, OrgSetup, Organization, OrganizationId,
+            TechnicianAccess, User, UserId, effective_joining,
             keykeeper_roles::{self, CustomPermissions, Permission},
         },
     },
@@ -203,7 +203,25 @@ impl Grant {
     fn for_staff(staff: &MspStaff) -> Option<Self> {
         let role = staff.role()?;
         let custom = (role == MspRole::Technician).then(|| staff.custom_role()).flatten();
-        Some(match custom {
+        Some(Self::with(role, custom))
+    }
+
+    /// The same, in one client: a technician's role there when it differs
+    /// from their role in the rest (`roles`, from `MspStaff::client_roles`).
+    fn for_staff_in(
+        staff: &MspStaff,
+        roles: &HashMap<OrganizationId, Option<CustomRole>>,
+        client: &OrganizationId,
+    ) -> Option<Self> {
+        let role = staff.role()?;
+        match roles.get(client) {
+            Some(custom) if role == MspRole::Technician => Some(Self::with(role, custom.clone())),
+            _ => Self::for_staff(staff),
+        }
+    }
+
+    fn with(role: MspRole, custom: Option<CustomRole>) -> Self {
+        match custom {
             None => Self {
                 atype: role.membership_type(),
                 access_all: true,
@@ -214,7 +232,7 @@ impl Grant {
                 access_all: custom.vault_items,
                 custom: Some(custom.permissions),
             },
-        })
+        }
     }
 }
 
@@ -250,12 +268,13 @@ async fn add_msp_membership(
 /// the MSP's memberships removed from clients they no longer reach.
 /// Memberships a client granted itself are left alone.
 async fn sync_staff_memberships(msp_id: &MspId, staff: &MspStaff, invited_by: &str, conn: &DbConn) -> EmptyResult {
-    let Some(grant) = Grant::for_staff(staff) else {
-        return Ok(());
-    };
     let reach = staff.reach(conn).await;
+    let roles = staff.client_roles(conn).await;
     let ours = msp_membership_ids(msp_id, conn).await;
     for client in MspClient::find_by_msp(msp_id, conn).await {
+        let Some(grant) = Grant::for_staff_in(staff, &roles, &client.org_uuid) else {
+            return Ok(());
+        };
         let reached = reach.as_ref().is_none_or(|r| r.contains(&client.org_uuid));
         match Membership::find_by_user_and_org(&staff.user_uuid, &client.org_uuid, conn).await {
             None if reached => {
@@ -633,6 +652,28 @@ async fn validate_access(
     if let Some(custom) = &access.custom {
         keykeeper_roles::ensure_export_needs_items(Some(&custom.permissions), custom.vault_items)?;
     }
+    // A different role in some clients: each client once, one they reach,
+    // and a custom role there follows the same rules.
+    let mut seen = HashSet::new();
+    let clients: HashSet<OrganizationId> =
+        MspClient::find_by_msp(msp_id, conn).await.into_iter().map(|c| c.org_uuid).collect();
+    for role in &access.client_roles {
+        if !seen.insert(role.client.clone()) {
+            err!("Each client can have only one role")
+        }
+        if !clients.contains(&role.client) {
+            err!("Client not found")
+        }
+        if !access.all_clients && !access.clients.contains(&role.client) {
+            err!("A role is only for a client the technician reaches")
+        }
+        if let Some(custom) = &role.custom {
+            if !custom.permissions.any() {
+                err!("Choose at least one permission for the custom role")
+            }
+            keykeeper_roles::ensure_export_needs_items(Some(&custom.permissions), custom.vault_items)?;
+        }
+    }
     Ok(access)
 }
 
@@ -656,7 +697,30 @@ async fn describe_access(access: &TechnicianAccess, conn: &DbConn) -> String {
             [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
         }
     };
-    let role = match &access.custom {
+    let role = role_in_words(access.custom.as_ref());
+    let install = if access.install_commands {
+        "install commands"
+    } else {
+        "no install commands"
+    };
+    let mut words = format!("{clients}, {role}, {install}");
+    let mut differing = Vec::new();
+    for role in &access.client_roles {
+        if let Some(org) = Organization::find_by_uuid(&role.client, conn).await {
+            differing.push(format!("{} {}", org.name, role_in_words(role.custom.as_ref())));
+        }
+    }
+    differing.sort();
+    if !differing.is_empty() {
+        words.push_str("; in ");
+        words.push_str(&differing.join("; in "));
+    }
+    words
+}
+
+/// A role in a few words: "as admin", or "custom role (...), no vault items".
+fn role_in_words(custom: Option<&CustomRole>) -> String {
+    match custom {
         None => "as admin".to_owned(),
         Some(custom) => {
             let permissions: Vec<&str> =
@@ -668,13 +732,7 @@ async fn describe_access(access: &TechnicianAccess, conn: &DbConn) -> String {
             };
             format!("custom role ({}), {items}", permissions.join(", "))
         }
-    };
-    let install = if access.install_commands {
-        "install commands"
-    } else {
-        "no install commands"
-    };
-    format!("{clients}, {role}, {install}")
+    }
 }
 
 fn invite_url(token: &str) -> String {
