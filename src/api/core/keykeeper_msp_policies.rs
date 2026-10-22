@@ -87,8 +87,8 @@ fn policy_name(t: OrgPolicyType) -> &'static str {
 }
 
 /// The Business preset's policies, which a new MSP's defaults start as. See
-/// DESIGN.md, "Defaults (Business preset)". The keykeeper_msp_policies
-/// migration gave MSPs that already existed the same.
+/// DESIGN.md, "Defaults (Business preset)". The keykeeper_msp_policies and
+/// keykeeper_msp_vault_lock migrations gave MSPs that already existed the same.
 fn business_policies() -> Vec<(OrgPolicyType, Value)> {
     vec![
         // Account recovery, with automatic enrollment: a member who forgets
@@ -115,6 +115,9 @@ fn business_policies() -> Vec<(OrgPolicyType, Value)> {
                 "enforceOnLogin": false,
             }),
         ),
+        // Vault lock: vaults lock when the computer locks or sleeps, then
+        // wait as each person chooses (docs/core.md, "Locking by policy").
+        (OrgPolicyType::MaximumVaultTimeout, json!({ "type": "onSystemLock", "minutes": null, "action": "lock" })),
     ]
 }
 
@@ -468,7 +471,7 @@ mod tests {
 
     #[test]
     fn the_business_preset_matches_the_migration() {
-        // MSPs from before default policies got these from the migration.
+        // MSPs from before default policies got these from the migrations.
         let migrated = [
             (OrgPolicyType::ResetPassword, r#"{"autoEnrollEnabled":true}"#),
             (OrgPolicyType::SingleOrg, "null"),
@@ -476,6 +479,8 @@ mod tests {
                 OrgPolicyType::MasterPassword,
                 r#"{"minComplexity":3,"minLength":12,"requireUpper":false,"requireLower":false,"requireNumbers":false,"requireSpecial":false,"enforceOnLogin":false}"#,
             ),
+            // keykeeper_msp_vault_lock.
+            (OrgPolicyType::MaximumVaultTimeout, r#"{"type":"onSystemLock","minutes":null,"action":"lock"}"#),
         ];
         let preset = business_policies();
         assert_eq!(preset.len(), migrated.len());
