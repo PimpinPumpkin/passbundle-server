@@ -478,6 +478,14 @@ impl MspStaff {
             .map(|_| ())
             .map_res("Error removing MSP staff")?;
             diesel::delete(
+                msp_staff_client_roles::table
+                    .filter(msp_staff_client_roles::msp_uuid.eq(&self.msp_uuid))
+                    .filter(msp_staff_client_roles::user_uuid.eq(&self.user_uuid)),
+            )
+            .execute(conn)
+            .map(|_| ())
+            .map_res("Error removing MSP staff")?;
+            diesel::delete(
                 msp_staff::table
                     .filter(msp_staff::msp_uuid.eq(self.msp_uuid))
                     .filter(msp_staff::user_uuid.eq(self.user_uuid)),
@@ -619,13 +627,21 @@ impl MspClient {
     }
 
     /// Ends the MSP's relationship with this client, including technicians'
-    /// choice of it.
+    /// choice of it and their roles there.
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         conn.run(move |conn| {
             diesel::delete(
                 msp_staff_clients::table
                     .filter(msp_staff_clients::msp_uuid.eq(&self.msp_uuid))
                     .filter(msp_staff_clients::org_uuid.eq(&self.org_uuid)),
+            )
+            .execute(conn)
+            .map(|_| ())
+            .map_res("Error removing MSP client")?;
+            diesel::delete(
+                msp_staff_client_roles::table
+                    .filter(msp_staff_client_roles::msp_uuid.eq(&self.msp_uuid))
+                    .filter(msp_staff_client_roles::org_uuid.eq(&self.org_uuid)),
             )
             .execute(conn)
             .map(|_| ())
