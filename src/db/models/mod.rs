@@ -17,6 +17,7 @@ pub mod keykeeper_roles;
 mod keykeeper_script_access;
 mod keykeeper_seals;
 mod keykeeper_site_fixes;
+mod keykeeper_user_settings;
 mod org_policy;
 mod organization;
 mod send;
@@ -52,6 +53,7 @@ pub use self::keykeeper_seals::{JoinSeal, JoiningSeal, SealKind, valid_encrypted
 pub use self::keykeeper_site_fixes::{
     Fix, FixField, MspSiteFixReport, MspSiteRule, ProblemField, SiteFix, SiteProblem,
 };
+pub use self::keykeeper_user_settings::{UserSettings, valid_settings};
 pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
 pub use self::organization::{
     Membership, MembershipId, MembershipStatus, MembershipType, OrgApiKeyId, Organization, OrganizationApiKey,

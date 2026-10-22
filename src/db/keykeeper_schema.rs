@@ -294,3 +294,11 @@ table! {
         reason -> Text,
     }
 }
+
+table! {
+    keykeeper_user_settings (user_uuid) {
+        user_uuid -> Text,
+        data -> Text,
+        revision_date -> Timestamp,
+    }
+}

@@ -23,7 +23,7 @@ use crate::{
             AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
             EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
             MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId,
-            UserKdfType,
+            UserKdfType, UserSettings,
         },
     },
     mail,
@@ -1040,6 +1040,15 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
     .await?;
 
     let save_result = user.save(&conn).await;
+
+    // Keykeeper: settings saved with the old key can't be read with the new
+    // one; the next app to save them writes them anew (keykeeper_user_settings).
+    // Only once the new key is saved, and never failing the rotation.
+    if save_result.is_ok()
+        && let Err(e) = UserSettings::delete_by_user(&user.uuid, &conn).await
+    {
+        warn!("Couldn't forget settings after a key rotation: {e:#?}");
+    }
 
     // Prevent logging out the client where the user requested this endpoint from.
     // If you do logout the user it will causes issues at the client side.
