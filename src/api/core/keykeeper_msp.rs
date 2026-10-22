@@ -269,7 +269,7 @@ async fn add_msp_membership(
 /// Memberships a client granted itself are left alone.
 async fn sync_staff_memberships(msp_id: &MspId, staff: &MspStaff, invited_by: &str, conn: &DbConn) -> EmptyResult {
     let reach = staff.reach(conn).await;
-    let roles = staff.client_roles(conn).await;
+    let roles = staff.client_roles(conn).await?;
     let ours = msp_membership_ids(msp_id, conn).await;
     for client in MspClient::find_by_msp(msp_id, conn).await {
         let Some(grant) = Grant::for_staff_in(staff, &roles, &client.org_uuid) else {
@@ -390,7 +390,7 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
     for member in MspStaff::find_by_msp(&msp_id, &conn).await {
         if let (Some(user), Some(member_role)) = (User::find_by_uuid(&member.user_uuid, &conn).await, member.role()) {
             let access = if is_admin && member_role == MspRole::Technician {
-                json!(member.access(&conn).await)
+                json!(member.access(&conn).await?)
             } else {
                 Value::Null
             };
@@ -462,7 +462,7 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
     let access = if is_admin {
         Value::Null
     } else {
-        json!(caller.access(&conn).await)
+        json!(caller.access(&conn).await?)
     };
     Ok(Json(json!({
         "id": msp.uuid,
@@ -707,7 +707,7 @@ async fn describe_access(access: &TechnicianAccess, conn: &DbConn) -> String {
     let mut differing = Vec::new();
     for role in &access.client_roles {
         if let Some(org) = Organization::find_by_uuid(&role.client, conn).await {
-            differing.push(format!("{} {}", org.name, role_in_words(role.custom.as_ref())));
+            differing.push(format!("{}, {}", org.name, role_in_words(role.custom.as_ref())));
         }
     }
     differing.sort();
@@ -863,12 +863,16 @@ async fn accept_invite(data: Json<InviteTokenData>, headers: Headers, conn: DbCo
     };
     let msp_id = invite.msp_uuid.clone();
     if MspStaff::find(&msp_id, &headers.user.uuid, &conn).await.is_none() {
-        // Clients removed since the invitation drop out of its access.
+        // Clients removed since the invitation drop out of its access, and
+        // so do roles in them (or in clients it no longer reaches).
         let mut access = invite.access();
         if let Some(access) = &mut access {
             let clients: HashSet<OrganizationId> =
                 MspClient::find_by_msp(&msp_id, &conn).await.into_iter().map(|c| c.org_uuid).collect();
             access.clients.retain(|c| clients.contains(c));
+            let reached = access.clients.clone();
+            let all_clients = access.all_clients;
+            access.client_roles.retain(|r| clients.contains(&r.client) && (all_clients || reached.contains(&r.client)));
         }
         add_to_staff(&msp_id, &headers.user, role, access.as_ref(), &invite.invited_by_email, &conn).await?;
         Audit::by("staff_invite_accepted", &headers)

@@ -17,7 +17,7 @@ use derive_more::{AsRef, Deref, Display, From};
 use diesel::prelude::*;
 
 use crate::{
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
         keykeeper_schema::{
@@ -173,8 +173,18 @@ pub struct TechnicianAccess {
 #[serde(rename_all = "camelCase")]
 pub struct ClientRole {
     pub client: OrganizationId,
-    #[serde(default)]
+    /// Required, as an explicit null for admin: leaving it out isn't admin.
+    #[serde(deserialize_with = "required_option")]
     pub custom: Option<CustomRole>,
+}
+
+/// An `Option` the JSON must name, even as null.
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
 }
 
 impl Default for TechnicianAccess {
@@ -323,7 +333,10 @@ impl MspStaff {
     /// A technician's roles in clients where it differs from their role in
     /// the rest, by client: a custom role, or None for admin. A stored value
     /// that doesn't parse gives a custom role with no permissions, never admin.
-    pub async fn client_roles(&self, conn: &DbConn) -> HashMap<OrganizationId, Option<CustomRole>> {
+    ///
+    /// Fails if they can't be read, rather than read as none: none would put
+    /// the default role, perhaps admin, where a narrower one was chosen.
+    pub async fn client_roles(&self, conn: &DbConn) -> ApiResult<HashMap<OrganizationId, Option<CustomRole>>> {
         let (msp, user) = (self.msp_uuid.clone(), self.user_uuid.clone());
         let rows: Vec<MspStaffClientRole> = conn
             .run(move |conn| {
@@ -331,10 +344,11 @@ impl MspStaff {
                     .filter(msp_staff_client_roles::msp_uuid.eq(msp))
                     .filter(msp_staff_client_roles::user_uuid.eq(user))
                     .load(conn)
-                    .unwrap_or_default()
+                    .map_res("Error reading a technician's roles in clients")
             })
-            .await;
-        rows.into_iter()
+            .await?;
+        Ok(rows
+            .into_iter()
             .map(|row| {
                 let custom = row.client_access.as_deref().map(|raw| {
                     serde_json::from_str(raw).unwrap_or(CustomRole {
@@ -344,16 +358,17 @@ impl MspStaff {
                 });
                 (row.org_uuid, custom)
             })
-            .collect()
+            .collect())
     }
 
-    /// A technician's access, as stored.
-    pub async fn access(&self, conn: &DbConn) -> TechnicianAccess {
+    /// A technician's access, as stored. Fails if their roles in clients
+    /// can't be read (`client_roles`).
+    pub async fn access(&self, conn: &DbConn) -> ApiResult<TechnicianAccess> {
         let mut clients: Vec<OrganizationId> = self.reach(conn).await.unwrap_or_default().into_iter().collect();
         clients.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
         let mut client_roles: Vec<ClientRole> = self
             .client_roles(conn)
-            .await
+            .await?
             .into_iter()
             .map(|(client, custom)| ClientRole {
                 client,
@@ -361,13 +376,13 @@ impl MspStaff {
             })
             .collect();
         client_roles.sort_by(|a, b| a.client.as_ref().cmp(b.client.as_ref()));
-        TechnicianAccess {
+        Ok(TechnicianAccess {
             all_clients: self.all_clients,
             clients,
             custom: self.custom_role(),
             install_commands: self.install_commands,
             client_roles,
-        }
+        })
     }
 
     /// Stores a technician's access. Doesn't touch their memberships.
@@ -401,49 +416,40 @@ impl MspStaff {
                 client_access: role.custom.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
             })
             .collect();
+        // All of it or none: a role row for a client that's gone would
+        // otherwise leave the others half written.
         conn.run(move |conn| {
-            diesel::update(
-                msp_staff::table.filter(msp_staff::msp_uuid.eq(&msp)).filter(msp_staff::user_uuid.eq(&user)),
-            )
-            .set((
-                msp_staff::all_clients.eq(all_clients),
-                msp_staff::client_access.eq(client_access),
-                msp_staff::install_commands.eq(install_commands),
-            ))
-            .execute(conn)
-            .map(|_| ())
-            .map_res("Error changing a technician's access")?;
-            diesel::delete(
-                msp_staff_clients::table
-                    .filter(msp_staff_clients::msp_uuid.eq(&msp))
-                    .filter(msp_staff_clients::user_uuid.eq(&user)),
-            )
-            .execute(conn)
-            .map(|_| ())
-            .map_res("Error changing a technician's clients")?;
-            for row in &chosen {
-                diesel::insert_into(msp_staff_clients::table)
-                    .values(row)
-                    .execute(conn)
-                    .map(|_| ())
-                    .map_res("Error changing a technician's clients")?;
-            }
-            diesel::delete(
-                msp_staff_client_roles::table
-                    .filter(msp_staff_client_roles::msp_uuid.eq(&msp))
-                    .filter(msp_staff_client_roles::user_uuid.eq(&user)),
-            )
-            .execute(conn)
-            .map(|_| ())
-            .map_res("Error changing a technician's roles in clients")?;
-            for row in &roles {
-                diesel::insert_into(msp_staff_client_roles::table)
-                    .values(row)
-                    .execute(conn)
-                    .map(|_| ())
-                    .map_res("Error changing a technician's roles in clients")?;
-            }
-            Ok(())
+            conn.transaction(|conn| {
+                diesel::update(
+                    msp_staff::table.filter(msp_staff::msp_uuid.eq(&msp)).filter(msp_staff::user_uuid.eq(&user)),
+                )
+                .set((
+                    msp_staff::all_clients.eq(all_clients),
+                    msp_staff::client_access.eq(client_access),
+                    msp_staff::install_commands.eq(install_commands),
+                ))
+                .execute(conn)?;
+                diesel::delete(
+                    msp_staff_clients::table
+                        .filter(msp_staff_clients::msp_uuid.eq(&msp))
+                        .filter(msp_staff_clients::user_uuid.eq(&user)),
+                )
+                .execute(conn)?;
+                for row in &chosen {
+                    diesel::insert_into(msp_staff_clients::table).values(row).execute(conn)?;
+                }
+                diesel::delete(
+                    msp_staff_client_roles::table
+                        .filter(msp_staff_client_roles::msp_uuid.eq(&msp))
+                        .filter(msp_staff_client_roles::user_uuid.eq(&user)),
+                )
+                .execute(conn)?;
+                for row in &roles {
+                    diesel::insert_into(msp_staff_client_roles::table).values(row).execute(conn)?;
+                }
+                Ok::<(), diesel::result::Error>(())
+            })
+            .map_res("Error changing a technician's access")
         })
         .await
     }
