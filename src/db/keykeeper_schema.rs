@@ -96,6 +96,15 @@ table! {
 }
 
 table! {
+    msp_staff_client_roles (msp_uuid, user_uuid, org_uuid) {
+        msp_uuid -> Text,
+        user_uuid -> Text,
+        org_uuid -> Text,
+        client_access -> Nullable<Text>,
+    }
+}
+
+table! {
     msp_policies (msp_uuid, atype) {
         msp_uuid -> Text,
         atype -> Integer,
