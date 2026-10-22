@@ -37,10 +37,11 @@ pub fn routes() -> Vec<Route> {
 
 /// The policies an MSP can set defaults for: every upstream policy this server
 /// supports, in the order the admin console lists them.
-const OFFERED: [OrgPolicyType; 12] = [
+const OFFERED: [OrgPolicyType; 13] = [
     OrgPolicyType::TwoFactorAuthentication,
     OrgPolicyType::MasterPassword,
     OrgPolicyType::RemoveUnlockWithPin,
+    OrgPolicyType::MaximumVaultTimeout,
     OrgPolicyType::ResetPassword,
     OrgPolicyType::PasswordGenerator,
     OrgPolicyType::SingleOrg,
@@ -81,6 +82,7 @@ fn policy_name(t: OrgPolicyType) -> &'static str {
         OrgPolicyType::RestrictedItemTypes => "Remove card item type",
         OrgPolicyType::UriMatchDefaults => "Default URI match detection",
         OrgPolicyType::OrganizationUserNotification => "Vault banner",
+        OrgPolicyType::MaximumVaultTimeout => "Vault lock",
     }
 }
 
@@ -318,6 +320,13 @@ async fn set_default(
     let options = data.data.unwrap_or(Value::Null);
     if !(options.is_null() || options.is_object()) {
         err!("Policy options must be an object")
+    }
+    // Refused before it's kept, not by each client after.
+    if t == OrgPolicyType::MaximumVaultTimeout {
+        super::keykeeper_vault_lock::check(&PolicyData {
+            enabled: data.enabled,
+            data: Some(options.clone()),
+        })?;
     }
     let clients = MspClient::find_by_msp(&msp_id, &conn).await;
     if data.keep.iter().any(|org| !clients.iter().any(|c| &c.org_uuid == org)) {

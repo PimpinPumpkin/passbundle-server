@@ -41,7 +41,8 @@ pub enum OrgPolicyType {
     DisableSend = 6,
     SendOptions = 7,
     ResetPassword = 8,
-    // MaximumVaultTimeout = 9, // Not supported (Not AGPLv3 Licensed)
+    // Keykeeper: built here, as "Vault lock" (api/core/keykeeper_vault_lock.rs).
+    MaximumVaultTimeout = 9,
     // DisablePersonalVaultExport = 10, // Not supported (Not AGPLv3 Licensed)
     // ActivateAutofill = 11,
     // AutomaticAppLogIn = 12,
