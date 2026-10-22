@@ -1050,8 +1050,10 @@ async fn list_events(
 }
 
 /// For a client's own owners and admins: which MSP manages the organization,
-/// its staff there, and the policies where the organization has its own
-/// setting rather than the MSP's default.
+/// its staff there with the role each has (owner, admin, a custom role and its
+/// permissions, or a regular member) and whether they see vault items, and the
+/// policies where the organization has its own setting rather than the MSP's
+/// default.
 #[get("/keykeeper/organizations/<org_id>/msp")]
 async fn get_organization_msp(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
     let Some(caller) = Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, &conn).await else {
@@ -1073,12 +1075,28 @@ async fn get_organization_msp(org_id: OrganizationId, headers: Headers, conn: Db
             continue;
         }
         if let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await {
+            let custom = keykeeper_roles::find(&member.uuid, &conn).await;
+            let (role, vault_items) = if member.atype == MembershipType::Owner as i32 {
+                ("owner", true)
+            } else if member.atype == MembershipType::Admin as i32 {
+                ("admin", true)
+            } else if custom.is_some() {
+                ("custom", member.access_all)
+            } else {
+                ("member", member.access_all)
+            };
+            let permissions: Vec<&str> = custom
+                .map(|c| Permission::ALL.iter().filter(|p| c.has(**p)).map(|p| p.key()).collect())
+                .unwrap_or_default();
             staff.push(json!({
                 "memberId": member.uuid,
                 "email": user.email,
                 "name": user.name,
                 "type": member.atype,
                 "status": member.status,
+                "role": role,
+                "permissions": permissions,
+                "vaultItems": vault_items,
             }));
         }
     }
