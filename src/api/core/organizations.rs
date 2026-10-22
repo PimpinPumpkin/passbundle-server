@@ -2252,6 +2252,11 @@ pub(super) async fn set_policy(
         }
     }
 
+    // Keykeeper: only vault lock data the clients can read.
+    if pol_type_enum == OrgPolicyType::MaximumVaultTimeout {
+        super::keykeeper_vault_lock::check(&data)?;
+    }
+
     // When enabling the TwoFactorAuthentication policy, revoke all members that do not have 2FA
     if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled {
         two_factor::enforce_2fa_policy_for_org(org_id, act_user_id, device_type, ip, conn).await?;

@@ -15,6 +15,7 @@ mod keykeeper_orgs;
 mod keykeeper_script_access;
 mod keykeeper_seals;
 mod keykeeper_site_fixes;
+mod keykeeper_vault_lock;
 mod organizations;
 mod public;
 mod sends;
