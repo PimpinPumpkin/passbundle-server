@@ -216,7 +216,10 @@ struct CopiesData {
 }
 
 /// Records the copies the console wrote: each must be an item in that client,
-/// one of the MSP's. Nothing is recorded unless all of them check out.
+/// one of the MSP's. Nothing is recorded unless all of them check out, and
+/// only for someone who can still share the template's source: a copy shares
+/// it, and whoever writes the copies may not be whoever chose the source, or
+/// may have lost share on it since.
 #[post("/keykeeper/msp/<msp_id>/templates/<template_id>/copies", data = "<data>")]
 async fn record_copies(
     msp_id: MspId,
@@ -226,8 +229,16 @@ async fn record_copies(
     conn: DbConn,
 ) -> EmptyResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
-    if MspTemplate::find(&msp_id, template_id, &conn).await.is_none() {
+    let Some(template) = MspTemplate::find(&msp_id, template_id, &conn).await else {
         err_code!("Template not found", rocket::http::Status::NotFound.code)
+    };
+    // Keykeeper: as set_template checks (DESIGN.md, "Folders and permissions").
+    let shareable = match Cipher::find_by_uuid(&template.source_cipher_uuid, &conn).await {
+        Some(source) => source.grid_for_user(&headers.user.uuid, None, &conn).await.is_some_and(|g| g.share),
+        None => false,
+    };
+    if !shareable {
+        err!("You don't have permission to share this template's item, so its copies can't be recorded")
     }
     let ours = client_ids(&msp_id, &conn).await;
     let copies = data.into_inner().copies;
