@@ -1,10 +1,10 @@
 // Keykeeper: a company's own organization, set up without an MSP. "New
 // organization" can start one with the Business preset, which an MSP's client
-// gets from the MSP's default policies: single organization, master password
-// requirements, vault lock, and the Everyone and Admins collections, plus an
-// install command for rolling it out. Account recovery stays off until the
-// organization's owners or admins turn it on. All in one call, so a closed
-// browser tab can't leave it half set up. See DESIGN.md, "A company's own IT".
+// gets from the MSP's default policies: account recovery, single
+// organization, master password requirements, and the Everyone and Admins
+// collections, plus an install command for rolling it out. All in one call, so
+// a closed browser tab can't leave it half set up. See DESIGN.md, "A company's
+// own IT".
 
 use rocket::{Route, serde::json::Json};
 

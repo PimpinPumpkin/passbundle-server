@@ -87,25 +87,19 @@ fn policy_name(t: OrgPolicyType) -> &'static str {
 }
 
 /// The Business preset's policies, which a new MSP's defaults start as. See
-/// DESIGN.md, "Defaults (Business preset)".
-///
-/// Account recovery isn't one of them. It lets an organization's admins reset
-/// a member's master password and so take over their whole account, which is
-/// for each organization to choose: it's off until the organization's owners
-/// or admins turn it on, or an MSP admin turns it on in the MSP's defaults or
-/// for one client. It stays offered (see OFFERED) wherever the server sends
-/// email.
-///
-/// MSPs that already existed got the preset from the keykeeper_msp_policies
-/// and keykeeper_msp_vault_lock migrations, when it still had account
-/// recovery, and keep what they have.
+/// DESIGN.md, "Defaults (Business preset)". The keykeeper_msp_policies and
+/// keykeeper_msp_vault_lock migrations gave MSPs that already existed the same.
 fn business_policies() -> Vec<(OrgPolicyType, Value)> {
     vec![
-        // Single organization: a work account belongs to one organization, so
-        // members can't also join another organization with the same account.
-        // Personal items go in a separate personal account. MSP staff are
-        // exempt (see exempt_from_member_policies), so they still reach every
-        // client.
+        // Account recovery, with automatic enrollment: a member who forgets
+        // their master password can be let back in by an owner or admin.
+        (OrgPolicyType::ResetPassword, json!({ "autoEnrollEnabled": true })),
+        // Single organization: members can't also belong to another
+        // organization with the same account. Recovery opens a member's whole
+        // account, so without this a client's admins could recover their way
+        // into a member's family organization. Personal items go in a separate
+        // personal account. MSP staff are exempt (see
+        // exempt_from_member_policies), so they still reach every client.
         (OrgPolicyType::SingleOrg, Value::Null),
         // A strong master password: at least 12 characters and a strength
         // score of 3 out of 4. Existing passwords aren't forced to change.
@@ -476,12 +470,9 @@ mod tests {
     }
 
     #[test]
-    fn the_business_preset_is_the_migration_without_account_recovery() {
-        // MSPs from before default policies got these from the migrations,
-        // and keep them. The preset is the same except for account recovery,
-        // which new MSPs and new Business organizations start without.
+    fn the_business_preset_matches_the_migration() {
+        // MSPs from before default policies got these from the migrations.
         let migrated = [
-            // keykeeper_msp_policies. Account recovery has left the preset.
             (OrgPolicyType::ResetPassword, r#"{"autoEnrollEnabled":true}"#),
             (OrgPolicyType::SingleOrg, "null"),
             (
@@ -492,11 +483,8 @@ mod tests {
             (OrgPolicyType::MaximumVaultTimeout, r#"{"type":"onSystemLock","minutes":null,"action":"lock"}"#),
         ];
         let preset = business_policies();
-        assert!(preset.iter().all(|(t, _)| *t != OrgPolicyType::ResetPassword));
-        let without_recovery: Vec<_> =
-            migrated.into_iter().filter(|(t, _)| *t != OrgPolicyType::ResetPassword).collect();
-        assert_eq!(preset.len(), without_recovery.len());
-        for ((t, data), (mt, mdata)) in preset.iter().zip(without_recovery) {
+        assert_eq!(preset.len(), migrated.len());
+        for ((t, data), (mt, mdata)) in preset.iter().zip(migrated) {
             assert!(*t == mt);
             assert_eq!(effect(true, &data.to_string()), effect(true, mdata));
         }
