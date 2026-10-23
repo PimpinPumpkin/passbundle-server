@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
         schema::{
@@ -403,17 +403,18 @@ impl Collection {
         }
     }
 
-    /// Keykeeper: whether the person manages this folder, from the grid.
-    pub async fn is_coll_manageable_by_user(uuid: &CollectionId, user_uuid: &UserId, conn: &DbConn) -> bool {
+    /// Keykeeper: whether the person manages this folder, from the grid. A
+    /// database error is an error, not a no.
+    pub async fn is_coll_manageable_by_user(uuid: &CollectionId, user_uuid: &UserId, conn: &DbConn) -> ApiResult<bool> {
         match Self::find_by_uuid(uuid, conn).await {
             Some(collection) => {
                 keykeeper_folder_permissions::manages(user_uuid, &collection.org_uuid, uuid, conn).await
             }
-            None => false,
+            None => Ok(false),
         }
     }
 
-    pub async fn is_manageable_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
+    pub async fn is_manageable_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> ApiResult<bool> {
         keykeeper_folder_permissions::manages(user_uuid, &self.org_uuid, &self.uuid, conn).await
     }
 
