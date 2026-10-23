@@ -1895,6 +1895,8 @@ async fn bulk_public_keys(
 
 use super::ciphers::CipherData;
 use super::ciphers::update_cipher_from_data;
+// Keykeeper: an import makes new items (keykeeper_cipher_versions).
+use crate::db::models::ItemSave;
 
 // The import endpoint only ever uses the name/id/external_id of a collection.
 // Bitwarden's own server ignores `groups`/`users` here too, so do not make them
@@ -2000,6 +2002,7 @@ async fn post_org_import(
             &conn,
             &nt,
             UpdateType::None,
+            ItemSave::New,
         )
         .await
         .ok();

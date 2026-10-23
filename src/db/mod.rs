@@ -314,7 +314,12 @@ impl DbConnType {
             #[cfg(postgresql)]
             Self::Postgresql => String::new(),
             #[cfg(sqlite)]
-            Self::Sqlite => "PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;".to_owned(),
+            // Keykeeper: foreign keys on, whichever SQLite the server is built
+            // with (the bundled one has them on already), so deletes cascade
+            // to tables like keykeeper_cipher_versions.
+            Self::Sqlite => {
+                "PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;".to_owned()
+            }
         }
     }
 }

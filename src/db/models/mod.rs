@@ -39,7 +39,9 @@ pub use self::event::{Event, EventType};
 pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
-pub use self::keykeeper_cipher_versions::CipherVersion;
+pub use self::keykeeper_cipher_versions::{
+    CipherVersion, History, ItemSave, MAX_ITEM_BYTES, MAX_PASSWORD_HISTORY, encrypted_size,
+};
 pub use self::keykeeper_joining::{
     INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, confirms_automatically, effective_joining,
     invite_hours, msp_default,

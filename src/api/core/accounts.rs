@@ -21,9 +21,9 @@ use crate::{
         DbConn, DbPool,
         models::{
             AuthRequest, AuthRequestId, Cipher, CipherId, CipherVersion, Device, DeviceId, DeviceType,
-            DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId,
-            Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User,
-            UserId, UserKdfType, UserSettings,
+            DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation,
+            ItemSave, KeyId, Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send,
+            SendId, User, UserId, UserKdfType, UserSettings,
         },
     },
     mail,
@@ -1022,7 +1022,17 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
             // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
             // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
             // We force the users to logout after the user has been saved to try and prevent these issues.
-            update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+            update_cipher_from_data(
+                saved_cipher,
+                cipher_data,
+                &headers,
+                None,
+                &conn,
+                &nt,
+                UpdateType::None,
+                ItemSave::Rotation,
+            )
+            .await?;
         }
     }
 

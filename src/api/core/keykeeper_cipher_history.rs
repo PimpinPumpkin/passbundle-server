@@ -1,7 +1,8 @@
 // Keykeeper: an item's past versions, for whoever can open the item. The
 // server keeps them as it stored them (keykeeper_cipher_versions) and can't
 // read them; apps decrypt each like the item, and restore one by saving it as
-// a normal edit. See DESIGN.md, "Item history".
+// a normal edit. Whoever can delete the item can clear its history. See
+// DESIGN.md, "Item history".
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,12 +10,12 @@ use rocket::{Route, http::Status, serde::json::Json};
 use serde_json::{Value, json};
 
 use crate::{
-    api::JsonResult,
+    api::{EmptyResult, JsonResult, core::log_event},
     auth::Headers,
     db::{
         DbConn,
         models::{
-            Cipher, CipherId, CipherVersion, Membership, User, UserId,
+            Cipher, CipherId, CipherVersion, EventType, Membership, MembershipType, User, UserId,
             keykeeper_roles::{self, Permission},
         },
     },
@@ -24,54 +25,104 @@ use crate::{
 use super::{CipherSyncData, CipherSyncType};
 
 pub fn routes() -> Vec<Route> {
-    routes![get_history]
+    routes![get_history, clear_history, delete_version]
+}
+
+/// The item, and what the caller may do with it: (read only, hide passwords,
+/// manage), as for reading the item. Anyone who can't open it gets 404, the
+/// same as for an item that doesn't exist.
+async fn readable(
+    cipher_id: &CipherId,
+    headers: &Headers,
+    conn: &DbConn,
+) -> Result<(Cipher, bool, bool), crate::Error> {
+    if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await
+        && let Some((read_only, hide_passwords, manage)) =
+            cipher.get_access_restrictions(&headers.user.uuid, None, conn).await
+    {
+        // Who may delete the item, as upstream's delete checks it.
+        let can_delete = !read_only || manage;
+        return Ok((cipher, hide_passwords, can_delete));
+    }
+    err_code!("Item not found", Status::NotFound.code)
 }
 
 /// An item's past versions, newest first, each as an item to decrypt, with
-/// when it was saved and by whom. Anyone who can't open the item gets 404,
-/// the same as for an item that doesn't exist.
+/// when it was saved and by whom. People who can't see the item's passwords
+/// get when and by whom only: no version's encrypted fields.
 #[get("/keykeeper/ciphers/<cipher_id>/history")]
 async fn get_history(cipher_id: CipherId, headers: Headers, conn: DbConn) -> JsonResult {
-    let cipher = match Cipher::find_by_uuid(&cipher_id, &conn).await {
-        Some(cipher) if cipher.is_accessible_to_user(&headers.user.uuid, &conn).await => cipher,
-        _ => err_code!("Item not found", Status::NotFound.code),
-    };
-
+    let (cipher, hide_passwords, _) = readable(&cipher_id, &headers, &conn).await?;
     let versions = CipherVersion::find_by_cipher(&cipher.uuid, &conn).await?;
     let mut editors = Editors::new(&cipher, &headers.user.uuid, &conn).await;
-    let savers = CipherVersion::saved_by(&versions, cipher.user_uuid.as_ref());
     // As an organization's sync sends items: nothing per person, and no
     // attachments, folders, or collections, which aren't part of versions.
     let no_extras = no_sync_data();
 
     let mut data = Vec::with_capacity(versions.len());
-    for (version, saved_by) in versions.iter().zip(savers) {
-        let item = version
-            .as_cipher(&cipher)
-            .to_json(&headers.host, &headers.user.uuid, Some(&no_extras), CipherSyncType::Organization, &conn)
-            .await?;
+    for version in &versions {
+        let item = if hide_passwords {
+            Value::Null
+        } else {
+            version
+                .as_cipher(&cipher)
+                .to_json(&headers.host, &headers.user.uuid, Some(&no_extras), CipherSyncType::Organization, &conn)
+                .await?
+        };
         data.push(json!({
             "object": "keykeeperCipherVersion",
             "id": version.uuid,
             "revisionDate": format_date(&version.revision_date),
+            "savedBy": editors.view(version.saved_by.as_ref(), &conn).await,
             "replacedDate": format_date(&version.replaced_at),
-            "savedBy": editors.view(saved_by, &conn).await,
+            "replacedBy": editors.view(version.replaced_by.as_ref(), &conn).await,
             "cipher": item,
         }));
     }
 
-    // Who saved what the item is now: whoever replaced its newest version.
-    let current_saved_by = match versions.first() {
-        Some(newest) => newest.replaced_by.as_ref(),
-        None => cipher.user_uuid.as_ref(),
-    };
+    let saved_by = CipherVersion::saved_by(&cipher.uuid, &conn).await;
     Ok(Json(json!({
         "object": "keykeeperCipherHistory",
         "cipherId": cipher.uuid,
         "revisionDate": format_date(&cipher.updated_at),
-        "savedBy": editors.view(current_saved_by, &conn).await,
+        "savedBy": editors.view(saved_by.as_ref(), &conn).await,
+        "hidePasswords": hide_passwords,
         "data": data,
     })))
+}
+
+/// Clears an item's history, for those who may delete the item. Logged in
+/// an organization's event log for its items.
+#[delete("/keykeeper/ciphers/<cipher_id>/history")]
+async fn clear_history(cipher_id: CipherId, headers: Headers, conn: DbConn) -> EmptyResult {
+    let (cipher, _, can_delete) = readable(&cipher_id, &headers, &conn).await?;
+    if !can_delete {
+        err_code!("You can't delete this item, so you can't clear its history", Status::Forbidden.code)
+    }
+    CipherVersion::delete_all_by_cipher(&cipher.uuid, &conn).await?;
+    logged(EventType::KeykeeperCipherHistoryCleared, &cipher, &headers, &conn).await;
+    Ok(())
+}
+
+/// Deletes one of an item's past versions, for those who may delete the item.
+#[delete("/keykeeper/ciphers/<cipher_id>/history/<version_id>")]
+async fn delete_version(cipher_id: CipherId, version_id: &str, headers: Headers, conn: DbConn) -> EmptyResult {
+    let (cipher, _, can_delete) = readable(&cipher_id, &headers, &conn).await?;
+    if !can_delete {
+        err_code!("You can't delete this item, so you can't delete its versions", Status::Forbidden.code)
+    }
+    if !CipherVersion::delete_one(&cipher.uuid, version_id, &conn).await? {
+        err_code!("Version not found", Status::NotFound.code)
+    }
+    logged(EventType::KeykeeperCipherVersionDeleted, &cipher, &headers, &conn).await;
+    Ok(())
+}
+
+async fn logged(event: EventType, cipher: &Cipher, headers: &Headers, conn: &DbConn) {
+    info!("{event:?}: item {} by {}", cipher.uuid, headers.user.uuid);
+    if let Some(org_id) = &cipher.organization_uuid {
+        log_event(event, &cipher.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn).await;
+    }
 }
 
 fn no_sync_data() -> CipherSyncData {
@@ -103,11 +154,7 @@ impl Editors {
             // Only its owner reads a personal item's versions.
             None => true,
             Some(org) => match Membership::find_confirmed_by_user_and_org(caller, org, conn).await {
-                Some(member) if member.has_full_access() => true,
-                // The custom roles that list the members (keykeeper_roles).
-                Some(member) => keykeeper_roles::find(&member.uuid, conn)
-                    .await
-                    .is_some_and(|role| role.has(Permission::ManageUsers) || role.has(Permission::ManageResetPassword)),
+                Some(member) => lists_members(&member, conn).await,
                 None => false,
             },
         };
@@ -134,4 +181,17 @@ impl Editors {
             _ => Value::Null,
         }
     }
+}
+
+/// Whether a confirmed member can list the organization's members, as
+/// `GET /organizations/<id>/users` decides: a manager or above with access to
+/// all items (owners and admins have it), or a custom role that manages
+/// members or account recovery (keykeeper_roles).
+async fn lists_members(member: &Membership, conn: &DbConn) -> bool {
+    if member.atype >= MembershipType::Manager && member.has_full_access() {
+        return true;
+    }
+    keykeeper_roles::find(&member.uuid, conn)
+        .await
+        .is_some_and(|role| role.has(Permission::ManageUsers) || role.has(Permission::ManageResetPassword))
 }

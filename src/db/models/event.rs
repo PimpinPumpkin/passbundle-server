@@ -79,6 +79,10 @@ pub enum EventType {
     CipherSoftDeleted = 1115,
     CipherRestored = 1116,
     CipherClientToggledCardNumberVisible = 1117,
+    // Keykeeper: someone cleared an item's earlier versions, or deleted one
+    // (keykeeper_cipher_versions). Upstream's cipher events end at 1132.
+    KeykeeperCipherHistoryCleared = 1190,
+    KeykeeperCipherVersionDeleted = 1191,
 
     // Collection
     CollectionCreated = 1300,

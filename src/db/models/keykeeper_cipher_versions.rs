@@ -1,24 +1,73 @@
-// Keykeeper: every item's past versions. Before a save replaces an item's
+// Keykeeper: every item's past versions. Before an edit replaces an item's
 // contents, the server keeps the item as it was stored: its encrypted fields
-// exactly as they were, which it can't read. Apps decrypt a version like the
-// item itself, and restore one by saving it as a normal edit. See DESIGN.md,
-// "Item history".
+// exactly as they were, which it can't read, with who saved that version and
+// who replaced it. Apps decrypt a version like the item itself, and restore
+// one by saving it as a normal edit. See DESIGN.md, "Item history".
 
-use chrono::{NaiveDateTime, Utc};
+use std::collections::HashMap;
+
+use chrono::{NaiveDate, NaiveDateTime, Utc};
 use diesel::prelude::*;
 
 use crate::{
     api::EmptyResult,
-    db::{DbConn, keykeeper_schema::keykeeper_cipher_versions, schema::ciphers},
+    db::{
+        DbConn,
+        keykeeper_schema::{keykeeper_cipher_saves, keykeeper_cipher_versions},
+        schema::ciphers,
+    },
     error::MapResult,
 };
 
 use super::{Cipher, CipherId, UserId};
 
-/// How many past versions an item keeps; the oldest goes first. Even a long
-/// note's 50 versions stay well under 1 MB, and 50 saves is years of edits
-/// for most items. See DESIGN.md, "Item history".
-pub const MAX_VERSIONS: usize = 50;
+/// The newest versions an item always keeps, every one of them.
+pub const KEEP_NEWEST: usize = 20;
+/// The most versions an item keeps: the newest, then one a day.
+pub const MAX_VERSIONS: usize = 100;
+/// The most an item's versions take together, encrypted.
+pub const MAX_HISTORY_BYTES: i64 = 4 * 1024 * 1024;
+/// The largest item the server saves, encrypted and without attachments,
+/// which are stored apart. Real items are a few KB; a note is at most
+/// 10,000 characters.
+pub const MAX_ITEM_BYTES: usize = 512 * 1024;
+/// The most password history entries an item keeps (upstream's apps keep 5).
+pub const MAX_PASSWORD_HISTORY: usize = 100;
+
+/// An item's encrypted fields' length in bytes, as the server stores them.
+pub fn encrypted_size(cipher: &Cipher) -> usize {
+    cipher.name.len()
+        + cipher.key.as_ref().map_or(0, String::len)
+        + cipher.notes.as_ref().map_or(0, String::len)
+        + cipher.fields.as_ref().map_or(0, String::len)
+        + cipher.data.len()
+        + cipher.password_history.as_ref().map_or(0, String::len)
+}
+
+/// What a save does to an item's history.
+pub enum ItemSave {
+    /// A new item, made or imported by this person: no version yet.
+    New,
+    /// An existing item's contents replaced by this person: the version it
+    /// replaces is kept, unless it's a personal item moving into an
+    /// organization.
+    Edit,
+    /// The same contents encrypted with the owner's new key: nothing changes.
+    Rotation,
+}
+
+/// The history part of a save, worked out before the item changes.
+pub enum History {
+    /// Record who saved the item, and keep nothing.
+    Saved,
+    /// Keep the version this edit replaces, if the edit changes it.
+    Replaced(Box<CipherVersion>),
+    /// Forget the item's versions: a personal item moving into an
+    /// organization, whose versions are under its owner's own key.
+    Moved,
+    /// Leave history and who saved the item as they are.
+    Untouched,
+}
 
 #[derive(Identifiable, Queryable, Insertable)]
 #[diesel(table_name = keykeeper_cipher_versions)]
@@ -36,16 +85,40 @@ pub struct CipherVersion {
     pub data: String,
     pub password_history: Option<String>,
     pub reprompt: Option<i32>,
-    /// When this version was saved: the item's revision date then.
+    pub size: i32,
+    /// When this version was saved (the item's revision date then), and who
+    /// saved it, when known.
     pub revision_date: NaiveDateTime,
-    /// When a save replaced it, and who saved that.
+    pub saved_by: Option<UserId>,
+    /// When an edit replaced it, and who made that edit.
     pub replaced_at: NaiveDateTime,
     pub replaced_by: Option<UserId>,
 }
 
+#[derive(Identifiable, Queryable, Insertable)]
+#[diesel(table_name = keykeeper_cipher_saves)]
+#[diesel(primary_key(cipher_uuid))]
+struct CipherSave {
+    cipher_uuid: CipherId,
+    saved_by: Option<UserId>,
+    saved_at: NaiveDateTime,
+}
+
+impl History {
+    /// What `save` does to history, from the item as it's stored now.
+    pub fn of(save: &ItemSave, cipher: &Cipher, moving_into_org: bool) -> Self {
+        match save {
+            ItemSave::Rotation => Self::Untouched,
+            ItemSave::New => Self::Saved,
+            ItemSave::Edit if moving_into_org => Self::Moved,
+            ItemSave::Edit => Self::Replaced(Box::new(CipherVersion::of(cipher))),
+        }
+    }
+}
+
 impl CipherVersion {
-    /// The item as it's stored now, to keep if a save by `by` changes it.
-    pub fn of(cipher: &Cipher, by: &UserId) -> Self {
+    /// The item as it's stored now, to keep if an edit changes it.
+    pub fn of(cipher: &Cipher) -> Self {
         Self {
             uuid: crate::util::get_uuid(),
             cipher_uuid: cipher.uuid.clone(),
@@ -57,9 +130,11 @@ impl CipherVersion {
             data: cipher.data.clone(),
             password_history: cipher.password_history.clone(),
             reprompt: cipher.reprompt,
+            size: i32::try_from(encrypted_size(cipher)).unwrap_or(i32::MAX),
             revision_date: cipher.updated_at,
+            saved_by: None,
             replaced_at: Utc::now().naive_utc(),
-            replaced_by: Some(by.clone()),
+            replaced_by: None,
         }
     }
 
@@ -99,29 +174,87 @@ impl CipherVersion {
         }
     }
 
-    /// Keeps this version, and forgets the item's oldest beyond MAX_VERSIONS.
-    pub async fn keep(self, conn: &DbConn) -> EmptyResult {
+    /// Saves an item and its history together, in one transaction: the
+    /// version an edit replaces (then trims the item's history), or forgets
+    /// the versions of an item moving into an organization, and records who
+    /// saved the item. Upstream's `Cipher::save`, with history.
+    pub async fn save_item(cipher: &mut Cipher, history: History, by: &UserId, conn: &DbConn) -> EmptyResult {
+        cipher.update_users_revision(conn).await;
+        cipher.updated_at = Utc::now().naive_utc();
+        let by = by.clone();
         conn.run(move |conn| {
             conn.transaction(|conn| {
-                diesel::insert_into(keykeeper_cipher_versions::table).values(&self).execute(conn)?;
-                let kept: Vec<String> = keykeeper_cipher_versions::table
-                    .filter(keykeeper_cipher_versions::cipher_uuid.eq(&self.cipher_uuid))
-                    .order((
-                        keykeeper_cipher_versions::replaced_at.desc(),
-                        keykeeper_cipher_versions::revision_date.desc(),
-                    ))
-                    .select(keykeeper_cipher_versions::uuid)
-                    .load(conn)?;
-                let oldest = beyond_limit(&kept);
-                if !oldest.is_empty() {
-                    diesel::delete(
-                        keykeeper_cipher_versions::table.filter(keykeeper_cipher_versions::uuid.eq_any(oldest)),
-                    )
+                let mut record_saver = true;
+                match history {
+                    History::Replaced(mut version) if !version.same_as(cipher) => {
+                        let saved_by = keykeeper_cipher_saves::table
+                            .filter(keykeeper_cipher_saves::cipher_uuid.eq(&cipher.uuid))
+                            .select(keykeeper_cipher_saves::saved_by)
+                            .first::<Option<UserId>>(conn)
+                            .optional()?;
+                        version.saved_by = saved_by.flatten();
+                        version.replaced_by = Some(by.clone());
+                        version.replaced_at = cipher.updated_at;
+                        if usize::try_from(version.size).unwrap_or(usize::MAX) <= MAX_ITEM_BYTES {
+                            diesel::insert_into(keykeeper_cipher_versions::table).values(&*version).execute(conn)?;
+                            trim(&cipher.uuid, conn)?;
+                        }
+                    }
+                    // The same encrypted fields again: its author doesn't change.
+                    History::Replaced(_) | History::Untouched => record_saver = false,
+                    History::Moved => {
+                        diesel::delete(
+                            keykeeper_cipher_versions::table
+                                .filter(keykeeper_cipher_versions::cipher_uuid.eq(&cipher.uuid)),
+                        )
+                        .execute(conn)?;
+                    }
+                    History::Saved => {}
+                }
+
+                // Upstream's save, which inserts the item or replaces it.
+                let updated = diesel::update(ciphers::table.filter(ciphers::uuid.eq(&cipher.uuid)))
+                    .set(&*cipher)
                     .execute(conn)?;
+                if updated == 0 {
+                    diesel::insert_into(ciphers::table).values(&*cipher).execute(conn)?;
+                }
+
+                if record_saver {
+                    let save = CipherSave {
+                        cipher_uuid: cipher.uuid.clone(),
+                        saved_by: Some(by),
+                        saved_at: cipher.updated_at,
+                    };
+                    let updated = diesel::update(
+                        keykeeper_cipher_saves::table.filter(keykeeper_cipher_saves::cipher_uuid.eq(&save.cipher_uuid)),
+                    )
+                    .set((
+                        keykeeper_cipher_saves::saved_by.eq(&save.saved_by),
+                        keykeeper_cipher_saves::saved_at.eq(save.saved_at),
+                    ))
+                    .execute(conn)?;
+                    if updated == 0 {
+                        diesel::insert_into(keykeeper_cipher_saves::table).values(&save).execute(conn)?;
+                    }
                 }
                 Ok::<_, diesel::result::Error>(())
             })
-            .map_res("Error keeping the item's earlier version")
+            .map_res("Error saving cipher")
+        })
+        .await
+    }
+
+    /// Who saved the item as it is now, when known.
+    pub async fn saved_by(cipher: &CipherId, conn: &DbConn) -> Option<UserId> {
+        let cipher = cipher.clone();
+        conn.run(move |conn| {
+            keykeeper_cipher_saves::table
+                .filter(keykeeper_cipher_saves::cipher_uuid.eq(cipher))
+                .select(keykeeper_cipher_saves::saved_by)
+                .first::<Option<UserId>>(conn)
+                .ok()
+                .flatten()
         })
         .await
     }
@@ -139,14 +272,50 @@ impl CipherVersion {
         .await
     }
 
-    /// Forgets an item's past versions, as when it moves into an organization:
-    /// they're encrypted with its owner's own key.
+    /// Forgets an item's past versions: someone cleared its history.
     pub async fn delete_all_by_cipher(cipher: &CipherId, conn: &DbConn) -> EmptyResult {
         let cipher = cipher.clone();
         conn.run(move |conn| {
             diesel::delete(keykeeper_cipher_versions::table.filter(keykeeper_cipher_versions::cipher_uuid.eq(cipher)))
                 .execute(conn)
                 .map_res("Error forgetting the item's earlier versions")
+        })
+        .await
+    }
+
+    /// Forgets one of an item's past versions. False when the item has no
+    /// such version.
+    pub async fn delete_one(cipher: &CipherId, version: &str, conn: &DbConn) -> Result<bool, crate::error::Error> {
+        let cipher = cipher.clone();
+        let version = version.to_owned();
+        conn.run(move |conn| {
+            diesel::delete(
+                keykeeper_cipher_versions::table
+                    .filter(keykeeper_cipher_versions::cipher_uuid.eq(cipher))
+                    .filter(keykeeper_cipher_versions::uuid.eq(version)),
+            )
+            .execute(conn)
+            .map(|deleted| deleted > 0)
+            .map_res("Error forgetting the item's earlier version")
+        })
+        .await
+    }
+
+    /// Forgets everything history keeps about an item that's being deleted
+    /// for good. The database's cascade does too; this doesn't rely on it.
+    pub async fn delete_item(cipher: &CipherId, conn: &DbConn) -> EmptyResult {
+        let cipher = cipher.clone();
+        conn.run(move |conn| {
+            conn.transaction(|conn| {
+                diesel::delete(
+                    keykeeper_cipher_versions::table.filter(keykeeper_cipher_versions::cipher_uuid.eq(&cipher)),
+                )
+                .execute(conn)?;
+                diesel::delete(keykeeper_cipher_saves::table.filter(keykeeper_cipher_saves::cipher_uuid.eq(&cipher)))
+                    .execute(conn)?;
+                Ok::<_, diesel::result::Error>(())
+            })
+            .map_res("Error forgetting the item's history")
         })
         .await
     }
@@ -158,8 +327,11 @@ impl CipherVersion {
         let user = user.clone();
         conn.run(move |conn| {
             conn.transaction(|conn| {
-                let owned: Vec<CipherId> =
-                    ciphers::table.filter(ciphers::user_uuid.eq(&user)).select(ciphers::uuid).load(conn)?;
+                let owned: Vec<CipherId> = ciphers::table
+                    .filter(ciphers::user_uuid.eq(&user))
+                    .filter(ciphers::organization_uuid.is_null())
+                    .select(ciphers::uuid)
+                    .load(conn)?;
                 for chunk in owned.chunks(500) {
                     diesel::delete(
                         keykeeper_cipher_versions::table.filter(keykeeper_cipher_versions::cipher_uuid.eq_any(chunk)),
@@ -172,28 +344,67 @@ impl CipherVersion {
         })
         .await
     }
-
-    /// Who saved each version, of an item's versions newest first: whoever
-    /// replaced the version before it. Nobody is recorded for the oldest,
-    /// except that only its owner edits a personal item (moving it into an
-    /// organization forgets its versions).
-    pub fn saved_by<'a>(newest_first: &'a [Self], owner: Option<&'a UserId>) -> Vec<Option<&'a UserId>> {
-        (0..newest_first.len())
-            .map(|i| match newest_first.get(i + 1) {
-                Some(older) => older.replaced_by.as_ref(),
-                None => owner,
-            })
-            .collect()
-    }
 }
 
-/// The versions to forget, of an item's versions newest first.
-fn beyond_limit(newest_first: &[String]) -> &[String] {
-    newest_first.get(MAX_VERSIONS..).unwrap_or_default()
+/// Forgets the versions an item no longer keeps (see `to_forget`).
+fn trim(cipher: &CipherId, conn: &mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> {
+    let kept: Vec<(String, NaiveDateTime, i32)> = keykeeper_cipher_versions::table
+        .filter(keykeeper_cipher_versions::cipher_uuid.eq(cipher))
+        .order((keykeeper_cipher_versions::replaced_at.desc(), keykeeper_cipher_versions::revision_date.desc()))
+        .select((
+            keykeeper_cipher_versions::uuid,
+            keykeeper_cipher_versions::replaced_at,
+            keykeeper_cipher_versions::size,
+        ))
+        .load(conn)?;
+    let forget = to_forget(&kept);
+    for chunk in forget.chunks(500) {
+        diesel::delete(keykeeper_cipher_versions::table.filter(keykeeper_cipher_versions::uuid.eq_any(chunk)))
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+/// Of an item's versions newest first (id, when replaced, size), the ones to
+/// forget. An item keeps its newest KEEP_NEWEST versions, every one; before
+/// those, one a day (UTC): the first that day's edits replaced, so the item
+/// as it was before them. Then at most MAX_VERSIONS and MAX_HISTORY_BYTES,
+/// newest first. A burst of saves, however many, can push out only the
+/// newest tier, never the days before it.
+fn to_forget(newest_first: &[(String, NaiveDateTime, i32)]) -> Vec<String> {
+    let mut keep = vec![false; newest_first.len()];
+    for k in keep.iter_mut().take(KEEP_NEWEST) {
+        *k = true;
+    }
+    // Newest first, so the last one seen of each day is its first replaced.
+    let mut first_of_day: HashMap<NaiveDate, usize> = HashMap::new();
+    for (i, (_, replaced_at, _)) in newest_first.iter().enumerate().skip(KEEP_NEWEST) {
+        first_of_day.insert(replaced_at.date(), i);
+    }
+    for i in first_of_day.into_values() {
+        keep[i] = true;
+    }
+
+    let (mut count, mut bytes, mut full) = (0usize, 0i64, false);
+    for (i, (_, _, size)) in newest_first.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        if full || count + 1 > MAX_VERSIONS || bytes + i64::from(*size) > MAX_HISTORY_BYTES {
+            full = true;
+            keep[i] = false;
+        } else {
+            count += 1;
+            bytes += i64::from(*size);
+        }
+    }
+    newest_first.iter().zip(keep).filter(|(_, k)| !k).map(|((id, _, _), _)| id.clone()).collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeDelta;
+
     use super::*;
 
     fn cipher() -> Cipher {
@@ -204,17 +415,13 @@ mod tests {
         cipher
     }
 
-    fn version(replaced_by: &str) -> CipherVersion {
-        CipherVersion::of(&cipher(), &UserId::from(replaced_by.to_owned()))
-    }
-
     #[test]
     fn a_version_is_the_item_as_stored() {
         let mut item = cipher();
-        let before = CipherVersion::of(&item, &UserId::from("editor".to_owned()));
+        let before = CipherVersion::of(&item);
         assert!(before.same_as(&item));
         assert_eq!(before.revision_date, item.updated_at);
-        assert_eq!(before.replaced_by.as_deref(), Some("editor"));
+        assert_eq!(usize::try_from(before.size).unwrap(), encrypted_size(&item));
 
         // Any encrypted field that differs is a new version, the item key too.
         item.key = Some("2.bmV3|bmV3|bWFj".to_owned());
@@ -236,23 +443,69 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_versions_are_kept() {
-        let ids: Vec<String> = (0..MAX_VERSIONS + 2).map(|i| format!("v{i}")).collect();
-        assert_eq!(beyond_limit(&ids), &ids[MAX_VERSIONS..]);
-        assert_eq!(beyond_limit(&ids).len(), 2);
-        assert!(beyond_limit(&ids[..MAX_VERSIONS]).is_empty());
-        assert!(beyond_limit(&[]).is_empty());
+    fn what_a_save_does_to_history() {
+        let item = cipher();
+        assert!(matches!(History::of(&ItemSave::New, &item, false), History::Saved));
+        assert!(matches!(History::of(&ItemSave::Rotation, &item, false), History::Untouched));
+        assert!(matches!(History::of(&ItemSave::Edit, &item, true), History::Moved));
+        assert!(matches!(History::of(&ItemSave::Edit, &item, false), History::Replaced(_)));
     }
 
     #[test]
-    fn each_version_was_saved_by_whoever_replaced_the_one_before() {
-        let versions = [version("carol"), version("ben"), version("ana")];
-        let names = |owner| -> Vec<Option<String>> {
-            CipherVersion::saved_by(&versions, owner).into_iter().map(|u| u.map(|u| u.to_string())).collect()
-        };
-        assert_eq!(names(None), vec![Some("ben".to_owned()), Some("ana".to_owned()), None]);
-        let owner = UserId::from("owner".to_owned());
-        assert_eq!(names(Some(&owner)), vec![Some("ben".to_owned()), Some("ana".to_owned()), Some("owner".to_owned())]);
-        assert!(CipherVersion::saved_by(&[], None).is_empty());
+    fn an_items_size_is_its_encrypted_fields() {
+        let mut item = cipher();
+        let base = encrypted_size(&item);
+        let notes = "2.bm90ZQ==|bm90ZQ==|bWFj";
+        item.notes = Some(notes.to_owned());
+        assert_eq!(encrypted_size(&item), base + notes.len());
+    }
+
+    fn at(day: u32, minute: i64) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 10, day).unwrap().and_hms_opt(9, 0, 0).unwrap() + TimeDelta::minutes(minute)
+    }
+
+    /// Newest first: (id, replaced at, size).
+    fn versions(list: &[(&str, NaiveDateTime, i32)]) -> Vec<(String, NaiveDateTime, i32)> {
+        list.iter().map(|(id, t, s)| ((*id).to_owned(), *t, *s)).collect()
+    }
+
+    #[test]
+    fn a_burst_of_saves_keeps_the_newest_and_the_item_before_it() {
+        // 60 saves in an hour on the 23rd, after edits on two earlier days.
+        let mut list: Vec<(String, NaiveDateTime, i32)> =
+            (0..60).rev().map(|m| (format!("burst-{m}"), at(23, m), 1000)).collect();
+        list.extend(versions(&[
+            ("21-late", at(21, 30), 1000),
+            ("21-early", at(21, 0), 1000),
+            ("20-only", at(20, 0), 1000),
+        ]));
+        let forget = to_forget(&list);
+        let kept: Vec<&str> =
+            list.iter().map(|(id, _, _)| id.as_str()).filter(|id| !forget.iter().any(|f| f == id)).collect();
+        // The newest 20 of the burst, its first (the item before it), and the
+        // first of each earlier day.
+        let mut expected: Vec<String> = (40..60).rev().map(|m| format!("burst-{m}")).collect();
+        expected.extend(["burst-0", "21-early", "20-only"].map(String::from));
+        assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn an_item_keeps_at_most_max_versions_and_bytes() {
+        // A version a day for 150 days: the newest MAX_VERSIONS stay.
+        let list: Vec<(String, NaiveDateTime, i32)> =
+            (0..150).map(|d| (format!("day-{d}"), at(23, 0) - TimeDelta::days(d), 1000)).collect();
+        let forget = to_forget(&list);
+        assert_eq!(forget.len(), 150 - MAX_VERSIONS);
+        assert_eq!(forget.first().map(String::as_str), Some("day-100"));
+
+        // Large versions: only the newest that fit the budget.
+        let big = i32::try_from(MAX_ITEM_BYTES).unwrap();
+        let list: Vec<(String, NaiveDateTime, i32)> =
+            (0..12).map(|m| (format!("big-{m}"), at(23, 0) - TimeDelta::minutes(m), big)).collect();
+        let forget = to_forget(&list);
+        assert_eq!(forget.len(), 12 - 8);
+        assert_eq!(forget.first().map(String::as_str), Some("big-8"));
+
+        assert!(to_forget(&[]).is_empty());
     }
 }
