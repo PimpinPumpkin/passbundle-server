@@ -102,6 +102,10 @@ pub async fn initialize_keys() -> Result<(), Error> {
         err!("PUBLIC_RSA_KEY must only be initialized once")
     }
 
+    // Keykeeper: the key for event destinations' secrets at rest, derived the
+    // same way, from the key's DER so another PEM form of it gives the same key.
+    crate::keykeeper_streaming::secrets::init(&zeroize::Zeroizing::new(priv_key.private_key_to_der()?));
+
     // Derived from the RSA key, so it stays the same across restarts without storing another secret
     let prelogin_kdf_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &priv_key_buffer), b"prelogin-kdf");
     if PRELOGIN_KDF_KEY.set(hmac::Key::new(hmac::HMAC_SHA256, prelogin_kdf_key.as_ref())).is_err() {
