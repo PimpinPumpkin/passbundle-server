@@ -14,7 +14,14 @@
 pub mod filter;
 pub mod patch;
 
-use std::{net::IpAddr, num::NonZeroU32, sync::LazyLock};
+use std::{
+    net::IpAddr,
+    num::NonZeroU32,
+    sync::{
+        LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use chrono::Utc;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
@@ -39,9 +46,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Collection, EventType, Group, GroupId, GroupUser, Invitation, JoinSeal, Membership, MembershipId,
-            MembershipStatus, MspClient, OrgPolicy, OrgSetup, Organization, OrganizationId, ScimGroup, ScimPerson,
-            ScimToken, ScimUser, SealKind, User, invite_hours, looks_like_scim_token, remove_group_member,
+            Collection, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation, JoinSeal, Membership,
+            MembershipId, MembershipStatus, MspClient, OrgPolicy, OrgSetup, Organization, OrganizationId, ScimGroup,
+            ScimPerson, ScimToken, ScimUser, SealKind, User, invite_hours, looks_like_scim_token, remove_group_member,
         },
     },
     mail,
@@ -94,6 +101,25 @@ static CREATES_TODAY: LazyLock<Limiter> = LazyLock::new(|| {
     )
 });
 static FAILURES: LazyLock<Limiter> = LazyLock::new(|| limiter(FAILURES_PER_MINUTE));
+
+/// How many requests the limiters have seen, and how often they forget keys
+/// whose limits have filled back up. Refused tokens are keyed by address, so
+/// without this, requests from many addresses would grow it without bound.
+static CHECKS: AtomicUsize = AtomicUsize::new(0);
+const PRUNE_EVERY: usize = 1024;
+
+/// Every `every` calls, forgets the keys whose limits have filled back up, as
+/// the login limiters do (src/ratelimit.rs). Returns whether it did.
+fn prune_now_and_then(checks: &AtomicUsize, every: usize, limiters: &[&Limiter]) -> bool {
+    if checks.fetch_add(1, Ordering::Relaxed) % every != every - 1 {
+        return false;
+    }
+    for limiter in limiters {
+        limiter.retain_recent();
+        limiter.shrink_to_fit();
+    }
+    true
+}
 
 fn scim_json() -> ContentType {
     ContentType::new("application", "scim+json")
@@ -261,6 +287,7 @@ impl<'r> FromRequest<'r> for ScimCaller {
             Outcome::Success(client) => client.ip,
             _ => return Outcome::Error((Status::BadRequest, "No client address")),
         };
+        prune_now_and_then(&CHECKS, PRUNE_EVERY, &[&*FAILURES, &*REQUESTS, &*CREATES, &*CREATES_TODAY]);
         let refused = || {
             if FAILURES.check_key(&ip.to_string()).is_err() {
                 Outcome::Error((Status::TooManyRequests, "Too many refused tokens"))
@@ -284,7 +311,10 @@ impl<'r> FromRequest<'r> for ScimCaller {
         let Outcome::Success(conn) = DbConn::from_request(request).await else {
             return Outcome::Error((Status::ServiceUnavailable, "No database"));
         };
+        // With or without a token for this organization, the same work: a
+        // hash and a constant-time compare, so timing doesn't say which.
         let Some(token) = ScimToken::find(&org_id, &conn).await else {
+            ScimToken::matches_none(presented);
             return refused();
         };
         if !token.matches(presented) {
@@ -786,7 +816,11 @@ async fn invite(caller: &ScimCaller, email: &str, conn: &DbConn) -> Result<Membe
         }
     }
     log_scim_event(EventType::OrganizationUserInvited, &member.uuid, &org.uuid, &caller.ip, conn).await;
-    if let Some(collection) = everyone_collection(&org.uuid, conn).await {
+    if let Some(collection) = everyone_collection(&org.uuid, conn).await
+        // A grant there already stays as it is: Can edit would widen a
+        // narrower one, as for joins with the install command.
+        && CollectionUser::find_by_collection_and_user(&collection.uuid, &member.user_uuid, conn).await.is_none()
+    {
         // Can edit, as a preset grant, as for people who join with the
         // install command (keykeeper_folder_permissions.rs).
         crate::db::models::keykeeper_folder_permissions::save_user(
@@ -815,18 +849,27 @@ async fn create_user(caller: &ScimCaller, body: Value, conn: &DbConn) -> ScimRes
     if ScimUser::find_by_user_name(org, &fields.user_name, conn).await.is_some() {
         return Err(ScimError::conflict(format!("A user with the userName {} exists", fields.user_name)));
     }
+    let existing = Membership::find_by_email_and_org(&email, org, conn).await;
+    check_user_name_slot(org, &fields.user_name, existing.as_ref().map(|m| &m.uuid), conn).await?;
 
     // Someone already in the organization: matched, never changed. The
     // directory gets their id and manages them from now on, if they're a
-    // regular member.
-    if let Some(member) = Membership::find_by_email_and_org(&email, org, conn).await {
+    // regular member. People provisioning never changes aren't linked: the
+    // directory writes nothing about them.
+    if let Some(member) = existing {
         if let Some(scim) = ScimUser::find(&member.uuid, conn).await {
             return Err(ScimError::conflict(format!("{email} is already provisioned as {}", scim.user_name)));
         }
-        let mut scim = ScimUser::new(member.uuid.clone(), org.clone(), false);
+        let mut person = ScimPerson::load(member, conn).await.ok_or_else(|| ScimError::not_found("That user was"))?;
+        if person.protected {
+            return Err(ScimError::conflict(format!(
+                "{email} is already in this organization, and provisioning doesn't change owners, admins, custom roles, people who see every item, or your IT provider's staff. Match them by their email as userName, or leave them out of provisioning."
+            )));
+        }
+        let mut scim = ScimUser::new(person.member.uuid.clone(), org.clone(), false);
         keep(&mut scim, &fields);
         scim.save(conn).await?;
-        let person = ScimPerson::load(member, conn).await.ok_or_else(|| ScimError::not_found("That user was"))?;
+        person.scim = Some(scim);
         return Ok(ScimResponse::created(user_json(&person, &caller.base)));
     }
 
@@ -868,7 +911,13 @@ fn editable(person: &ScimPerson) -> Map<String, Value> {
     if let Some(external_id) = external_id {
         resource.insert("externalId".into(), json!(external_id));
     }
-    resource.insert("active".into(), json!(person.member.status > MembershipStatus::Revoked as i32));
+    // For someone provisioning never changes, what the directory last asked
+    // for, so a PATCH of other attributes doesn't read as turning them on.
+    let active = match &person.scim {
+        Some(scim) if person.protected && scim.refused_off_at.is_some() => false,
+        _ => person.member.status > MembershipStatus::Revoked as i32,
+    };
+    resource.insert("active".into(), json!(active));
     resource
 }
 
@@ -893,26 +942,24 @@ async fn put_user(caller: &ScimCaller, id: &str, body: Value, conn: &DbConn) -> 
 /// `active` changes. Everything is checked before anything changes.
 async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFields, conn: &DbConn) -> ScimResult {
     let org = &caller.org.uuid;
+    // People provisioning never changes are read-only: nothing the directory
+    // sends about them is kept. What's noted is only whether it asked to turn
+    // them off, for the Provisioning page.
+    if person.protected {
+        note_protected(&person, org, fields.active, conn).await?;
+        return Err(ScimError::forbidden(PROTECTED));
+    }
     let mut scim = person.scim.clone().unwrap_or_else(|| ScimUser::new(person.member.uuid.clone(), org.clone(), false));
     if let Some(other) = ScimUser::find_by_user_name(org, &fields.user_name, conn).await
         && other.membership_uuid != person.member.uuid
     {
         return Err(ScimError::conflict(format!("A user with the userName {} exists", fields.user_name)));
     }
+    check_user_name_slot(org, &fields.user_name, Some(&person.member.uuid), conn).await?;
     let active_now = person.member.status > MembershipStatus::Revoked as i32;
     let active = fields.active.unwrap_or(active_now);
 
     if active != active_now {
-        if person.protected {
-            if !active {
-                // Recorded, so the organization's admins see it on their
-                // Provisioning page; nothing about the membership changes.
-                scim.refused_off_at = Some(Utc::now().naive_utc());
-                keep(&mut scim, &fields);
-                scim.save(conn).await?;
-            }
-            return Err(ScimError::forbidden(PROTECTED));
-        }
         if active {
             if !scim.turned_off {
                 return Err(ScimError::forbidden(
@@ -934,14 +981,60 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
             scim.turned_off = true;
             log_scim_event(EventType::OrganizationUserRevoked, &person.member.uuid, org, &caller.ip, conn).await;
         }
-    } else if active {
-        // The directory has them on again: no longer one to remove by hand.
-        scim.refused_off_at = None;
     }
     keep(&mut scim, &fields);
     scim.save(conn).await?;
     person.scim = Some(scim);
     Ok(ScimResponse::ok(user_json(&person, &caller.base)))
+}
+
+/// Notes that the directory asked to turn off (or remove) someone provisioning
+/// never changes, or turned them back on, so the Provisioning page lists whom
+/// to remove by hand. Nothing the directory sent is kept: a new note is keyed
+/// by the person's own account email, never a userName the directory chose.
+async fn note_protected(
+    person: &ScimPerson,
+    org: &OrganizationId,
+    active: Option<bool>,
+    conn: &DbConn,
+) -> Result<(), ScimError> {
+    let Some(active) = active else {
+        return Ok(());
+    };
+    let mut scim = match &person.scim {
+        Some(scim) => scim.clone(),
+        None if active => return Ok(()),
+        None => {
+            let mut scim = ScimUser::new(person.member.uuid.clone(), org.clone(), false);
+            scim.set_user_name(&person.user.email);
+            scim
+        }
+    };
+    let off = (!active).then(|| Utc::now().naive_utc());
+    if scim.refused_off_at.is_some() == off.is_some() {
+        return Ok(());
+    }
+    scim.refused_off_at = off;
+    scim.save(conn).await?;
+    Ok(())
+}
+
+/// A userName may not be another member's account email: the directory
+/// can't take the name a member is matched by, an owner's included.
+async fn check_user_name_slot(
+    org: &OrganizationId,
+    user_name: &str,
+    own: Option<&MembershipId>,
+    conn: &DbConn,
+) -> Result<(), ScimError> {
+    if let Some(other) = Membership::find_by_email_and_org(user_name, org, conn).await
+        && Some(&other.uuid) != own
+    {
+        return Err(ScimError::conflict(format!(
+            "{user_name} is another member's email, so it can't be this user's userName"
+        )));
+    }
+    Ok(())
 }
 
 /// Removes a regular member, as the Members page's Remove: the organization's
@@ -950,13 +1043,7 @@ async fn delete_user(caller: &ScimCaller, id: &str, conn: &DbConn, nt: &Notify<'
     let person = person(caller, id, conn).await?;
     let org = &caller.org.uuid;
     if person.protected {
-        let mut scim =
-            person.scim.clone().unwrap_or_else(|| ScimUser::new(person.member.uuid.clone(), org.clone(), false));
-        scim.refused_off_at = Some(Utc::now().naive_utc());
-        if person.scim.is_none() {
-            scim.set_user_name(&person.user.email);
-        }
-        scim.save(conn).await?;
+        note_protected(&person, org, Some(false), conn).await?;
         return Err(ScimError::forbidden(PROTECTED));
     }
     log_scim_event(EventType::OrganizationUserRemoved, &person.member.uuid, org, &caller.ip, conn).await;
@@ -1516,6 +1603,25 @@ mod tests {
         let mut user = json!({ "schemas": [], "id": "u", "userName": "a", "name": { "givenName": "A" } });
         query.project(&mut user);
         assert_eq!(user, json!({ "schemas": [], "id": "u", "name": { "givenName": "A" } }));
+    }
+
+    #[test]
+    fn the_limiters_forget_filled_keys_now_and_then() {
+        let limiter: Limiter = RateLimiter::keyed(Quota::per_second(NonZeroU32::new(1000).unwrap()));
+        for i in 0..200 {
+            assert!(limiter.check_key(&format!("203.0.113.{i}")).is_ok());
+        }
+        assert_eq!(limiter.len(), 200);
+        // Long enough for every key's limit to fill back up.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let checks = AtomicUsize::new(0);
+        for _ in 0..9 {
+            assert!(!prune_now_and_then(&checks, 10, &[&limiter]));
+        }
+        assert_eq!(limiter.len(), 200, "not before the tenth check");
+        assert!(prune_now_and_then(&checks, 10, &[&limiter]));
+        assert_eq!(limiter.len(), 0);
+        assert!(!prune_now_and_then(&checks, 10, &[&limiter]));
     }
 
     #[test]

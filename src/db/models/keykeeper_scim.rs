@@ -79,6 +79,16 @@ impl ScimToken {
         ct_eq(scim_token_hash(presented), &self.token_hash)
     }
 
+    /// The same work as `matches`, for an organization with no token, so
+    /// timing doesn't tell the two apart. Always false.
+    pub fn matches_none(presented: &str) -> bool {
+        // The base64 of 32 zero bytes: the length of a real hash, and no
+        // token's (SHA-256 has no known preimage for it).
+        const NO_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let _ = std::hint::black_box(ct_eq(scim_token_hash(presented), NO_TOKEN));
+        false
+    }
+
     pub async fn find(org_uuid: &OrganizationId, conn: &DbConn) -> Option<Self> {
         conn.run(move |conn| scim_tokens::table.filter(scim_tokens::org_uuid.eq(org_uuid)).first::<Self>(conn).ok())
             .await
@@ -408,6 +418,15 @@ mod tests {
         let (other, _) = ScimToken::generate(OrganizationId::from("org".to_owned()), "a@example.test");
         assert_ne!(token, other);
         assert!(!row.matches(&other));
+    }
+
+    #[test]
+    fn no_token_is_the_same_work_and_never_matches() {
+        let (token, row) = ScimToken::generate(OrganizationId::from("org".to_owned()), "a@example.test");
+        assert!(!ScimToken::matches_none(&token));
+        assert!(!ScimToken::matches_none("pbscim1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        // The stand-in compared against is as long as a real hash.
+        assert_eq!(row.token_hash.len(), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".len());
     }
 
     #[test]

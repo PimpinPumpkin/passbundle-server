@@ -481,14 +481,26 @@ pub fn as_bool(value: &Value) -> Option<bool> {
     }
 }
 
-/// Drops attributes sent as null, at the top and in extensions: SCIM leaves
-/// out what has no value.
+/// Drops attributes sent as null, at every depth (in extensions, complex
+/// attributes, and the values of multi-valued ones): SCIM leaves out what has
+/// no value.
 pub fn without_nulls(resource: &mut Map<String, Value>) {
     resource.retain(|_, v| !v.is_null());
     for value in resource.values_mut() {
-        if let Value::Object(object) = value {
-            object.retain(|_, v| !v.is_null());
+        drop_nulls(value);
+    }
+}
+
+fn drop_nulls(value: &mut Value) {
+    match value {
+        Value::Object(object) => without_nulls(object),
+        Value::Array(items) => {
+            items.retain(|v| !v.is_null());
+            for item in items {
+                drop_nulls(item);
+            }
         }
+        _ => {}
     }
 }
 
@@ -707,12 +719,25 @@ mod tests {
 
     #[test]
     fn nulls_are_left_out() {
-        let mut user =
-            json!({ "userName": "a", "title": null, ENTERPRISE_USER_SCHEMA: { "manager": null, "department": "x" } })
-                .as_object()
-                .unwrap()
-                .clone();
+        let mut user = json!({
+            "userName": "a",
+            "title": null,
+            ENTERPRISE_USER_SCHEMA: { "manager": { "value": null, "$ref": "r" }, "department": "x", "costCenter": null },
+            "emails": [null, { "value": "a@x.test", "type": null, "display": { "deep": null } }],
+            "name": { "givenName": "A", "middleName": null }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
         without_nulls(&mut user);
-        assert_eq!(Value::Object(user), json!({ "userName": "a", ENTERPRISE_USER_SCHEMA: { "department": "x" } }));
+        assert_eq!(
+            Value::Object(user),
+            json!({
+                "userName": "a",
+                ENTERPRISE_USER_SCHEMA: { "manager": { "$ref": "r" }, "department": "x" },
+                "emails": [{ "value": "a@x.test", "display": {} }],
+                "name": { "givenName": "A" }
+            })
+        );
     }
 }
