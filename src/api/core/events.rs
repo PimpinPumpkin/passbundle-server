@@ -160,8 +160,14 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
     if !CONFIG.org_events_enabled() {
         return Ok(());
     }
+    // Keykeeper: a few requests a second per person, and at most
+    // MAX_COLLECTED events from each, so one member's app can't flood the
+    // event log and the organization's security tools (keykeeper_streaming).
+    if !crate::keykeeper_streaming::collect_allowed(&headers.user.uuid) {
+        err_code!("Too many events at once. Try again later.", rocket::http::Status::TooManyRequests.code)
+    }
 
-    for event in data.iter() {
+    for event in data.iter().take(crate::keykeeper_streaming::MAX_COLLECTED) {
         let event_date = parse_date(&event.date).map_res("Invalid event date")?;
         // Only the event types upstream accepts from clients, the rest are written server-side.
         match event.r#type {

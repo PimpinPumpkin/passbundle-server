@@ -126,6 +126,15 @@ pub enum EventType {
     OrganizationUpdated = 1600,
     OrganizationPurgedVault = 1601,
     OrganizationClientExportedVault = 1602,
+    // Keykeeper: a place the organization's events are sent was added,
+    // changed, removed, or stopped (keykeeper_event_streaming). 1690 and up
+    // are ours.
+    KeykeeperEventStreamAdded = 1690,
+    KeykeeperEventStreamChanged = 1691,
+    KeykeeperEventStreamRemoved = 1692,
+    // The server turned a destination off: it kept failing, said it's gone,
+    // or its settings can't be read anymore.
+    KeykeeperEventStreamStopped = 1693,
     // OrganizationVaultAccessed = 1603,
     // OrganizationEnabledSso = 1604, // Not supported
     // OrganizationDisabledSso = 1605, // Not supported
@@ -183,6 +192,29 @@ impl Event {
         }
     }
 
+    /// Keykeeper: a copy, for streaming (upstream's Event isn't Clone).
+    fn copy(&self) -> Self {
+        Self {
+            uuid: self.uuid.clone(),
+            event_type: self.event_type,
+            user_uuid: self.user_uuid.clone(),
+            org_uuid: self.org_uuid.clone(),
+            cipher_uuid: self.cipher_uuid.clone(),
+            collection_uuid: self.collection_uuid.clone(),
+            group_uuid: self.group_uuid.clone(),
+            org_user_uuid: self.org_user_uuid.clone(),
+            act_user_uuid: self.act_user_uuid.clone(),
+            device_type: self.device_type,
+            ip_address: self.ip_address.clone(),
+            event_date: self.event_date,
+            policy_uuid: self.policy_uuid.clone(),
+            provider_uuid: self.provider_uuid.clone(),
+            provider_user_uuid: self.provider_user_uuid.clone(),
+            provider_org_uuid: self.provider_org_uuid.clone(),
+            system_actor: self.system_actor,
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         use crate::util::format_date;
 
@@ -216,6 +248,16 @@ impl Event {
     /// #############
     /// Basic Queries
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+        let saved = self.save_row(conn).await;
+        // Keykeeper: and to the organization's security tools, if it sends
+        // its events to any (keykeeper_event_streaming).
+        if saved.is_ok() {
+            super::keykeeper_event_streaming::stream(self, conn).await;
+        }
+        saved
+    }
+
+    async fn save_row(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
             mysql {
                 diesel::insert_into(event::table)
@@ -239,6 +281,18 @@ impl Event {
     }
 
     pub async fn save_user_event(events: Vec<Event>, conn: &DbConn) -> EmptyResult {
+        // Keykeeper: and to each organization's security tools
+        // (keykeeper_event_streaming). The saves below ignore errors, so the
+        // events are streamed whatever they return.
+        let streamed: Vec<Event> = events.iter().filter(|e| e.org_uuid.is_some()).map(Event::copy).collect();
+        let saved = Self::save_user_event_rows(events, conn).await;
+        for event in &streamed {
+            super::keykeeper_event_streaming::stream(event, conn).await;
+        }
+        saved
+    }
+
+    async fn save_user_event_rows(events: Vec<Event>, conn: &DbConn) -> EmptyResult {
         // Special save function which is able to handle multiple events.
         // SQLite doesn't support the DEFAULT argument, and does not support inserting multiple values at the same time.
         // MySQL and PostgreSQL do.
@@ -372,3 +426,10 @@ impl Event {
 
 #[derive(Clone, Debug, DieselNewType, FromForm, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventId(String);
+
+// Keykeeper: for event streaming's queue, which keys on it.
+impl EventId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}

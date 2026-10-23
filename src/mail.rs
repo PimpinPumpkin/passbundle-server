@@ -411,6 +411,29 @@ pub async fn send_member_joined(
     send_email(address, &subject, body_html, body_text).await
 }
 
+/// Keykeeper: a place an organization's or MSP's events are sent kept
+/// failing, or its secrets can't be read anymore, so the server stopped
+/// sending there until someone fixes it and turns it back on.
+pub async fn send_event_stream_paused(
+    address: &str,
+    scope_name: &str,
+    destination_name: &str,
+    reason: &str,
+    url: &str,
+) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/keykeeper_event_stream_paused",
+        json!({
+            "url": url,
+            "img_src": CONFIG._smtp_img_src(),
+            "scope_name": scope_name,
+            "destination_name": destination_name,
+            "reason": reason,
+        }),
+    )?;
+    send_email(address, &subject, body_html, body_text).await
+}
+
 pub async fn send_emergency_access_invite(
     address: &str,
     user_id: UserId,
