@@ -4,7 +4,7 @@ use diesel::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
         schema::{collections, collections_groups, groups, groups_users, users_organizations},
@@ -86,22 +86,22 @@ impl Group {
         })
     }
 
-    pub async fn to_json_details(&self, conn: &DbConn) -> Value {
+    pub async fn to_json_details(&self, conn: &DbConn) -> ApiResult<Value> {
         // Keykeeper: each grant with its grid (DESIGN.md, "Folders and permissions").
         let grants = CollectionGroup::find_by_group(&self.uuid, &self.organizations_uuid, conn).await;
         let ids: Vec<CollectionId> = grants.iter().map(|g| g.collections_uuid.clone()).collect();
-        let extras = Extras::for_collections(&ids, conn).await;
+        let extras = Extras::for_collections(&ids, conn).await?;
         let collections_groups: Vec<Value> =
             grants.iter().map(|entry| extras.group(entry).grant_json(&entry.collections_uuid)).collect();
 
-        json!({
+        Ok(json!({
             "id": self.uuid,
             "organizationId": self.organizations_uuid,
             "name": self.name,
             "externalId": self.external_id,
             "collections": collections_groups,
             "object": "groupDetails"
-        })
+        }))
     }
 
     pub fn set_external_id(&mut self, external_id: Option<String>) {

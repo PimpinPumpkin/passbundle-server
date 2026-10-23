@@ -109,7 +109,12 @@ impl Collection {
         let grid = if let Some(cipher_sync_data) = cipher_sync_data {
             cipher_sync_data.access.in_collection(&self.org_uuid, &self.uuid)
         } else {
-            keykeeper_folder_permissions::in_collection(user_uuid, &self.org_uuid, &self.uuid, conn).await
+            // A database error shows no capabilities, never more than they have.
+            keykeeper_folder_permissions::in_collection(user_uuid, &self.org_uuid, &self.uuid, conn)
+                .await
+                .inspect_err(|e| error!("{e}"))
+                .ok()
+                .flatten()
         };
         self.to_json_with_grid(grid)
     }
@@ -419,7 +424,9 @@ impl Collection {
         user_uuid: &UserId,
         conn: &DbConn,
     ) -> bool {
-        let access = keykeeper_folder_permissions::Access::in_org(user_uuid, org_uuid, conn).await;
+        let Ok(access) = keykeeper_folder_permissions::Access::in_org(user_uuid, org_uuid, conn).await else {
+            return false;
+        };
         let collections = Self::find_by_organization(org_uuid, conn).await.into_iter().map(|c| c.uuid).collect();
         access.manages_any(org_uuid, &collections)
     }

@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
         schema::{
@@ -542,7 +542,7 @@ impl Membership {
         include_collections: bool,
         include_groups: bool,
         conn: &DbConn,
-    ) -> Value {
+    ) -> ApiResult<Value> {
         let user = User::find_by_uuid(&self.user_uuid, conn).await.unwrap();
 
         // Because BitWarden want the status to be -1 for revoked users we need to catch that here.
@@ -576,7 +576,7 @@ impl Membership {
             let grants =
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn).await;
             let ids: Vec<CollectionId> = grants.iter().map(|cu| cu.collection_uuid.clone()).collect();
-            let extras = Extras::for_collections(&ids, conn).await;
+            let extras = Extras::for_collections(&ids, conn).await?;
             grants.iter().map(|cu| extras.user(cu).grant_json(&cu.collection_uuid)).collect()
         } else {
             Vec::new()
@@ -614,7 +614,7 @@ impl Membership {
         let (membership_type, permissions) =
             super::keykeeper_roles::client_type_and_permissions(self, membership_type, permissions, conn).await;
 
-        json!({
+        Ok(json!({
             "id": self.uuid,
             "userId": self.user_uuid,
             "name": if self.get_unrevoked_status() >= MembershipStatus::Accepted as i32 { Some(user.name) } else { None },
@@ -638,7 +638,7 @@ impl Membership {
             "accessSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
 
             "object": "organizationUserUserDetails",
-        })
+        }))
     }
 
     /// Keykeeper: the member's grant with its grid.
@@ -646,14 +646,14 @@ impl Membership {
         grid.grant_json(&self.uuid)
     }
 
-    pub async fn to_json_details(&self, conn: &DbConn) -> Value {
+    pub async fn to_json_details(&self, conn: &DbConn) -> ApiResult<Value> {
         let coll_uuids = if self.access_all {
             vec![] // If we have complete access, no need to fill the array
         } else {
             let collections =
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn).await;
             let ids: Vec<CollectionId> = collections.iter().map(|cu| cu.collection_uuid.clone()).collect();
-            let extras = Extras::for_collections(&ids, conn).await;
+            let extras = Extras::for_collections(&ids, conn).await?;
             collections.iter().map(|cu| extras.user(cu).grant_json(&cu.collection_uuid)).collect()
         };
 
@@ -665,7 +665,7 @@ impl Membership {
             self.status
         };
 
-        json!({
+        Ok(json!({
             "id": self.uuid,
             "userId": self.user_uuid,
 
@@ -674,7 +674,7 @@ impl Membership {
             "collections": coll_uuids,
 
             "object": "organizationUserDetails",
-        })
+        }))
     }
 
     pub async fn to_json_mini_details(&self, conn: &DbConn) -> Value {

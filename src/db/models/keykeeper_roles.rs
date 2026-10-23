@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::{
-    CollectionId, Membership, MembershipId, MembershipType, OrganizationId, UserId,
+    CollectionId, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, UserId,
     keykeeper_folder_permissions::{Access, Grid},
 };
 
@@ -308,6 +308,28 @@ pub async fn refuse<S>(
     Outcome::Error((Status::Unauthorized, message))
 }
 
+/// For the manager guards: as refuse, but a confirmed member who isn't a
+/// custom member gets 404, as for something that isn't there. A regular
+/// member's web vault can reach a folder's endpoints (a folder they manage,
+/// or one they just stopped managing), and 401 would sign them out.
+pub async fn refuse_on_manager_route<S>(
+    request: &Request<'_>,
+    member: &Membership,
+    message: &'static str,
+) -> request::Outcome<S, &'static str> {
+    if member.status == MembershipStatus::Confirmed as i32
+        && !(member.atype == MembershipType::User as i32
+            && match request.guard::<DbConn>().await {
+                Outcome::Success(conn) => find(&member.uuid, &conn).await.is_some(),
+                _ => false,
+            })
+    {
+        error!(target: "auth", "Not found: {message}");
+        return Outcome::Error((Status::NotFound, message));
+    }
+    refuse(request, member, message).await
+}
+
 /// Refuses a custom member's action on anyone but a regular member: not
 /// themselves, admins, owners, or other custom members.
 pub async fn ensure_regular_target(
@@ -355,13 +377,13 @@ pub enum Reach {
 }
 
 impl Reach {
-    pub async fn of(actor: &UserId, org_id: &OrganizationId, conn: &DbConn) -> Self {
-        let access = Access::in_org(actor, org_id, conn).await;
-        if access.has_full(org_id) {
+    pub async fn of(actor: &UserId, org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Self> {
+        let access = Access::in_org(actor, org_id, conn).await?;
+        Ok(if access.has_full(org_id) {
             Self::All
         } else {
             Self::Only(access.folders)
-        }
+        })
     }
 
     pub fn contains(&self, collection: &CollectionId) -> bool {

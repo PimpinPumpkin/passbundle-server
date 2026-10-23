@@ -26,14 +26,14 @@ use crate::{
     db::{
         DbConn,
         keykeeper_schema::{keykeeper_collections_groups, keykeeper_users_collections},
-        schema::ciphers_collections,
+        schema::{ciphers_collections, collections_groups, users_collections},
     },
     error::MapResult,
 };
 
 use super::{
     Cipher, CipherId, CollectionGroup, CollectionId, CollectionUser, Group, GroupId, GroupUser, Membership,
-    MembershipStatus, MembershipType, OrganizationId, UserId,
+    MembershipStatus, MembershipType, OrganizationId, User, UserId,
 };
 
 /// What someone can do in a shared folder. Having a grant at all is "see
@@ -178,6 +178,21 @@ impl Grid {
 /// The grant a request asks for: our grid when it sends one, checked, or the
 /// preset upstream's fields name.
 pub fn requested(read_only: bool, hide_passwords: bool, manage: bool, keykeeper: Option<&Grid>) -> ApiResult<Grid> {
+    resolve(read_only, hide_passwords, manage, keykeeper, None)
+}
+
+/// The grant a save asks for, over the one it replaces: our grid when the
+/// request sends one, checked. Without one (an upstream client, or our CLI
+/// with an edited grant), the grid it had while upstream's fields are the
+/// ones it had, since every save resends every grant and upstream clients
+/// can't send ours; the preset those fields name once they change.
+pub fn resolve(
+    read_only: bool,
+    hide_passwords: bool,
+    manage: bool,
+    keykeeper: Option<&Grid>,
+    stored: Option<Grid>,
+) -> ApiResult<Grid> {
     match keykeeper {
         Some(grid) => {
             if let Err(e) = grid.check() {
@@ -185,7 +200,10 @@ pub fn requested(read_only: bool, hide_passwords: bool, manage: bool, keykeeper:
             }
             Ok(*grid)
         }
-        None => Ok(Grid::preset(read_only, hide_passwords, manage)),
+        None => match stored {
+            Some(grid) if grid.upstream() == (read_only, hide_passwords, manage) => Ok(grid),
+            _ => Ok(Grid::preset(read_only, hide_passwords, manage)),
+        },
     }
 }
 
@@ -308,50 +326,50 @@ pub struct Extras {
 }
 
 impl Extras {
-    /// Every row for these folders.
-    pub async fn for_collections(collections: &[CollectionId], conn: &DbConn) -> Self {
+    /// Every row for these folders. A database error refuses whatever asked:
+    /// without our rows, grants would read as their presets, which can be
+    /// more open.
+    pub async fn for_collections(collections: &[CollectionId], conn: &DbConn) -> ApiResult<Self> {
         if collections.is_empty() {
-            return Self::default();
+            return Ok(Self::default());
         }
         let ids = collections.to_vec();
         let (users, groups) = conn
             .run(move |conn| {
                 let users = keykeeper_users_collections::table
                     .filter(keykeeper_users_collections::collection_uuid.eq_any(&ids))
-                    .load::<UserRow>(conn)
-                    .unwrap_or_default();
+                    .load::<UserRow>(conn)?;
                 let groups = keykeeper_collections_groups::table
                     .filter(keykeeper_collections_groups::collections_uuid.eq_any(&ids))
-                    .load::<GroupRow>(conn)
-                    .unwrap_or_default();
-                (users, groups)
+                    .load::<GroupRow>(conn)?;
+                Ok::<_, diesel::result::Error>((users, groups))
             })
-            .await;
-        Self::from_rows(users, groups)
+            .await
+            .map_res("Error loading shared folders' permissions")?;
+        Ok(Self::from_rows(users, groups))
     }
 
     /// The rows for one person's own grants and their groups' grants.
-    async fn for_user(user: &UserId, groups: &[GroupId], conn: &DbConn) -> Self {
+    async fn for_user(user: &UserId, groups: &[GroupId], conn: &DbConn) -> ApiResult<Self> {
         let user = user.clone();
         let groups = groups.to_vec();
         let (users, groups) = conn
             .run(move |conn| {
                 let users = keykeeper_users_collections::table
                     .filter(keykeeper_users_collections::user_uuid.eq(&user))
-                    .load::<UserRow>(conn)
-                    .unwrap_or_default();
+                    .load::<UserRow>(conn)?;
                 let groups = if groups.is_empty() {
                     Vec::new()
                 } else {
                     keykeeper_collections_groups::table
                         .filter(keykeeper_collections_groups::groups_uuid.eq_any(&groups))
-                        .load::<GroupRow>(conn)
-                        .unwrap_or_default()
+                        .load::<GroupRow>(conn)?
                 };
-                (users, groups)
+                Ok::<_, diesel::result::Error>((users, groups))
             })
-            .await;
-        Self::from_rows(users, groups)
+            .await
+            .map_res("Error loading shared folders' permissions")?;
+        Ok(Self::from_rows(users, groups))
     }
 
     fn from_rows(users: Vec<UserRow>, groups: Vec<GroupRow>) -> Self {
@@ -385,16 +403,102 @@ impl Extras {
     }
 }
 
-/// Gives a person this grant to a folder: upstream's row with the closest
-/// preset, and ours with the rest when the preset doesn't say it all.
-pub async fn save_user(user: &UserId, collection: &CollectionId, grid: &Grid, conn: &DbConn) -> EmptyResult {
+/// The grants a save is about to replace, read before anything is deleted, so
+/// a grant sent back without our grid keeps the one it had (see resolve).
+#[derive(Default)]
+pub struct Stored {
+    users: HashMap<(UserId, CollectionId), Grid>,
+    groups: HashMap<(CollectionId, GroupId), Grid>,
+}
+
+impl Stored {
+    fn from(users: &[CollectionUser], groups: &[CollectionGroup], extras: &Extras) -> Self {
+        Self {
+            users: users
+                .iter()
+                .map(|cu| ((cu.user_uuid.clone(), cu.collection_uuid.clone()), extras.user(cu)))
+                .collect(),
+            groups: groups
+                .iter()
+                .map(|cg| ((cg.collections_uuid.clone(), cg.groups_uuid.clone()), extras.group(cg)))
+                .collect(),
+        }
+    }
+
+    /// Every grant to this folder, people's and groups'.
+    pub async fn of_collection(collection: &CollectionId, conn: &DbConn) -> ApiResult<Self> {
+        let users = CollectionUser::find_by_collection(collection, conn).await;
+        let groups = CollectionGroup::find_by_collection(collection, conn).await;
+        let extras = Extras::for_collections(std::slice::from_ref(collection), conn).await?;
+        Ok(Self::from(&users, &groups, &extras))
+    }
+
+    /// Every grant this person has in the organization's folders.
+    pub async fn of_member(user: &UserId, org: &OrganizationId, conn: &DbConn) -> ApiResult<Self> {
+        let users = CollectionUser::find_by_organization_and_user_uuid(org, user, conn).await;
+        let ids: Vec<CollectionId> = users.iter().map(|cu| cu.collection_uuid.clone()).collect();
+        let extras = Extras::for_collections(&ids, conn).await?;
+        Ok(Self::from(&users, &[], &extras))
+    }
+
+    /// Every grant this group has.
+    pub async fn of_group(group: &GroupId, org: &OrganizationId, conn: &DbConn) -> ApiResult<Self> {
+        let groups = CollectionGroup::find_by_group(group, org, conn).await;
+        let ids: Vec<CollectionId> = groups.iter().map(|cg| cg.collections_uuid.clone()).collect();
+        let extras = Extras::for_collections(&ids, conn).await?;
+        Ok(Self::from(&[], &groups, &extras))
+    }
+
+    pub fn user(&self, user: &UserId, collection: &CollectionId) -> Option<Grid> {
+        self.users.get(&(user.clone(), collection.clone())).copied()
+    }
+
+    pub fn group(&self, collection: &CollectionId, group: &GroupId) -> Option<Grid> {
+        self.groups.get(&(collection.clone(), group.clone())).copied()
+    }
+}
+
+/// Our row for a grant, or None when its preset says it all.
+fn extra_for(grid: &Grid) -> Option<Extra> {
     let (read_only, hide_passwords, manage) = grid.upstream();
-    CollectionUser::save(user, collection, read_only, hide_passwords, manage, conn).await?;
+    (*grid != Grid::preset(read_only, hide_passwords, manage)).then(|| Extra::of(grid))
+}
+
+/// Gives a person this grant to a folder: upstream's row with the closest
+/// preset, and ours with the rest when the preset doesn't say it all, in one
+/// transaction, so the two can't disagree.
+pub async fn save_user(user: &UserId, collection: &CollectionId, grid: &Grid, conn: &DbConn) -> EmptyResult {
+    User::update_uuid_revision(user, conn).await;
+    let (read_only, hide_passwords, manage) = grid.upstream();
+    let extra = extra_for(grid);
     let user = user.clone();
     let collection = collection.clone();
-    let extra = (*grid != Grid::preset(read_only, hide_passwords, manage)).then(|| Extra::of(grid));
     conn.run(move |conn| {
         conn.transaction(|conn| {
+            // Upstream's row, inserted or replaced (upstream's CollectionUser::save).
+            let values = (
+                users_collections::read_only.eq(read_only),
+                users_collections::hide_passwords.eq(hide_passwords),
+                users_collections::manage.eq(manage),
+            );
+            let updated = diesel::update(
+                users_collections::table
+                    .filter(users_collections::user_uuid.eq(&user))
+                    .filter(users_collections::collection_uuid.eq(&collection)),
+            )
+            .set(values)
+            .execute(conn)?;
+            if updated == 0 {
+                diesel::insert_into(users_collections::table)
+                    .values((
+                        users_collections::user_uuid.eq(&user),
+                        users_collections::collection_uuid.eq(&collection),
+                        values.0,
+                        values.1,
+                        values.2,
+                    ))
+                    .execute(conn)?;
+            }
             diesel::delete(
                 keykeeper_users_collections::table
                     .filter(keykeeper_users_collections::user_uuid.eq(&user))
@@ -433,13 +537,39 @@ pub async fn save_group(
     grid: &Grid,
     conn: &DbConn,
 ) -> EmptyResult {
+    for group_user in GroupUser::find_by_group(group, org, conn).await {
+        group_user.update_user_revision(conn).await;
+    }
     let (read_only, hide_passwords, manage) = grid.upstream();
-    CollectionGroup::new(collection.clone(), group.clone(), read_only, hide_passwords, manage).save(org, conn).await?;
+    let extra = extra_for(grid);
     let group = group.clone();
     let collection = collection.clone();
-    let extra = (*grid != Grid::preset(read_only, hide_passwords, manage)).then(|| Extra::of(grid));
     conn.run(move |conn| {
         conn.transaction(|conn| {
+            // Upstream's row, inserted or replaced (upstream's CollectionGroup::save).
+            let values = (
+                collections_groups::read_only.eq(read_only),
+                collections_groups::hide_passwords.eq(hide_passwords),
+                collections_groups::manage.eq(manage),
+            );
+            let updated = diesel::update(
+                collections_groups::table
+                    .filter(collections_groups::collections_uuid.eq(&collection))
+                    .filter(collections_groups::groups_uuid.eq(&group)),
+            )
+            .set(values)
+            .execute(conn)?;
+            if updated == 0 {
+                diesel::insert_into(collections_groups::table)
+                    .values((
+                        collections_groups::collections_uuid.eq(&collection),
+                        collections_groups::groups_uuid.eq(&group),
+                        values.0,
+                        values.1,
+                        values.2,
+                    ))
+                    .execute(conn)?;
+            }
             diesel::delete(
                 keykeeper_collections_groups::table
                     .filter(keykeeper_collections_groups::collections_uuid.eq(&collection))
@@ -493,7 +623,7 @@ fn full_grid(member: &Membership) -> Grid {
 
 impl Access {
     /// Across every organization they're a confirmed member of.
-    pub async fn of(user: &UserId, conn: &DbConn) -> Self {
+    pub async fn of(user: &UserId, conn: &DbConn) -> ApiResult<Self> {
         let members: HashMap<OrganizationId, Membership> =
             Membership::find_confirmed_by_user(user, conn).await.into_iter().map(|m| (m.org_uuid.clone(), m)).collect();
         let mut full: HashMap<OrganizationId, Grid> =
@@ -513,9 +643,9 @@ impl Access {
     }
 
     /// In one organization only.
-    pub async fn in_org(user: &UserId, org: &OrganizationId, conn: &DbConn) -> Self {
+    pub async fn in_org(user: &UserId, org: &OrganizationId, conn: &DbConn) -> ApiResult<Self> {
         let Some(member) = Membership::find_confirmed_by_user_and_org(user, org, conn).await else {
-            return Self::default();
+            return Ok(Self::default());
         };
         let mut full = HashMap::new();
         if member.has_full_access()
@@ -539,10 +669,10 @@ impl Access {
         direct: Vec<CollectionUser>,
         group_grants: Vec<CollectionGroup>,
         conn: &DbConn,
-    ) -> Self {
+    ) -> ApiResult<Self> {
         let groups: Vec<GroupId> =
             group_grants.iter().map(|g| g.groups_uuid.clone()).collect::<HashSet<_>>().into_iter().collect();
-        let extras = Extras::for_user(user, &groups, conn).await;
+        let extras = Extras::for_user(user, &groups, conn).await?;
         let mut folders: HashMap<CollectionId, Grid> = HashMap::new();
         let mut add = |collection: &CollectionId, grid: Grid| {
             folders.entry(collection.clone()).and_modify(|g| *g = g.or(grid)).or_insert(grid);
@@ -553,10 +683,10 @@ impl Access {
         for cg in &group_grants {
             add(&cg.collections_uuid, extras.group(cg));
         }
-        Self {
+        Ok(Self {
             full,
             folders,
-        }
+        })
     }
 
     /// Whether they reach every folder of this organization.
@@ -586,6 +716,19 @@ impl Access {
         }
     }
 
+    /// Each way they have to an organization's item in these folders: every
+    /// item if they reach every folder, and each of the item's folders they
+    /// reach, apart. For what needs two capabilities in the same place (an
+    /// item's history with its passwords), not merged across folders.
+    pub fn ways_to_item(&self, org: &OrganizationId, collections: &[CollectionId]) -> Vec<Grid> {
+        self.full
+            .get(org)
+            .copied()
+            .into_iter()
+            .chain(collections.iter().filter_map(|c| self.folders.get(c).copied()))
+            .collect()
+    }
+
     /// Whether they manage at least one folder of this organization.
     pub fn manages_any(&self, org: &OrganizationId, org_collections: &HashSet<CollectionId>) -> bool {
         self.full.get(org).is_some_and(|g| g.manage)
@@ -594,14 +737,14 @@ impl Access {
 }
 
 /// The folders an item is in, whoever reaches them.
-pub async fn collections_of(cipher: &CipherId, conn: &DbConn) -> Vec<CollectionId> {
+pub async fn collections_of(cipher: &CipherId, conn: &DbConn) -> ApiResult<Vec<CollectionId>> {
     let cipher = cipher.clone();
     conn.run(move |conn| {
         ciphers_collections::table
             .filter(ciphers_collections::cipher_uuid.eq(cipher))
             .select(ciphers_collections::collection_uuid)
             .load::<CollectionId>(conn)
-            .unwrap_or_default()
+            .map_res("Error loading an item's shared folders")
     })
     .await
 }
@@ -609,13 +752,43 @@ pub async fn collections_of(cipher: &CipherId, conn: &DbConn) -> Vec<CollectionI
 /// What a person can do with an item, without sync data at hand: everything
 /// with their own item, what their folders allow with an organization's, or
 /// None if they can't open it.
-pub async fn for_cipher(cipher: &Cipher, user: &UserId, conn: &DbConn) -> Option<Grid> {
+pub async fn for_cipher(cipher: &Cipher, user: &UserId, conn: &DbConn) -> ApiResult<Option<Grid>> {
     if cipher.is_owned_by_user(user) {
-        return Some(Grid::ALL);
+        return Ok(Some(Grid::ALL));
     }
-    let org = cipher.organization_uuid.as_ref()?;
-    let access = Access::in_org(user, org, conn).await;
-    access.for_item(org, &collections_of(&cipher.uuid, conn).await)
+    let Some(org) = cipher.organization_uuid.as_ref() else {
+        return Ok(None);
+    };
+    let access = Access::in_org(user, org, conn).await?;
+    Ok(access.for_item(org, &collections_of(&cipher.uuid, conn).await?))
+}
+
+/// Each way a person has to an item (Access::ways_to_item): everything for
+/// their own item, nothing if they can't open it.
+pub async fn ways_to_cipher(cipher: &Cipher, user: &UserId, conn: &DbConn) -> ApiResult<Vec<Grid>> {
+    if cipher.is_owned_by_user(user) {
+        return Ok(vec![Grid::ALL]);
+    }
+    let Some(org) = cipher.organization_uuid.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let access = Access::in_org(user, org, conn).await?;
+    Ok(access.ways_to_item(org, &collections_of(&cipher.uuid, conn).await?))
+}
+
+/// The folders of an organization's item that a person reaches, for the
+/// item's collectionIds outside sync, as sync lists them: every one of them
+/// for someone who reaches every folder.
+pub async fn reached_collections_of(cipher: &Cipher, user: &UserId, conn: &DbConn) -> ApiResult<Vec<CollectionId>> {
+    let Some(org) = cipher.organization_uuid.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let access = Access::in_org(user, org, conn).await?;
+    Ok(collections_of(&cipher.uuid, conn)
+        .await?
+        .into_iter()
+        .filter(|c| access.in_collection(org, c).is_some())
+        .collect())
 }
 
 /// What a person can do in one folder, or None if they don't reach it.
@@ -624,13 +797,20 @@ pub async fn in_collection(
     org: &OrganizationId,
     collection: &CollectionId,
     conn: &DbConn,
-) -> Option<Grid> {
-    Access::in_org(user, org, conn).await.in_collection(org, collection)
+) -> ApiResult<Option<Grid>> {
+    Ok(Access::in_org(user, org, conn).await?.in_collection(org, collection))
 }
 
-/// Whether a confirmed member manages this folder (or every folder).
+/// Whether a confirmed member manages this folder (or every folder). A
+/// database error says no.
 pub async fn manages(user: &UserId, org: &OrganizationId, collection: &CollectionId, conn: &DbConn) -> bool {
-    in_collection(user, org, collection, conn).await.is_some_and(|g| g.manage)
+    match in_collection(user, org, collection, conn).await {
+        Ok(grid) => grid.is_some_and(|g| g.manage),
+        Err(e) => {
+            error!("{e}");
+            false
+        }
+    }
 }
 
 /// The endpoints a regular member reaches for a folder they manage: what the
@@ -685,7 +865,9 @@ pub async fn admits_folder_manager(
     if let Some(collection) = collection {
         return manages(&member.user_uuid, &member.org_uuid, collection, &conn).await;
     }
-    let access = Access::in_org(&member.user_uuid, &member.org_uuid, &conn).await;
+    let Ok(access) = Access::in_org(&member.user_uuid, &member.org_uuid, &conn).await else {
+        return false;
+    };
     let collections =
         super::Collection::find_by_organization(&member.org_uuid, &conn).await.into_iter().map(|c| c.uuid).collect();
     access.manages_any(&member.org_uuid, &collections)
@@ -822,6 +1004,62 @@ mod tests {
         assert!(Grid::ALL.check().is_ok());
         // Without a grid, upstream's fields are taken at their word.
         assert_eq!(requested(false, false, false, None).ok(), Some(Grid::preset(false, false, false)));
+    }
+
+    #[test]
+    fn a_grant_sent_back_without_our_grid_keeps_it_until_upstream_fields_change() {
+        let custom = Grid {
+            see_passwords: true,
+            edit: true,
+            view_history: true,
+            ..NONE
+        };
+        let (ro, hp, mn) = custom.upstream();
+        // An upstream client resending what it was shown: the grid stays.
+        assert_eq!(resolve(ro, hp, mn, None, Some(custom)).ok(), Some(custom));
+        // Upstream's fields changed: the preset they name, whatever was stored.
+        assert_eq!(resolve(true, false, false, None, Some(custom)).ok(), Some(Grid::preset(true, false, false)));
+        assert_eq!(resolve(false, false, true, None, Some(custom)).ok(), Some(Grid::ALL));
+        // Nothing stored: the preset.
+        assert_eq!(resolve(ro, hp, mn, None, None).ok(), Some(Grid::preset(ro, hp, mn)));
+        // Our grid, when sent, decides, and is checked.
+        let other = Grid::preset(true, true, false);
+        assert_eq!(resolve(ro, hp, mn, Some(&other), Some(custom)).ok(), Some(other));
+        let broken = Grid {
+            export: true,
+            ..NONE
+        };
+        assert!(resolve(ro, hp, mn, Some(&broken), Some(custom)).is_err());
+    }
+
+    #[test]
+    fn ways_to_an_item_stay_apart_for_what_needs_two_capabilities_together() {
+        let org: OrganizationId = "org".to_owned().into();
+        let a: CollectionId = "a".to_owned().into();
+        let b: CollectionId = "b".to_owned().into();
+        let history_only = Grid {
+            view_history: true,
+            ..NONE
+        };
+        let passwords_only = Grid {
+            see_passwords: true,
+            ..NONE
+        };
+        let access = Access {
+            full: HashMap::new(),
+            folders: HashMap::from([(a.clone(), history_only), (b.clone(), passwords_only)]),
+        };
+        let ways = access.ways_to_item(&org, &[a.clone(), b.clone()]);
+        assert_eq!(ways.len(), 2);
+        assert!(!ways.iter().any(|g| g.view_history && g.see_passwords));
+        // Merged, they would have both: what for_item gives, for anything else.
+        let merged = access.for_item(&org, &[a.clone(), b]).unwrap_or_default();
+        assert!(merged.view_history && merged.see_passwords);
+        let full = Access {
+            full: HashMap::from([(org.clone(), Grid::EVERY_ITEM)]),
+            folders: HashMap::from([(a.clone(), history_only)]),
+        };
+        assert_eq!(full.ways_to_item(&org, &[a]), vec![Grid::EVERY_ITEM, history_only]);
     }
 
     #[test]

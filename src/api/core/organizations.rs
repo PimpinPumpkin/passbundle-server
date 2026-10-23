@@ -168,6 +168,11 @@ impl CollectionGroupData {
     fn grid(&self) -> ApiResult<Grid> {
         folder_permissions::requested(self.read_only, self.hide_passwords, self.manage, self.keykeeper.as_ref())
     }
+
+    /// The grant to save over the stored one (folder_permissions::resolve).
+    fn grid_over(&self, stored: Option<Grid>) -> ApiResult<Grid> {
+        folder_permissions::resolve(self.read_only, self.hide_passwords, self.manage, self.keykeeper.as_ref(), stored)
+    }
 }
 
 #[derive(Deserialize)]
@@ -185,6 +190,11 @@ struct CollectionMembershipData {
 impl CollectionMembershipData {
     fn grid(&self) -> ApiResult<Grid> {
         folder_permissions::requested(self.read_only, self.hide_passwords, self.manage, self.keykeeper.as_ref())
+    }
+
+    /// The grant to save over the stored one (folder_permissions::resolve).
+    fn grid_over(&self, stored: Option<Grid>) -> ApiResult<Grid> {
+        folder_permissions::resolve(self.read_only, self.hide_passwords, self.manage, self.keykeeper.as_ref(), stored)
     }
 }
 
@@ -421,10 +431,10 @@ async fn get_org_collections_details(org_id: OrganizationId, headers: ManagerHea
     // folder sees no one else's access to it: a regular member who manages
     // some folders gets this list for their dialogs, and it lists who
     // reaches only the folders they manage.
-    let access = Access::in_org(&headers.user.uuid, &org_id, &conn).await;
+    let access = Access::in_org(&headers.user.uuid, &org_id, &conn).await?;
     let collections = Collection::find_by_organization(&org_id, &conn).await;
     let collection_ids: Vec<CollectionId> = collections.iter().map(|c| c.uuid.clone()).collect();
-    let extras = Extras::for_collections(&collection_ids, &conn).await;
+    let extras = Extras::for_collections(&collection_ids, &conn).await?;
     let sees_access = |col: &CollectionId| {
         headers.custom_permissions.is_some()
             || headers.membership.atype >= MembershipType::Manager
@@ -618,9 +628,12 @@ async fn post_bulk_access_collections(
         )
         .await;
 
+        // Keykeeper: a grant sent back without our grid keeps the one it had.
+        let stored = folder_permissions::Stored::of_collection(&col_id, &conn).await?;
         CollectionGroup::delete_all_by_collection(&col_id, &org_id, &conn).await?;
         for group in &data.groups {
-            folder_permissions::save_group(&col_id, &group.id, &org_id, &group.grid()?, &conn).await?;
+            let grid = group.grid_over(stored.group(&col_id, &group.id))?;
+            folder_permissions::save_group(&col_id, &group.id, &org_id, &grid, &conn).await?;
         }
 
         CollectionUser::delete_all_by_collection(&col_id, &conn).await?;
@@ -633,7 +646,8 @@ async fn post_bulk_access_collections(
                 continue;
             }
 
-            folder_permissions::save_user(&member.user_uuid, &col_id, &user.grid()?, &conn).await?;
+            let grid = user.grid_over(stored.user(&member.user_uuid, &col_id))?;
+            folder_permissions::save_user(&member.user_uuid, &col_id, &grid, &conn).await?;
         }
     }
 
@@ -681,11 +695,14 @@ async fn put_organization_collection_update(
     )
     .await;
 
+    // Keykeeper: each grant with its grid, checked in validate(). A grant
+    // sent back without our grid keeps the one it had.
+    let stored = folder_permissions::Stored::of_collection(&col_id, &conn).await?;
     CollectionGroup::delete_all_by_collection(&col_id, &org_id, &conn).await?;
 
-    // Keykeeper: each grant with its grid, checked in validate().
     for group in data.groups {
-        folder_permissions::save_group(&col_id, &group.id, &org_id, &group.grid()?, &conn).await?;
+        let grid = group.grid_over(stored.group(&col_id, &group.id))?;
+        folder_permissions::save_group(&col_id, &group.id, &org_id, &grid, &conn).await?;
     }
 
     CollectionUser::delete_all_by_collection(&col_id, &conn).await?;
@@ -699,7 +716,8 @@ async fn put_organization_collection_update(
             continue;
         }
 
-        folder_permissions::save_user(&member.user_uuid, &col_id, &user.grid()?, &conn).await?;
+        let grid = user.grid_over(stored.user(&member.user_uuid, &col_id))?;
+        folder_permissions::save_user(&member.user_uuid, &col_id, &grid, &conn).await?;
     }
 
     Ok(Json(collection.to_json_details(&headers.user.uuid, None, &conn).await))
@@ -713,11 +731,6 @@ async fn delete_organization_collection_impl(
 ) -> EmptyResult {
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
-    }
-    // Keykeeper: a regular member who manages a folder changes its name and
-    // people; deleting folders stays with owners, admins, and managers.
-    if headers.folder_manager {
-        err!("You don't have permission to delete collections")
     }
     let Some(collection) = Collection::find_by_uuid_and_org(col_id, org_id, conn).await else {
         err!("Collection not found", "Collection does not exist or does not belong to this organization")
@@ -795,7 +808,7 @@ async fn get_org_collection_detail(
             };
 
             // Keykeeper: each grant's grid.
-            let extras = Extras::for_collections(std::slice::from_ref(&collection.uuid), &conn).await;
+            let extras = Extras::for_collections(std::slice::from_ref(&collection.uuid), &conn).await?;
             let groups: Vec<Value> = if CONFIG.org_groups_enabled() {
                 CollectionGroup::find_by_collection(&collection.uuid, &conn)
                     .await
@@ -844,7 +857,7 @@ async fn get_collection_users(
     };
 
     // Keykeeper: each grant's grid.
-    let extras = Extras::for_collections(std::slice::from_ref(&collection.uuid), &conn).await;
+    let extras = Extras::for_collections(std::slice::from_ref(&collection.uuid), &conn).await?;
     let mut member_list = Vec::new();
     for col_user in CollectionUser::find_by_collection(&collection.uuid, &conn).await {
         member_list.push(
@@ -888,7 +901,7 @@ async fn get_org_details_impl(
     conn: &DbConn,
 ) -> Result<Value, crate::Error> {
     let ciphers = Cipher::find_by_org(org_id, conn).await;
-    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await;
+    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await?;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
     for c in ciphers {
@@ -948,7 +961,7 @@ async fn get_members(
                 data.include_groups.unwrap_or(false),
                 &conn,
             )
-            .await,
+            .await?,
         );
     }
 
@@ -1089,7 +1102,7 @@ async fn send_invite(
         if !data.groups.is_empty() {
             err!("Your role can't add people to groups")
         }
-        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await;
+        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await?;
         for col in data.collections.iter().flatten() {
             reach.ensure_grant(&col.id, &col.grid()?)?;
         }
@@ -1576,6 +1589,12 @@ async fn get_org_user_mini_details(org_id: OrganizationId, headers: ManagerHeade
     }
     let mut members_json = Vec::new();
     for m in Membership::find_by_org(&org_id, &conn).await {
+        // Keykeeper: a member admitted because they manage a folder gets the
+        // people they can give it to: accepted and confirmed members, not
+        // invitations or revoked members.
+        if headers.folder_manager && m.status < MembershipStatus::Accepted as i32 {
+            continue;
+        }
         members_json.push(m.to_json_mini_details(&conn).await);
     }
 
@@ -1605,7 +1624,8 @@ async fn get_user(
     // Else these will not be shown in the interface, and could lead to missing collections when saved.
     let include_groups = data.include_groups.unwrap_or(false);
     Ok(Json(
-        user.to_json_details_for_admin(data.include_collections.unwrap_or(include_groups), include_groups, &conn).await,
+        user.to_json_details_for_admin(data.include_collections.unwrap_or(include_groups), include_groups, &conn)
+            .await?,
     ))
 }
 
@@ -1677,8 +1697,12 @@ async fn edit_member(
         custom_role.as_ref(),
         access_all,
     )?;
+    // Keykeeper: the member's grants as they are, so a grant sent back without
+    // our grid keeps the one it had (folder_permissions::resolve).
+    let stored = folder_permissions::Stored::of_member(&member_to_edit.user_uuid, &org_id, &conn).await?;
     // Keykeeper: a custom role changes only collections it reaches, giving no
-    // more than it has, and leaves groups alone.
+    // more than it has, and leaves groups alone. A grant it leaves as it was
+    // isn't one it gives.
     let reach = if headers.custom_permissions.is_some() {
         let current: HashSet<GroupId> =
             GroupUser::find_by_member(&member_to_edit.uuid, &conn).await.into_iter().map(|g| g.groups_uuid).collect();
@@ -1686,9 +1710,13 @@ async fn edit_member(
         if current != requested {
             err!("Your role can't change someone's groups")
         }
-        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await;
+        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await?;
         for col in data.collections.iter().flatten() {
-            reach.ensure_grant(&col.id, &col.grid()?)?;
+            let had = stored.user(&member_to_edit.user_uuid, &col.id);
+            let grid = col.grid_over(had)?;
+            if had != Some(grid) {
+                reach.ensure_grant(&col.id, &grid)?;
+            }
         }
         Some(reach)
     } else {
@@ -1738,8 +1766,8 @@ async fn edit_member(
             match Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await {
                 None => err!("Collection not found in Organization"),
                 Some(collection) => {
-                    folder_permissions::save_user(&member_to_edit.user_uuid, &collection.uuid, &col.grid()?, &conn)
-                        .await?;
+                    let grid = col.grid_over(stored.user(&member_to_edit.user_uuid, &collection.uuid))?;
+                    folder_permissions::save_user(&member_to_edit.user_uuid, &collection.uuid, &grid, &conn).await?;
                 }
             }
         }
@@ -1982,20 +2010,28 @@ async fn post_org_import(
 
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
+
+    // Keykeeper: every relation names an item and a folder of this import,
+    // checked before anything is saved, so nothing is left half done.
+    let mut relations: HashMap<usize, Vec<usize>> = HashMap::new();
+    for relation in &data.collection_relationships {
+        if relation.key >= data.ciphers.len() || relation.value >= data.collections.len() {
+            err!(Compact, "Invalid collection relationship")
+        }
+        relations.entry(relation.key).or_default().push(relation.value);
+    }
+
     // Keykeeper: an import makes items, so each folder it puts them in needs
     // create, and someone who doesn't reach every folder can't leave an item
     // outside all of them (DESIGN.md, "Folders and permissions").
-    let access = Access::in_org(&headers.membership.user_uuid, &org_id, &conn).await;
-    if !access.has_full(&org_id) {
-        let placed: HashSet<usize> = data.collection_relationships.iter().map(|r| r.key).collect();
-        if (0..data.ciphers.len()).any(|i| !placed.contains(&i)) {
-            err!(Compact, "You don't have permission to import items outside your shared folders")
-        }
+    let access = Access::in_org(&headers.membership.user_uuid, &org_id, &conn).await?;
+    if !access.has_full(&org_id) && (0..data.ciphers.len()).any(|i| !relations.contains_key(&i)) {
+        err!(Compact, "You don't have permission to import items outside your shared folders")
     }
-    let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
-    for col in data.collections {
-        let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
-        let collection_uuid = if let Some(collection) = existing {
+
+    // Every folder is checked before any new one is made.
+    for col in &data.collections {
+        if let Some(collection) = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id)) {
             // When not an Owner or Admin, check if the member is allowed to write to the collection.
             // Keykeeper: allowed to add items to it.
             if headers.membership.atype < MembershipType::Admin
@@ -2003,13 +2039,18 @@ async fn post_org_import(
             {
                 err!(Compact, "The current user isn't allowed to manage this collection")
             }
-            collection.uuid.clone()
-        } else {
+        } else if headers.membership.atype <= MembershipType::Manager && !headers.membership.has_full_access() {
             // We do not allow users or managers which can not manage all collections to create new collections
             // If there is any collection other than an existing import collection, abort the import.
-            if headers.membership.atype <= MembershipType::Manager && !headers.membership.has_full_access() {
-                err!(Compact, "The current user isn't allowed to create new collections")
-            }
+            err!(Compact, "The current user isn't allowed to create new collections")
+        }
+    }
+    let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
+    for col in data.collections {
+        let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
+        let collection_uuid = if let Some(collection) = existing {
+            collection.uuid.clone()
+        } else {
             let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
             new_collection.save(&conn).await?;
             new_collection.uuid
@@ -2018,23 +2059,18 @@ async fn post_org_import(
         collections.push(collection_uuid);
     }
 
-    // Read the relations between collections and ciphers
-    // Ciphers can be in multiple collections at the same time
-    let mut relations = Vec::with_capacity(data.collection_relationships.len());
-    for relation in data.collection_relationships {
-        relations.push((relation.key, relation.value));
-    }
-
     let headers: Headers = headers.into();
 
-    let mut ciphers: Vec<CipherId> = Vec::with_capacity(data.ciphers.len());
-    for mut cipher_data in data.ciphers {
+    // Keykeeper: each item goes into its folders as soon as it's saved, and
+    // an item that can't be saved stops the import, rather than being
+    // skipped: no item of this import is ever outside the folders it named.
+    for (index, mut cipher_data) in data.ciphers.into_iter().enumerate() {
         // Always clear folder_id's via an organization import
         cipher_data.folder_id = None;
         // Replace the client-provided, unvalidated organizationId with the real target org
         cipher_data.organization_id = Some(org_id.clone());
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        update_cipher_from_data(
+        if let Err(e) = update_cipher_from_data(
             &mut cipher,
             cipher_data,
             &headers,
@@ -2045,16 +2081,18 @@ async fn post_org_import(
             ItemSave::New,
         )
         .await
-        .ok();
-        ciphers.push(cipher.uuid);
-    }
-
-    // Assign the collections
-    for (cipher_index, col_index) in relations {
-        let (Some(cipher_id), Some(col_id)) = (ciphers.get(cipher_index), collections.get(col_index)) else {
-            err!(Compact, "Invalid collection relationship")
-        };
-        CollectionCipher::save(cipher_id, col_id, &conn).await?;
+        {
+            if Cipher::find_by_uuid(&cipher.uuid, &conn).await.is_some() {
+                cipher.delete(&conn).await?;
+            }
+            return Err(e);
+        }
+        for col_index in relations.get(&index).into_iter().flatten() {
+            let Some(col_id) = collections.get(*col_index) else {
+                err!(Compact, "Invalid collection relationship")
+            };
+            CollectionCipher::save(&cipher.uuid, col_id, &conn).await?;
+        }
     }
 
     let mut user = headers.user;
@@ -2081,12 +2119,13 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
     }
 
     // Keykeeper: the same rules as one item's folders (ciphers.rs,
-    // change_item_folders): adding needs create in each folder, removing
-    // needs share, the item must be editable with its passwords showing, and
+    // change_item_folders): adding needs create in each folder and share on
+    // the item, removing needs share there, the item must be editable with
+    // its passwords showing, and
     // it stays in at least one folder for anyone who doesn't reach every
     // folder. Everything is checked before anything changes.
     let org_id = &data.organization_id;
-    let access = Access::in_org(&headers.user.uuid, org_id, &conn).await;
+    let access = Access::in_org(&headers.user.uuid, org_id, &conn).await?;
     for collection_uuid in &data.collection_ids {
         let grid = match Collection::find_by_uuid_and_org(collection_uuid, org_id, &conn).await {
             Some(_) => access.in_collection(org_id, collection_uuid),
@@ -2116,13 +2155,22 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
         let Some(cipher) = Cipher::find_by_uuid_and_org(cipher_id, org_id, &conn).await else {
             continue;
         };
-        if !cipher.is_in_editable_collection_by_user(&headers.user.uuid, &conn).await {
+        let held: Vec<CollectionId> = folder_permissions::collections_of(&cipher.uuid, &conn).await?;
+        let item = access.for_item(org_id, &held).unwrap_or(Grid::NONE);
+        if !(item.edit && item.see_passwords) {
             err!("You don't have permission to change this item's shared folders")
         }
-        let held: HashSet<CollectionId> =
-            folder_permissions::collections_of(&cipher.uuid, &conn).await.into_iter().collect();
-        if data.remove_collections && !access.has_full(org_id) && held.is_subset(&data.collection_ids) {
-            err!("Items only leave their last shared folder by being deleted")
+        let held: HashSet<CollectionId> = held.into_iter().collect();
+        if data.remove_collections {
+            if !access.has_full(org_id) && held.is_subset(&data.collection_ids) {
+                err!("Items only leave their last shared folder by being deleted")
+            }
+        } else {
+            // Adding an existing item to another folder needs share on it
+            // (ciphers.rs, may_add_to); create in each folder was checked above.
+            for collection in data.collection_ids.difference(&held) {
+                super::ciphers::may_add_to(&item, access.in_collection(org_id, collection))?;
+            }
         }
         changing.push(cipher);
     }
@@ -2684,8 +2732,8 @@ async fn get_groups_data(
                 None
             };
             for g in groups {
-                let mut group = g.to_json_details(&conn).await;
-                if custom {
+                let mut group = g.to_json_details(&conn).await?;
+                if custom || headers.folder_manager {
                     group["externalId"] = Value::Null;
                 }
                 if let (Some(reach), Some(collections)) = (&reach, group["collections"].as_array_mut()) {
@@ -2696,7 +2744,9 @@ async fn get_groups_data(
         } else {
             for g in groups {
                 let mut group = g.to_json();
-                if custom {
+                // Keykeeper: a directory's id is for owners and admins, not a
+                // custom role or someone who manages a folder.
+                if custom || headers.folder_manager {
                     group["externalId"] = Value::Null;
                 }
                 groups_json.push(group);
@@ -2790,6 +2840,11 @@ impl CollectionData {
     fn grid(&self) -> ApiResult<Grid> {
         folder_permissions::requested(self.read_only, self.hide_passwords, self.manage, self.keykeeper.as_ref())
     }
+
+    /// The grant to save over the stored one (folder_permissions::resolve).
+    fn grid_over(&self, stored: Option<Grid>) -> ApiResult<Grid> {
+        folder_permissions::resolve(self.read_only, self.hide_passwords, self.manage, self.keykeeper.as_ref(), stored)
+    }
 }
 
 #[post("/organizations/<org_id>/groups", data = "<data>")]
@@ -2822,7 +2877,8 @@ async fn post_groups(
     )
     .await;
 
-    add_update_group(group, group_request.collections, group_request.users, org_id, &headers, &conn).await
+    let stored = folder_permissions::Stored::default();
+    add_update_group(group, group_request.collections, group_request.users, org_id, &stored, &headers, &conn).await
 }
 
 #[put("/organizations/<org_id>/groups/<group_id>", data = "<data>")]
@@ -2849,6 +2905,8 @@ async fn put_group(
 
     let updated_group = group_request.update_group(group);
 
+    // Keykeeper: a grant sent back without our grid keeps the one it had.
+    let stored = folder_permissions::Stored::of_group(&group_id, &org_id, &conn).await?;
     CollectionGroup::delete_all_by_group(&group_id, &org_id, &conn).await?;
     GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
@@ -2863,7 +2921,8 @@ async fn put_group(
     )
     .await;
 
-    add_update_group(updated_group, group_request.collections, group_request.users, org_id, &headers, &conn).await
+    add_update_group(updated_group, group_request.collections, group_request.users, org_id, &stored, &headers, &conn)
+        .await
 }
 
 async fn add_update_group(
@@ -2871,14 +2930,16 @@ async fn add_update_group(
     collections: Vec<CollectionData>,
     members: Vec<MembershipId>,
     org_id: OrganizationId,
+    stored: &folder_permissions::Stored,
     headers: &AdminHeaders,
     conn: &DbConn,
 ) -> JsonResult {
     group.save(conn).await?;
 
-    // Keykeeper: each grant with its grid, checked in validate().
+    // Keykeeper: each grant with its grid, checked in validate(), over the
+    // one it had (empty for a new group).
     for col_selection in collections {
-        let grid = col_selection.grid()?;
+        let grid = col_selection.grid_over(stored.group(&col_selection.id, &group.uuid))?;
         folder_permissions::save_group(&col_selection.id, &group.uuid, &org_id, &grid, conn).await?;
     }
 
@@ -2925,7 +2986,7 @@ async fn get_group_details(
         err!("Group not found", "Group uuid is invalid or does not belong to the organization")
     };
 
-    Ok(Json(group.to_json_details(&conn).await))
+    Ok(Json(group.to_json_details(&conn).await?))
 }
 
 #[delete("/organizations/<org_id>/groups/<group_id>")]
@@ -3343,7 +3404,7 @@ async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, conn: DbC
     // yet, so for them import and export covers import.
     if headers.custom_permissions.is_some()
         && !matches!(
-            crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await,
+            crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await?,
             crate::db::models::keykeeper_roles::Reach::All
         )
     {

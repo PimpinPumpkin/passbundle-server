@@ -115,8 +115,8 @@ struct TemplateData {
 }
 
 /// Adds a template, or changes its source or which clients get it. The source
-/// must be an item the caller can see, and not one of the MSP's clients'
-/// copies.
+/// must be an item the caller can see and share, and not one of the MSP's
+/// clients' copies.
 #[put("/keykeeper/msp/<msp_id>/templates/<template_id>", data = "<data>")]
 async fn set_template(
     msp_id: MspId,
@@ -134,6 +134,11 @@ async fn set_template(
         Some(c) if c.deleted_at.is_none() && c.is_accessible_to_user(&headers.user.uuid, &conn).await => c,
         _ => err!("Template not found"),
     };
+    // Keykeeper: a template is copied into other organizations, so its source
+    // needs share, as for any copy (DESIGN.md, "Folders and permissions").
+    if !source.grid_for_user(&headers.user.uuid, None, &conn).await.is_some_and(|g| g.share) {
+        err!("You don't have permission to share this item, so it can't be a template")
+    }
     if source.organization_uuid.as_ref().is_some_and(|org| ours.contains(org)) {
         err!("That's a copy in one of your clients. Choose the original template.")
     }

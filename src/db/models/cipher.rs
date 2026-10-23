@@ -317,7 +317,10 @@ impl Cipher {
                 Cow::from(Vec::new())
             }
         } else {
-            Cow::from(self.get_admin_collections(user_uuid.clone(), conn).await)
+            // Keykeeper: every folder of the item the person reaches, as sync
+            // lists them, read-only ones included: the item form posts this
+            // list back, and leaving a folder out takes the item out of it.
+            Cow::from(keykeeper_folder_permissions::reached_collections_of(self, user_uuid, conn).await?)
         };
 
         // There are three types of cipher response models in upstream
@@ -554,7 +557,7 @@ impl Cipher {
     /// and permissions"): everything with their own item, what full access
     /// to its organization gives them, and otherwise what any shared folder
     /// holding it allows them, merged over their ways in. None means they
-    /// can't open it.
+    /// can't open it, or that their permissions couldn't be read.
     pub async fn grid_for_user(
         &self,
         user_uuid: &UserId,
@@ -562,7 +565,11 @@ impl Cipher {
         conn: &DbConn,
     ) -> Option<Grid> {
         let Some(sync) = cipher_sync_data else {
-            return keykeeper_folder_permissions::for_cipher(self, user_uuid, conn).await;
+            return keykeeper_folder_permissions::for_cipher(self, user_uuid, conn)
+                .await
+                .inspect_err(|e| error!("Refused, as the item's permissions couldn't be read: {e}"))
+                .ok()
+                .flatten();
         };
         if self.is_owned_by_user(user_uuid) {
             return Some(Grid::ALL);

@@ -917,9 +917,6 @@ pub struct ManagerHeaders {
     pub user: User,
     pub ip: ClientIp,
     pub org_id: OrganizationId,
-    /// Keykeeper: a regular member admitted because they manage this folder
-    /// (keykeeper_folder_permissions.rs), not an owner, admin, or manager.
-    pub folder_manager: bool,
 }
 
 #[rocket::async_trait]
@@ -934,11 +931,17 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                     err_handler!("Error getting DB")
                 };
 
+                // Keykeeper: 404, not 401, which signs the web vault out.
                 if !Collection::is_coll_manageable_by_user(&col_id, &headers.membership.user_uuid, &conn).await {
-                    err_handler!("The current user isn't a manager for this collection")
+                    error!(target: "auth", "Not found: the current user isn't a manager for this collection");
+                    return Outcome::Error((
+                        rocket::http::Status::NotFound,
+                        "The current user isn't a manager for this collection",
+                    ));
                 }
             } else {
-                err_handler!("Error getting the collection id")
+                error!(target: "auth", "Not found: error getting the collection id");
+                return Outcome::Error((rocket::http::Status::NotFound, "Error getting the collection id"));
             }
 
             Outcome::Success(Self {
@@ -947,7 +950,6 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 user: headers.user,
                 ip: headers.ip,
                 org_id: headers.membership.org_uuid,
-                folder_manager: false,
             })
         } else if let Some(col_id) = get_col_id(request)
             && crate::db::models::keykeeper_folder_permissions::admits_folder_manager(
@@ -965,11 +967,11 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 user: headers.user,
                 ip: headers.ip,
                 org_id: headers.membership.org_uuid,
-                folder_manager: true,
             })
         } else {
-            // Keykeeper: 403 for a custom member, 401 for everyone else.
-            crate::db::models::keykeeper_roles::refuse(
+            // Keykeeper: 403 for a custom member, 404 for another confirmed
+            // member (401 signs the web vault out), 401 for everyone else.
+            crate::db::models::keykeeper_roles::refuse_on_manager_route(
                 request,
                 &headers.membership,
                 "You need to be a Manager, Admin or Owner to call this endpoint",
@@ -1053,8 +1055,9 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 ip: headers.ip,
             })
         } else {
-            // Keykeeper: 403 for a custom member, 401 for everyone else.
-            crate::db::models::keykeeper_roles::refuse(
+            // Keykeeper: 403 for a custom member, 404 for another confirmed
+            // member (401 signs the web vault out), 401 for everyone else.
+            crate::db::models::keykeeper_roles::refuse_on_manager_route(
                 request,
                 &headers.membership,
                 "You need to be a Manager, Admin or Owner to call this endpoint",
@@ -1096,7 +1099,6 @@ impl ManagerHeaders {
             user: h.user,
             ip: h.ip,
             org_id: h.membership.org_uuid,
-            folder_manager: h.folder_manager,
         })
     }
 }
