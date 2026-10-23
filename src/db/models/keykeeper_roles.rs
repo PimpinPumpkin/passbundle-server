@@ -121,6 +121,9 @@ const ROUTES: &[(Method, &str, &[Permission])] = &[
     // Event logs
     (Method::Get, "/organizations/<org_id>/events", &[AccessEventLogs]),
     (Method::Get, "/organizations/<org_id>/users/<member_id>/events", &[AccessEventLogs]),
+    // The event log loads the members' names and emails to say who acted.
+    // Read only, and only what the endpoint gives anyone who can call it.
+    (Method::Get, "/organizations/<org_id>/users/mini-details", &[AccessEventLogs]),
     // Export
     (Method::Get, "/organizations/<org_id>/export", &[AccessImportExport]),
 ];
@@ -470,6 +473,15 @@ mod tests {
         ] {
             assert!(route_permissions(method, path).is_empty(), "{method} {path}");
         }
+    }
+
+    #[test]
+    fn the_event_log_can_name_who_acted() {
+        assert_eq!(route_permissions(Method::Get, "/organizations/<org_id>/users/mini-details"), &[AccessEventLogs]);
+        assert_eq!(
+            route_permissions(Method::Get, "/organizations/<org_id>/events"),
+            route_permissions(Method::Get, "/organizations/<org_id>/users/mini-details")
+        );
     }
 
     #[test]

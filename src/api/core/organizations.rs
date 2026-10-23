@@ -1538,6 +1538,8 @@ async fn confirm_invite_impl(
     save_result
 }
 
+// Keykeeper: a custom role that views event logs reads this too, so the event
+// log can say who acted (keykeeper_roles.rs). The same fields, read only.
 #[get("/organizations/<org_id>/users/mini-details", rank = 1)]
 async fn get_org_user_mini_details(org_id: OrganizationId, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
     if org_id != headers.membership.org_uuid {
