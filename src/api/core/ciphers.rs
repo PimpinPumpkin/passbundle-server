@@ -22,9 +22,10 @@ use crate::{
         DbConn, DbPool,
         models::{
             Archive, Attachment, AttachmentId, Cipher, CipherId, CipherVersion, Collection, CollectionCipher,
-            CollectionGroup, CollectionId, CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group,
-            History, ItemSave, KeyId, MAX_ITEM_BYTES, MAX_PASSWORD_HISTORY, Membership, MembershipType, OrgPolicy,
-            OrgPolicyType, OrganizationId, RepromptType, Send, UserId, encrypted_size,
+            CollectionId, EventType, Favorite, Folder, FolderCipher, FolderId, History, ItemSave, KeyId,
+            MAX_ITEM_BYTES, MAX_PASSWORD_HISTORY, Membership, MembershipType, OrgPolicy, OrgPolicyType, OrganizationId,
+            RepromptType, Send, UserId, encrypted_size,
+            keykeeper_folder_permissions::{Access, collections_of},
         },
     },
     util::{NumberOrString, deser_opt_nonempty_str, save_temp_file},
@@ -879,36 +880,12 @@ async fn post_collections_update(
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_in_editable_collection_by_user(&headers.user.uuid, &conn).await {
-        err!("Collection cannot be changed")
-    }
-
     let Some(ref org_uuid) = cipher.organization_uuid else {
         err!("Cipher is not owned by an organization")
     };
 
     let posted_collections = HashSet::<CollectionId>::from_iter(data.collection_ids);
-    let current_collections =
-        HashSet::<CollectionId>::from_iter(cipher.get_collections(headers.user.uuid.clone(), &conn).await);
-
-    for collection in posted_collections.symmetric_difference(&current_collections) {
-        match Collection::find_by_uuid_and_org(collection, org_uuid, &conn).await {
-            None => err!("Invalid collection ID provided"),
-            Some(collection) => {
-                if collection.is_writable_by_user(&headers.user.uuid, &conn).await {
-                    if posted_collections.contains(&collection.uuid) {
-                        // Add to collection
-                        CollectionCipher::save(&cipher.uuid, &collection.uuid, &conn).await?;
-                    } else {
-                        // Remove from collection
-                        CollectionCipher::delete(&cipher.uuid, &collection.uuid, &conn).await?;
-                    }
-                } else {
-                    err!("No rights to modify the collection")
-                }
-            }
-        }
-    }
+    change_item_folders(&cipher, org_uuid, &posted_collections, &headers, &conn).await?;
 
     nt.send_cipher_update(
         UpdateType::SyncCipherUpdate,
@@ -932,6 +909,61 @@ async fn post_collections_update(
     .await;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
+}
+
+/// Keykeeper: puts an item in the shared folders the caller asks for, among
+/// those they reach (DESIGN.md, "Folders and permissions"). Changing an item's
+/// folders needs edit with its passwords showing (upstream's rule, so moving
+/// it can't show anyone passwords they couldn't see); each folder it's added
+/// to needs create, and each it leaves needs share. Folders the caller
+/// doesn't reach stay as they are, and the item stays in at least one folder
+/// for anyone who doesn't reach every folder. Everything is checked before
+/// anything changes.
+pub async fn change_item_folders(
+    cipher: &Cipher,
+    org_id: &OrganizationId,
+    posted: &HashSet<CollectionId>,
+    headers: &Headers,
+    conn: &DbConn,
+) -> EmptyResult {
+    if !cipher.is_in_editable_collection_by_user(&headers.user.uuid, conn).await {
+        err!("You don't have permission to change this item's shared folders")
+    }
+    let access = Access::in_org(&headers.user.uuid, org_id, conn).await;
+    let held: HashSet<CollectionId> = collections_of(&cipher.uuid, conn).await.into_iter().collect();
+
+    let mut added = Vec::new();
+    for collection in posted.difference(&held) {
+        if Collection::find_by_uuid_and_org(collection, org_id, conn).await.is_none() {
+            err!("Invalid collection ID provided")
+        }
+        if !access.in_collection(org_id, collection).is_some_and(|g| g.create) {
+            err!("You don't have permission to add items to this shared folder")
+        }
+        added.push(collection.clone());
+    }
+    let mut removed = Vec::new();
+    for collection in held.difference(posted) {
+        // A folder the caller doesn't reach isn't theirs to change.
+        let Some(grid) = access.in_collection(org_id, collection) else {
+            continue;
+        };
+        if !grid.share {
+            err!("You don't have permission to move items out of this shared folder")
+        }
+        removed.push(collection.clone());
+    }
+    if !access.has_full(org_id) && held.len() - removed.len() + added.len() == 0 {
+        err!("Items only leave their last shared folder by being deleted")
+    }
+
+    for collection in &added {
+        CollectionCipher::save(&cipher.uuid, collection, conn).await?;
+    }
+    for collection in &removed {
+        CollectionCipher::delete(&cipher.uuid, collection, conn).await?;
+    }
+    Ok(())
 }
 
 #[put("/ciphers/<cipher_id>/collections-admin", data = "<data>")]
@@ -959,36 +991,13 @@ async fn post_collections_admin(
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_in_editable_collection_by_user(&headers.user.uuid, &conn).await {
-        err!("Collection cannot be changed")
-    }
-
     let Some(ref org_uuid) = cipher.organization_uuid else {
         err!("Cipher is not owned by an organization")
     };
 
+    // Keykeeper: the same rules from the admin console's vault.
     let posted_collections = HashSet::<CollectionId>::from_iter(data.collection_ids);
-    let current_collections =
-        HashSet::<CollectionId>::from_iter(cipher.get_admin_collections(headers.user.uuid.clone(), &conn).await);
-
-    for collection in posted_collections.symmetric_difference(&current_collections) {
-        match Collection::find_by_uuid_and_org(collection, org_uuid, &conn).await {
-            None => err!("Invalid collection ID provided"),
-            Some(collection) => {
-                if collection.is_writable_by_user(&headers.user.uuid, &conn).await {
-                    if posted_collections.contains(&collection.uuid) {
-                        // Add to collection
-                        CollectionCipher::save(&cipher.uuid, &collection.uuid, &conn).await?;
-                    } else {
-                        // Remove from collection
-                        CollectionCipher::delete(&cipher.uuid, &collection.uuid, &conn).await?;
-                    }
-                } else {
-                    err!("No rights to modify the collection")
-                }
-            }
-        }
-    }
+    change_item_folders(&cipher, org_uuid, &posted_collections, &headers, &conn).await?;
 
     nt.send_cipher_update(
         UpdateType::SyncCipherUpdate,
@@ -1130,18 +1139,34 @@ async fn share_cipher_by_uuid(
     let mut shared_to_collections = vec![];
 
     if let Some(organization_id) = &data.cipher.organization_id {
+        // Keykeeper: an item comes into each folder only where the caller can
+        // create (DESIGN.md, "Folders and permissions"). An organization's
+        // own item going into more of its folders also needs to be editable
+        // with its passwords showing, as for any change of its folders.
+        // Every folder is checked before any is linked.
+        let access = Access::in_org(&headers.user.uuid, organization_id, conn).await;
+        let held: HashSet<CollectionId> = if cipher.organization_uuid.is_some() {
+            collections_of(&cipher.uuid, conn).await.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        if cipher.organization_uuid.is_some()
+            && data.collection_ids.iter().any(|c| !held.contains(c))
+            && !cipher.is_in_editable_collection_by_user(&headers.user.uuid, conn).await
+        {
+            err!("You don't have permission to change this item's shared folders")
+        }
         for col_id in &data.collection_ids {
-            match Collection::find_by_uuid_and_org(col_id, organization_id, conn).await {
-                None => err!("Invalid collection ID provided"),
-                Some(collection) => {
-                    if collection.is_writable_by_user(&headers.user.uuid, conn).await {
-                        CollectionCipher::save(&cipher.uuid, &collection.uuid, conn).await?;
-                        shared_to_collections.push(collection.uuid);
-                    } else {
-                        err!("No rights to modify the collection")
-                    }
-                }
+            if Collection::find_by_uuid_and_org(col_id, organization_id, conn).await.is_none() {
+                err!("Invalid collection ID provided")
             }
+            if !held.contains(col_id) && !access.in_collection(organization_id, col_id).is_some_and(|g| g.create) {
+                err!("You don't have permission to add items to this shared folder")
+            }
+        }
+        for col_id in &data.collection_ids {
+            CollectionCipher::save(&cipher.uuid, col_id, conn).await?;
+            shared_to_collections.push(col_id.clone());
         }
     }
 
@@ -1866,7 +1891,8 @@ async fn delete_cipher_by_uuid(
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await {
+    // Keykeeper: delete, from the grid (DESIGN.md, "Folders and permissions").
+    if !cipher.is_deletable_by_user(&headers.user.uuid, conn).await {
         err!("Cipher can't be deleted by user")
     }
 
@@ -1953,7 +1979,8 @@ async fn restore_cipher_by_uuid(
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await {
+    // Keykeeper: restoring from the trash is the other half of delete.
+    if !cipher.is_deletable_by_user(&headers.user.uuid, conn).await {
         err!("Cipher can't be restored by user")
     }
 
@@ -2192,9 +2219,10 @@ pub struct CipherSyncData {
     pub cipher_collections: HashMap<CipherId, Vec<CollectionId>>,
     pub cipher_archives: HashMap<CipherId, NaiveDateTime>,
     pub members: HashMap<OrganizationId, Membership>,
-    pub user_collections: HashMap<CollectionId, CollectionUser>,
-    pub user_collections_groups: HashMap<CollectionId, CollectionGroup>,
-    pub user_group_full_access_for_organizations: HashSet<OrganizationId>,
+    /// Keykeeper: what the person can do in each shared folder they reach,
+    /// and in organizations where they reach every folder (DESIGN.md,
+    /// "Folders and permissions").
+    pub access: Access,
 }
 
 #[derive(Eq, PartialEq)]
@@ -2252,40 +2280,10 @@ impl CipherSyncData {
             cipher_collections.entry(cipher).or_default().push(collection);
         }
 
-        // Generate a HashMap with the User_Collections UUID as key and the CollectionUser record
-        let user_collections: HashMap<CollectionId, CollectionUser> = CollectionUser::find_by_user(user_id, conn)
-            .await
-            .into_iter()
-            .map(|uc| (uc.collection_uuid.clone(), uc))
-            .collect();
-
-        // Generate a HashMap with the collections_uuid as key and the CollectionGroup record
-        let user_collections_groups: HashMap<CollectionId, CollectionGroup> = if CONFIG.org_groups_enabled() {
-            CollectionGroup::find_by_user(user_id, conn).await.into_iter().fold(
-                HashMap::new(),
-                |mut combined_permissions, cg| {
-                    combined_permissions
-                        .entry(cg.collections_uuid.clone())
-                        .and_modify(|existing| {
-                            // Combine permissions: take the most permissive settings.
-                            existing.read_only &= cg.read_only; // false if ANY group allows write
-                            existing.hide_passwords &= cg.hide_passwords; // false if ANY group allows password view
-                            existing.manage |= cg.manage; // true if ANY group allows manage
-                        })
-                        .or_insert(cg);
-                    combined_permissions
-                },
-            )
-        } else {
-            HashMap::new()
-        };
-
-        // Get all organizations that the given user has full access to via group assignment
-        let user_group_full_access_for_organizations: HashSet<OrganizationId> = if CONFIG.org_groups_enabled() {
-            Group::get_orgs_by_user_with_full_access(user_id, conn).await.into_iter().collect()
-        } else {
-            HashSet::new()
-        };
+        // Keykeeper: the person's capabilities in each folder, merged over
+        // their own grants and their groups', in place of upstream's
+        // per-collection rows.
+        let access = Access::of(user_id, conn).await;
 
         Self {
             cipher_attachments,
@@ -2294,9 +2292,7 @@ impl CipherSyncData {
             cipher_collections,
             cipher_archives,
             members,
-            user_collections,
-            user_collections_groups,
-            user_group_full_access_for_organizations,
+            access,
         }
     }
 }

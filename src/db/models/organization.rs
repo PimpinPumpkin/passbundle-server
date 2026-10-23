@@ -23,6 +23,7 @@ use macros::UuidFromParam;
 use super::{
     Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy, OrgPolicyType,
     TwoFactor, User, UserId,
+    keykeeper_folder_permissions::{Extras, Grid},
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -570,19 +571,13 @@ impl Membership {
 
         // If collections are to be included, only include them if the user does not have full access via a group or defined to the user it self
         // Only the collections assigned directly are returned, the ones assigned via a group are returned via a special group endpoint
+        // Keykeeper: each grant with its grid (DESIGN.md, "Folders and permissions").
         let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
-            CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
-                .await
-                .into_iter()
-                .map(|cu| {
-                    json!({
-                        "id": cu.collection_uuid,
-                        "readOnly": cu.read_only,
-                        "hidePasswords": cu.hide_passwords,
-                        "manage": cu.manage || (self.atype == MembershipType::Manager && !cu.read_only && !cu.hide_passwords),
-                    })
-                })
-                .collect()
+            let grants =
+                CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn).await;
+            let ids: Vec<CollectionId> = grants.iter().map(|cu| cu.collection_uuid.clone()).collect();
+            let extras = Extras::for_collections(&ids, conn).await;
+            grants.iter().map(|cu| extras.user(cu).grant_json(&cu.collection_uuid)).collect()
         } else {
             Vec::new()
         };
@@ -646,13 +641,9 @@ impl Membership {
         })
     }
 
-    pub fn to_json_user_access_restrictions(&self, col_user: &CollectionUser) -> Value {
-        json!({
-            "id": self.uuid,
-            "readOnly": col_user.read_only,
-            "hidePasswords": col_user.hide_passwords,
-            "manage": col_user.manage,
-        })
+    /// Keykeeper: the member's grant with its grid.
+    pub fn to_json_user_access_restrictions(&self, grid: &Grid) -> Value {
+        grid.grant_json(&self.uuid)
     }
 
     pub async fn to_json_details(&self, conn: &DbConn) -> Value {
@@ -661,17 +652,9 @@ impl Membership {
         } else {
             let collections =
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn).await;
-            collections
-                .iter()
-                .map(|cu| {
-                    json!({
-                        "id": cu.collection_uuid,
-                        "readOnly": cu.read_only,
-                        "hidePasswords": cu.hide_passwords,
-                        "manage": cu.manage,
-                    })
-                })
-                .collect()
+            let ids: Vec<CollectionId> = collections.iter().map(|cu| cu.collection_uuid.clone()).collect();
+            let extras = Extras::for_collections(&ids, conn).await;
+            collections.iter().map(|cu| extras.user(cu).grant_json(&cu.collection_uuid)).collect()
         };
 
         // Because BitWarden want the status to be -1 for revoked users we need to catch that here.

@@ -26,10 +26,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, Membership, MembershipStatus, MembershipType,
-            Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
-            OrganizationId, User, effective_joining, email_in_domains, parse_enrollment_domains,
-            valid_encrypted_secret, valid_seal,
+            CollectionId, EnrollmentDomains, JoiningSeal, Membership, MembershipStatus, MembershipType, Msp, MspClient,
+            MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization, OrganizationId, User,
+            effective_joining, email_in_domains, parse_enrollment_domains, valid_encrypted_secret, valid_seal,
         },
     },
     mail,
@@ -481,7 +480,14 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
     super::accept_org_invite(&headers.user, member, reset_password_key, false, &conn).await?;
 
     if let Some(collection) = &target.everyone_collection {
-        CollectionUser::save(&headers.user.uuid, collection, false, false, false, &conn).await?;
+        // Can edit, as a preset grant (keykeeper_folder_permissions.rs).
+        crate::db::models::keykeeper_folder_permissions::save_user(
+            &headers.user.uuid,
+            collection,
+            &crate::db::models::keykeeper_folder_permissions::Grid::preset(false, false, false),
+            &conn,
+        )
+        .await?;
     }
     MspEnrollmentJoin::new(member_id, org.uuid.clone(), proof).insert(&conn).await?;
     if let Some(msp_id) = &target.msp_uuid {

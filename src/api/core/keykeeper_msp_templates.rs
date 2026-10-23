@@ -330,5 +330,12 @@ pub async fn give_templates(member: &Membership, client: &MspClient, conn: &DbCo
     {
         return Ok(());
     }
-    CollectionUser::save(&member.user_uuid, collection, true, false, false, conn).await
+    // Can view, as a preset grant (keykeeper_folder_permissions.rs).
+    crate::db::models::keykeeper_folder_permissions::save_user(
+        &member.user_uuid,
+        collection,
+        &crate::db::models::keykeeper_folder_permissions::Grid::preset(true, false, false),
+        conn,
+    )
+    .await
 }

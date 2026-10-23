@@ -11,6 +11,7 @@ mod folder;
 mod group;
 // Keykeeper
 mod keykeeper_cipher_versions;
+pub mod keykeeper_folder_permissions;
 mod keykeeper_joining;
 mod keykeeper_msp;
 mod keykeeper_orgs;

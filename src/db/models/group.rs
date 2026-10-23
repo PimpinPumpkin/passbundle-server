@@ -13,7 +13,10 @@ use crate::{
 };
 use macros::UuidFromParam;
 
-use super::{CollectionId, Membership, MembershipId, MembershipStatus, OrganizationId, User, UserId};
+use super::{
+    CollectionId, Membership, MembershipId, MembershipStatus, OrganizationId, User, UserId,
+    keykeeper_folder_permissions::Extras,
+};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = groups)]
@@ -84,21 +87,12 @@ impl Group {
     }
 
     pub async fn to_json_details(&self, conn: &DbConn) -> Value {
-        // If both read_only and hide_passwords are false, then manage should be true
-        // You can't have an entry with read_only and manage, or hide_passwords and manage
-        // Or an entry with everything to false
-        let collections_groups: Vec<Value> = CollectionGroup::find_by_group(&self.uuid, &self.organizations_uuid, conn)
-            .await
-            .iter()
-            .map(|entry| {
-                json!({
-                    "id": entry.collections_uuid,
-                    "readOnly": entry.read_only,
-                    "hidePasswords": entry.hide_passwords,
-                    "manage": entry.manage,
-                })
-            })
-            .collect();
+        // Keykeeper: each grant with its grid (DESIGN.md, "Folders and permissions").
+        let grants = CollectionGroup::find_by_group(&self.uuid, &self.organizations_uuid, conn).await;
+        let ids: Vec<CollectionId> = grants.iter().map(|g| g.collections_uuid.clone()).collect();
+        let extras = Extras::for_collections(&ids, conn).await;
+        let collections_groups: Vec<Value> =
+            grants.iter().map(|entry| extras.group(entry).grant_json(&entry.collections_uuid)).collect();
 
         json!({
             "id": self.uuid,
@@ -136,17 +130,11 @@ impl CollectionGroup {
         }
     }
 
-    pub fn to_json_details_for_group(&self) -> Value {
-        // If both read_only and hide_passwords are false, then manage should be true
-        // You can't have an entry with read_only and manage, or hide_passwords and manage
-        // Or an entry with everything to false
-        // For backwards compatibility and migration proposes we keep checking read_only and hide_password
-        json!({
-            "id": self.groups_uuid,
-            "readOnly": self.read_only,
-            "hidePasswords": self.hide_passwords,
-            "manage": self.manage || (!self.read_only && !self.hide_passwords),
-        })
+    /// Keykeeper: the group's grant with its grid. Upstream showed a group
+    /// that could edit as managing; now what it shows is what it can do
+    /// (DESIGN.md, "Folders and permissions").
+    pub fn to_json_details_for_group(&self, extras: &Extras) -> Value {
+        extras.group(self).grant_json(&self.groups_uuid)
     }
 }
 

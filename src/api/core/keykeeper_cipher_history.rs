@@ -16,6 +16,7 @@ use crate::{
         DbConn,
         models::{
             Cipher, CipherId, CipherVersion, EventType, Membership, MembershipType, User, UserId,
+            keykeeper_folder_permissions::Access,
             keykeeper_roles::{self, Permission},
         },
     },
@@ -28,21 +29,21 @@ pub fn routes() -> Vec<Route> {
     routes![get_history, clear_history, delete_version]
 }
 
-/// The item, and what the caller may do with it: (read only, hide passwords,
-/// manage), as for reading the item. Anyone who can't open it gets 404, the
-/// same as for an item that doesn't exist.
+/// The item, and what the caller may do with it: (hide passwords, may clear
+/// its history). Anyone who can't open it, or whose shared folders don't let
+/// them view its history, gets 404, the same as for an item that doesn't
+/// exist (DESIGN.md, "Folders and permissions").
 async fn readable(
     cipher_id: &CipherId,
     headers: &Headers,
     conn: &DbConn,
 ) -> Result<(Cipher, bool, bool), crate::Error> {
     if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await
-        && let Some((read_only, hide_passwords, manage)) =
-            cipher.get_access_restrictions(&headers.user.uuid, None, conn).await
+        && let Some(grid) = cipher.grid_for_user(&headers.user.uuid, None, conn).await
+        && grid.view_history
     {
-        // Who may delete the item, as upstream's delete checks it.
-        let can_delete = !read_only || manage;
-        return Ok((cipher, hide_passwords, can_delete));
+        // Clearing history deletes it: whoever may delete the item.
+        return Ok((cipher, !grid.see_passwords, grid.delete));
     }
     err_code!("Item not found", Status::NotFound.code)
 }
@@ -133,9 +134,7 @@ fn no_sync_data() -> CipherSyncData {
         cipher_collections: HashMap::new(),
         cipher_archives: HashMap::new(),
         members: HashMap::new(),
-        user_collections: HashMap::new(),
-        user_collections_groups: HashMap::new(),
-        user_group_full_access_for_organizations: HashSet::new(),
+        access: Access::default(),
     }
 }
 

@@ -917,6 +917,9 @@ pub struct ManagerHeaders {
     pub user: User,
     pub ip: ClientIp,
     pub org_id: OrganizationId,
+    /// Keykeeper: a regular member admitted because they manage this folder
+    /// (keykeeper_folder_permissions.rs), not an owner, admin, or manager.
+    pub folder_manager: bool,
 }
 
 #[rocket::async_trait]
@@ -944,6 +947,25 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 user: headers.user,
                 ip: headers.ip,
                 org_id: headers.membership.org_uuid,
+                folder_manager: false,
+            })
+        } else if let Some(col_id) = get_col_id(request)
+            && crate::db::models::keykeeper_folder_permissions::admits_folder_manager(
+                request,
+                &headers.membership,
+                Some(&col_id),
+            )
+            .await
+        {
+            // Keykeeper: a regular member who manages this folder, on what its
+            // dialog loads and saves (DESIGN.md, "Folders and permissions").
+            Outcome::Success(Self {
+                host: headers.host,
+                device: headers.device,
+                user: headers.user,
+                ip: headers.ip,
+                org_id: headers.membership.org_uuid,
+                folder_manager: true,
             })
         } else {
             // Keykeeper: 403 for a custom member, 401 for everyone else.
@@ -973,6 +995,9 @@ impl From<ManagerHeaders> for Headers {
 pub struct ManagerHeadersLoose {
     /// Keykeeper: set when a custom role was admitted (see AdminHeaders).
     pub custom_permissions: Option<crate::db::models::keykeeper_roles::CustomPermissions>,
+    /// Keykeeper: a regular member admitted because they manage at least one
+    /// folder (keykeeper_folder_permissions.rs).
+    pub folder_manager: bool,
     pub host: String,
     pub device: Device,
     pub user: User,
@@ -989,6 +1014,7 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
         if headers.is_confirmed_and_manager() {
             Outcome::Success(Self {
                 custom_permissions: None,
+                folder_manager: false,
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
@@ -1001,6 +1027,25 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
             // Keykeeper: a custom role whose permissions cover this endpoint.
             Outcome::Success(Self {
                 custom_permissions: Some(role),
+                folder_manager: false,
+                host: headers.host,
+                device: headers.device,
+                user: headers.user,
+                membership: headers.membership,
+                ip: headers.ip,
+            })
+        } else if crate::db::models::keykeeper_folder_permissions::admits_folder_manager(
+            request,
+            &headers.membership,
+            None,
+        )
+        .await
+        {
+            // Keykeeper: a regular member who manages a folder, on what their
+            // folders' dialogs load (DESIGN.md, "Folders and permissions").
+            Outcome::Success(Self {
+                custom_permissions: None,
+                folder_manager: true,
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
@@ -1051,6 +1096,7 @@ impl ManagerHeaders {
             user: h.user,
             ip: h.ip,
             org_id: h.membership.org_uuid,
+            folder_manager: h.folder_manager,
         })
     }
 }
