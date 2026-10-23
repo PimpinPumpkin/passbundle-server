@@ -362,3 +362,38 @@ table! {
         can_view_history -> Bool,
     }
 }
+
+table! {
+    scim_tokens (org_uuid) {
+        org_uuid -> Text,
+        token_hash -> Text,
+        created_by -> Text,
+        created_at -> Timestamp,
+        last_used_at -> Nullable<Timestamp>,
+        last_used_ip -> Nullable<Text>,
+    }
+}
+
+table! {
+    scim_users (membership_uuid) {
+        membership_uuid -> Text,
+        org_uuid -> Text,
+        user_name -> Text,
+        user_name_key -> Text,
+        external_id -> Nullable<Text>,
+        attributes -> Text,
+        provisioned -> Bool,
+        turned_off -> Bool,
+        refused_off_at -> Nullable<Timestamp>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+table! {
+    scim_groups (group_uuid) {
+        group_uuid -> Text,
+        org_uuid -> Text,
+        created_at -> Timestamp,
+    }
+}

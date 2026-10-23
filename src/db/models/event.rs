@@ -41,6 +41,9 @@ pub struct Event {
     pub provider_uuid: Option<String>,
     pub provider_user_uuid: Option<String>,
     pub provider_org_uuid: Option<String>,
+    // Keykeeper: upstream's system user that acted, when no person did (1 is
+    // SCIM provisioning). The web vault's event log names it.
+    pub system_actor: Option<i32>,
 }
 
 // Upstream enum: https://github.com/bitwarden/server/blob/v2026.6.2/src/Core/Dirt/Enums/EventType.cs
@@ -176,6 +179,7 @@ impl Event {
             provider_uuid: None,
             provider_user_uuid: None,
             provider_org_uuid: None,
+            system_actor: None,
         }
     }
 
@@ -198,6 +202,7 @@ impl Event {
             "providerId": self.provider_uuid,
             "providerUserId": self.provider_user_uuid,
             "providerOrganizationId": self.provider_org_uuid,
+            "systemUser": self.system_actor,
             // "installationId": null, // Not supported
         })
     }

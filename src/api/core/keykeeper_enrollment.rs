@@ -28,7 +28,7 @@ use crate::{
         models::{
             CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, Membership, MembershipStatus, MembershipType,
             Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
-            OrganizationId, User, effective_joining, email_in_domains, parse_enrollment_domains,
+            OrganizationId, ScimUser, User, effective_joining, email_in_domains, parse_enrollment_domains,
             valid_encrypted_secret, valid_seal,
         },
     },
@@ -391,7 +391,12 @@ async fn enrollment_info(data: Json<EnrollmentTokenData>, headers: Headers, conn
         err_code!(INVALID_TOKEN, rocket::http::Status::NotFound.code)
     };
     // Said here too, so the extension says why before it does any work.
-    let invited = Membership::find_by_user_and_org(&headers.user.uuid, &org.uuid, &conn).await.is_some();
+    // Keykeeper: an invitation only the directory chose (provisioning) isn't
+    // an admin's choice, so the command's domains still apply to it.
+    let invited = match Membership::find_by_user_and_org(&headers.user.uuid, &org.uuid, &conn).await {
+        Some(member) => !ScimUser::invited_unvouched(&member, &headers.user.email, &conn).await,
+        None => false,
+    };
     if !invited {
         check_domains(&headers.user, &org, &EnrollmentDomains::for_org(&org.uuid, &conn).await)?;
     }
@@ -455,6 +460,14 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
                     "Verify your email address first, then join {}. Settings, then My account, sends the email.",
                     org.name
                 ))
+            }
+            // Invited by the directory alone (provisioning), with no owner's
+            // or admin's app vouching for the address: the command's domains
+            // apply, or a stolen provisioning token plus a copied command
+            // would let any address in. See DESIGN.md, "Provisioning from
+            // Entra ID".
+            if ScimUser::invited_unvouched(&member, &headers.user.email, &conn).await {
+                check_domains(&headers.user, &org, &EnrollmentDomains::for_org(&org.uuid, &conn).await)?;
             }
             member
         }

@@ -298,6 +298,35 @@ pub async fn log_event(
     log_event_impl(event_type as i32, source_uuid, org_id, act_user_id, device_type, None, ip, conn).await;
 }
 
+/// Keykeeper: upstream's system user for provisioning, which the web vault's
+/// event log shows as "SCIM".
+pub const SYSTEM_USER_SCIM: i32 = 1;
+
+/// Keykeeper: an organization event that provisioning (SCIM) did, with no
+/// person acting: the directory's address, and SCIM as upstream's system user.
+/// See DESIGN.md, "Provisioning from Entra ID".
+pub async fn log_scim_event(
+    event_type: EventType,
+    source_uuid: &str,
+    org_id: &OrganizationId,
+    ip: &IpAddr,
+    conn: &DbConn,
+) {
+    if !CONFIG.org_events_enabled() {
+        return;
+    }
+    let mut event = Event::new(event_type as i32, None);
+    match event_type as i32 {
+        1400..=1499 => event.group_uuid = Some(source_uuid.to_owned().into()),
+        1500..=1599 => event.org_user_uuid = Some(source_uuid.to_owned().into()),
+        _ => {}
+    }
+    event.org_uuid = Some(org_id.clone());
+    event.ip_address = Some(ip.to_string());
+    event.system_actor = Some(SYSTEM_USER_SCIM);
+    event.save(conn).await.unwrap_or(());
+}
+
 #[expect(clippy::too_many_arguments)]
 async fn log_event_impl(
     event_type: i32,
