@@ -2298,6 +2298,14 @@ pub(super) async fn set_policy(
     policy.data = serde_json::to_string(&data.data)?;
     policy.save(conn).await?;
 
+    // Keykeeper: an app syncs at unlock only when the account changed, so
+    // each member's account changes with the policy. Otherwise a member's
+    // browser extension wouldn't learn of a new vault lock or any other
+    // policy until something else changed.
+    for member in Membership::find_by_org(org_id, conn).await {
+        User::update_uuid_revision(&member.user_uuid, conn).await;
+    }
+
     log_event(EventType::PolicyUpdated, policy.uuid.as_ref(), org_id, act_user_id, device_type, ip, conn).await;
 
     Ok(policy)
