@@ -931,13 +931,18 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                     err_handler!("Error getting DB")
                 };
 
-                // Keykeeper: 404, not 401, which signs the web vault out.
-                if !Collection::is_coll_manageable_by_user(&col_id, &headers.membership.user_uuid, &conn).await {
-                    error!(target: "auth", "Not found: the current user isn't a manager for this collection");
-                    return Outcome::Error((
-                        rocket::http::Status::NotFound,
-                        "The current user isn't a manager for this collection",
-                    ));
+                // Keykeeper: 404, not 401, which signs the web vault out, and
+                // 500 when the database can't say.
+                match Collection::is_coll_manageable_by_user(&col_id, &headers.membership.user_uuid, &conn).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        error!(target: "auth", "Not found: the current user isn't a manager for this collection");
+                        return Outcome::Error((
+                            rocket::http::Status::NotFound,
+                            "The current user isn't a manager for this collection",
+                        ));
+                    }
+                    Err(e) => return manager_check_failed(&e),
                 }
             } else {
                 error!(target: "auth", "Not found: error getting the collection id");
@@ -951,34 +956,50 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 ip: headers.ip,
                 org_id: headers.membership.org_uuid,
             })
-        } else if let Some(col_id) = get_col_id(request)
-            && crate::db::models::keykeeper_folder_permissions::admits_folder_manager(
-                request,
-                &headers.membership,
-                Some(&col_id),
-            )
-            .await
-        {
-            // Keykeeper: a regular member who manages this folder, on what its
-            // dialog loads and saves (DESIGN.md, "Folders and permissions").
-            Outcome::Success(Self {
-                host: headers.host,
-                device: headers.device,
-                user: headers.user,
-                ip: headers.ip,
-                org_id: headers.membership.org_uuid,
-            })
         } else {
-            // Keykeeper: 403 for a custom member, 404 for another confirmed
-            // member (401 signs the web vault out), 401 for everyone else.
-            crate::db::models::keykeeper_roles::refuse_on_manager_route(
-                request,
-                &headers.membership,
-                "You need to be a Manager, Admin or Owner to call this endpoint",
-            )
-            .await
+            let admitted = match get_col_id(request) {
+                Some(col_id) => {
+                    crate::db::models::keykeeper_folder_permissions::admits_folder_manager(
+                        request,
+                        &headers.membership,
+                        Some(&col_id),
+                    )
+                    .await
+                }
+                None => Ok(false),
+            };
+            match admitted {
+                // Keykeeper: a regular member who manages this folder, on what
+                // its dialog loads and saves (DESIGN.md, "Folders and
+                // permissions").
+                Ok(true) => Outcome::Success(Self {
+                    host: headers.host,
+                    device: headers.device,
+                    user: headers.user,
+                    ip: headers.ip,
+                    org_id: headers.membership.org_uuid,
+                }),
+                // Keykeeper: 404 for a confirmed member, custom or not (401 and
+                // 403 sign the web vault out), as refuse for everyone else.
+                Ok(false) => {
+                    crate::db::models::keykeeper_roles::refuse_on_manager_route(
+                        request,
+                        &headers.membership,
+                        "You need to be a Manager, Admin or Owner to call this endpoint",
+                    )
+                    .await
+                }
+                Err(e) => manager_check_failed(&e),
+            }
         }
     }
+}
+
+/// Keykeeper: when the database can't say whether someone manages a folder,
+/// 500, not "not a manager" (404), which would hide the failure.
+fn manager_check_failed<S>(e: &Error) -> Outcome<S, &'static str> {
+    error!(target: "auth", "Error checking who manages a folder: {e}");
+    Outcome::Error((rocket::http::Status::InternalServerError, "Error checking who manages this folder"))
 }
 
 impl From<ManagerHeaders> for Headers {
@@ -1036,33 +1057,38 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 membership: headers.membership,
                 ip: headers.ip,
             })
-        } else if crate::db::models::keykeeper_folder_permissions::admits_folder_manager(
-            request,
-            &headers.membership,
-            None,
-        )
-        .await
-        {
-            // Keykeeper: a regular member who manages a folder, on what their
-            // folders' dialogs load (DESIGN.md, "Folders and permissions").
-            Outcome::Success(Self {
-                custom_permissions: None,
-                folder_manager: true,
-                host: headers.host,
-                device: headers.device,
-                user: headers.user,
-                membership: headers.membership,
-                ip: headers.ip,
-            })
         } else {
-            // Keykeeper: 403 for a custom member, 404 for another confirmed
-            // member (401 signs the web vault out), 401 for everyone else.
-            crate::db::models::keykeeper_roles::refuse_on_manager_route(
+            match crate::db::models::keykeeper_folder_permissions::admits_folder_manager(
                 request,
                 &headers.membership,
-                "You need to be a Manager, Admin or Owner to call this endpoint",
+                None,
             )
             .await
+            {
+                // Keykeeper: a regular member who manages a folder, on what
+                // their folders' dialogs load (DESIGN.md, "Folders and
+                // permissions").
+                Ok(true) => Outcome::Success(Self {
+                    custom_permissions: None,
+                    folder_manager: true,
+                    host: headers.host,
+                    device: headers.device,
+                    user: headers.user,
+                    membership: headers.membership,
+                    ip: headers.ip,
+                }),
+                // Keykeeper: 404 for a confirmed member, custom or not (401 and
+                // 403 sign the web vault out), as refuse for everyone else.
+                Ok(false) => {
+                    crate::db::models::keykeeper_roles::refuse_on_manager_route(
+                        request,
+                        &headers.membership,
+                        "You need to be a Manager, Admin or Owner to call this endpoint",
+                    )
+                    .await
+                }
+                Err(e) => manager_check_failed(&e),
+            }
         }
     }
 }
@@ -1088,7 +1114,7 @@ impl ManagerHeaders {
             if uuid::Uuid::parse_str(col_id.as_ref()).is_err() {
                 err!("Collection Id is malformed!");
             }
-            if !Collection::is_coll_manageable_by_user(col_id, &h.membership.user_uuid, conn).await {
+            if !Collection::is_coll_manageable_by_user(col_id, &h.membership.user_uuid, conn).await? {
                 err!("Collection not found", "The current user isn't a manager for this collection")
             }
         }

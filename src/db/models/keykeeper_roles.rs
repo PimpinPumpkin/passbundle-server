@@ -11,7 +11,8 @@
 //
 // Endpoints a custom member's permissions don't cover refuse them with 403, not
 // upstream's 401, so a client can tell a missing permission from an expired
-// session.
+// session. The manager guards answer 404 instead, as they do for every
+// confirmed member (refuse_on_manager_route).
 
 use std::collections::HashMap;
 
@@ -308,22 +309,16 @@ pub async fn refuse<S>(
     Outcome::Error((Status::Unauthorized, message))
 }
 
-/// For the manager guards: as refuse, but a confirmed member who isn't a
-/// custom member gets 404, as for something that isn't there. A regular
-/// member's web vault can reach a folder's endpoints (a folder they manage,
-/// or one they just stopped managing), and 401 would sign them out.
+/// For the manager guards: as refuse, but any confirmed member, custom or
+/// not, gets 404, as for something that isn't there. A member's web vault can
+/// reach a folder's endpoints (a folder they manage, or one they just stopped
+/// managing), and 401 or 403 would sign them out.
 pub async fn refuse_on_manager_route<S>(
     request: &Request<'_>,
     member: &Membership,
     message: &'static str,
 ) -> request::Outcome<S, &'static str> {
-    if member.status == MembershipStatus::Confirmed as i32
-        && !(member.atype == MembershipType::User as i32
-            && match request.guard::<DbConn>().await {
-                Outcome::Success(conn) => find(&member.uuid, &conn).await.is_some(),
-                _ => false,
-            })
-    {
+    if member.status == MembershipStatus::Confirmed as i32 {
         error!(target: "auth", "Not found: {message}");
         return Outcome::Error((Status::NotFound, message));
     }

@@ -600,7 +600,7 @@ async fn post_bulk_access_collections(
         u.grid()?;
     }
     for col_id in &data.collection_ids {
-        if !folder_permissions::manages(&headers.membership.user_uuid, &org_id, col_id, &conn).await {
+        if !folder_permissions::manages(&headers.membership.user_uuid, &org_id, col_id, &conn).await? {
             err!("Collection not found", "The current user isn't a manager for this collection")
         }
     }
@@ -610,7 +610,7 @@ async fn post_bulk_access_collections(
             err!("Collection not found")
         };
 
-        if !collection.is_manageable_by_user(&headers.membership.user_uuid, &conn).await {
+        if !collection.is_manageable_by_user(&headers.membership.user_uuid, &conn).await? {
             err!("Collection not found", "The current user isn't a manager for this collection")
         }
 

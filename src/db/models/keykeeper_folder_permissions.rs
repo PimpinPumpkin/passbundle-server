@@ -802,15 +802,10 @@ pub async fn in_collection(
 }
 
 /// Whether a confirmed member manages this folder (or every folder). A
-/// database error says no.
-pub async fn manages(user: &UserId, org: &OrganizationId, collection: &CollectionId, conn: &DbConn) -> bool {
-    match in_collection(user, org, collection, conn).await {
-        Ok(grid) => grid.is_some_and(|g| g.manage),
-        Err(e) => {
-            error!("{e}");
-            false
-        }
-    }
+/// database error is an error, not a no: callers answer 500, not "not a
+/// manager".
+pub async fn manages(user: &UserId, org: &OrganizationId, collection: &CollectionId, conn: &DbConn) -> ApiResult<bool> {
+    Ok(in_collection(user, org, collection, conn).await?.is_some_and(|g| g.manage))
 }
 
 /// The endpoints a regular member reaches for a folder they manage: what the
@@ -842,14 +837,15 @@ fn route_in(request: &Request<'_>, routes: &[(Method, &str)]) -> bool {
 
 /// For the manager guards: a confirmed regular member who manages this folder
 /// (with one) or any folder of the organization (without), on a route listed
-/// above. Owners, admins, and managers are admitted as before.
+/// above. Owners, admins, and managers are admitted as before. A database
+/// error is an error, which the guards answer with 500.
 pub async fn admits_folder_manager(
     request: &Request<'_>,
     member: &Membership,
     collection: Option<&CollectionId>,
-) -> bool {
+) -> ApiResult<bool> {
     if member.status != MembershipStatus::Confirmed as i32 || member.atype != MembershipType::User as i32 {
-        return false;
+        return Ok(false);
     }
     let routes = if collection.is_some() {
         FOLDER_ROUTES
@@ -857,20 +853,18 @@ pub async fn admits_folder_manager(
         ORG_ROUTES
     };
     if !route_in(request, routes) {
-        return false;
+        return Ok(false);
     }
     let Outcome::Success(conn) = request.guard::<DbConn>().await else {
-        return false;
+        err!("Error getting DB")
     };
     if let Some(collection) = collection {
         return manages(&member.user_uuid, &member.org_uuid, collection, &conn).await;
     }
-    let Ok(access) = Access::in_org(&member.user_uuid, &member.org_uuid, &conn).await else {
-        return false;
-    };
+    let access = Access::in_org(&member.user_uuid, &member.org_uuid, &conn).await?;
     let collections =
         super::Collection::find_by_organization(&member.org_uuid, &conn).await.into_iter().map(|c| c.uuid).collect();
-    access.manages_any(&member.org_uuid, &collections)
+    Ok(access.manages_any(&member.org_uuid, &collections))
 }
 
 #[cfg(test)]
