@@ -21,9 +21,10 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            Archive, Attachment, AttachmentId, Cipher, CipherId, Collection, CollectionCipher, CollectionGroup,
-            CollectionId, CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group, KeyId,
-            Membership, MembershipType, OrgPolicy, OrgPolicyType, OrganizationId, RepromptType, Send, UserId,
+            Archive, Attachment, AttachmentId, Cipher, CipherId, CipherVersion, Collection, CollectionCipher,
+            CollectionGroup, CollectionId, CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group,
+            History, ItemSave, KeyId, MAX_ITEM_BYTES, MAX_PASSWORD_HISTORY, Membership, MembershipType, OrgPolicy,
+            OrgPolicyType, OrganizationId, RepromptType, Send, UserId, encrypted_size,
         },
     },
     util::{NumberOrString, deser_opt_nonempty_str, save_temp_file},
@@ -373,7 +374,7 @@ async fn post_ciphers_create(
     // or otherwise), we can just ignore this field entirely.
     data.cipher.last_known_revision_date = None;
 
-    let res = share_cipher_by_uuid(&cipher.uuid, data, &headers, &conn, &nt, None).await;
+    let res = share_cipher_by_uuid(&cipher.uuid, data, &headers, &conn, &nt, None, ItemSave::New).await;
     if res.is_err() {
         cipher.delete(&conn).await?;
     }
@@ -403,7 +404,8 @@ async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt
     data.last_known_revision_date = None;
 
     let mut cipher = Cipher::new(data.r#type, data.name.clone());
-    update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherCreate).await?;
+    update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherCreate, ItemSave::New)
+        .await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
 }
@@ -426,6 +428,10 @@ async fn enforce_personal_ownership_policy(data: Option<&CipherData>, headers: &
     Ok(())
 }
 
+// Keykeeper: `save` says what the save does to the item's history
+// (keykeeper_cipher_versions): a new item, an edit of an existing one, or the
+// same contents under a rotated key.
+#[expect(clippy::too_many_arguments, reason = "Upstream's arguments, plus what the save does to history")]
 pub async fn update_cipher_from_data(
     cipher: &mut Cipher,
     data: CipherData,
@@ -434,6 +440,7 @@ pub async fn update_cipher_from_data(
     conn: &DbConn,
     nt: &Notify<'_>,
     ut: UpdateType,
+    save: ItemSave,
 ) -> EmptyResult {
     // Cleanup cipher data, like removing the 'Response' key.
     // This key is somewhere generated during Javascript so no way for us this fix this.
@@ -479,6 +486,11 @@ pub async fn update_cipher_from_data(
 
     // Check if this cipher is being transferred from a personal to an organization vault
     let transfer_cipher = cipher.organization_uuid.is_none() && data.organization_id.is_some();
+
+    // Keykeeper: the item as it's stored before this edit, kept as a past
+    // version if the edit changes it, or forgotten when a personal item moves
+    // into an organization (DESIGN.md, "Item history").
+    let history = History::of(&save, cipher, transfer_cipher);
 
     if let Some(org_id) = data.organization_id {
         match Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, conn).await {
@@ -570,10 +582,25 @@ pub async fn update_cipher_from_data(
     cipher.notes = data.notes;
     cipher.fields = data.fields.map(|f| clean_cipher_data(f).to_string());
     cipher.data = type_data.to_string();
-    cipher.password_history = data.password_history.map(|f| f.to_string());
+    // Keykeeper: at most MAX_PASSWORD_HISTORY entries, newest first as apps send them.
+    cipher.password_history = data.password_history.map(|mut f| {
+        if let Some(entries) = f.as_array_mut() {
+            entries.truncate(MAX_PASSWORD_HISTORY);
+        }
+        f.to_string()
+    });
     cipher.reprompt = data.reprompt.filter(|r| *r == RepromptType::None as i32 || *r == RepromptType::Password as i32);
 
-    cipher.save(conn).await?;
+    // Keykeeper: no item over MAX_ITEM_BYTES encrypted (attachments are
+    // stored apart), and the item saved together with its history, in one
+    // transaction.
+    if encrypted_size(cipher) > MAX_ITEM_BYTES {
+        err!(format!(
+            "This item is too large to save. Items can be up to {} KB, not counting attachments.",
+            MAX_ITEM_BYTES / 1024
+        ))
+    }
+    CipherVersion::save_item(cipher, history, &headers.user.uuid, conn).await?;
     cipher.move_to_folder(data.folder_id, &headers.user.uuid, conn).await?;
     cipher.set_favorite(data.favorite, &headers.user.uuid, conn).await?;
 
@@ -668,7 +695,8 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
         cipher_data.folder_id = folder_id;
 
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None, ItemSave::New)
+            .await?;
     }
 
     let mut user = headers.user;
@@ -735,7 +763,17 @@ async fn put_cipher(
         err!("Cipher is not write accessible")
     }
 
-    update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherUpdate).await?;
+    update_cipher_from_data(
+        &mut cipher,
+        data,
+        &headers,
+        None,
+        &conn,
+        &nt,
+        UpdateType::SyncCipherUpdate,
+        ItemSave::Edit,
+    )
+    .await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
 }
@@ -995,7 +1033,7 @@ async fn post_cipher_share(
 ) -> JsonResult {
     let data: ShareCipherData = data.into_inner();
 
-    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None).await
+    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None, ItemSave::Edit).await
 }
 
 #[put("/ciphers/<cipher_id>/share", data = "<data>")]
@@ -1008,7 +1046,7 @@ async fn put_cipher_share(
 ) -> JsonResult {
     let data: ShareCipherData = data.into_inner();
 
-    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None).await
+    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None, ItemSave::Edit).await
 }
 
 #[derive(Deserialize)]
@@ -1048,7 +1086,8 @@ async fn put_cipher_share_selected(
         };
 
         if let Some(id) = shared_cipher_data.cipher.id.take() {
-            share_cipher_by_uuid(&id, shared_cipher_data, &headers, &conn, &nt, Some(UpdateType::None)).await?
+            share_cipher_by_uuid(&id, shared_cipher_data, &headers, &conn, &nt, Some(UpdateType::None), ItemSave::Edit)
+                .await?
         } else {
             err!("Request missing ids field")
         };
@@ -1060,6 +1099,8 @@ async fn put_cipher_share_selected(
     Ok(())
 }
 
+// Keykeeper: `save` is New for the item post_ciphers_create just made, Edit
+// for an existing one (keykeeper_cipher_versions).
 async fn share_cipher_by_uuid(
     cipher_id: &CipherId,
     data: ShareCipherData,
@@ -1067,6 +1108,7 @@ async fn share_cipher_by_uuid(
     conn: &DbConn,
     nt: &Notify<'_>,
     override_ut: Option<UpdateType>,
+    save: ItemSave,
 ) -> JsonResult {
     let mut cipher = if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await {
         if cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await {
@@ -1113,7 +1155,7 @@ async fn share_cipher_by_uuid(
         UpdateType::SyncCipherCreate
     };
 
-    update_cipher_from_data(&mut cipher, data.cipher, headers, Some(shared_to_collections), conn, nt, ut).await?;
+    update_cipher_from_data(&mut cipher, data.cipher, headers, Some(shared_to_collections), conn, nt, ut, save).await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
 }

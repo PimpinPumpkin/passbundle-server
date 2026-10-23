@@ -20,10 +20,10 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
-            EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
-            MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId,
-            UserKdfType, UserSettings,
+            AuthRequest, AuthRequestId, Cipher, CipherId, CipherVersion, Device, DeviceId, DeviceType,
+            DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation,
+            ItemSave, KeyId, Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send,
+            SendId, User, UserId, UserKdfType, UserSettings,
         },
     },
     mail,
@@ -1022,7 +1022,17 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
             // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
             // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
             // We force the users to logout after the user has been saved to try and prevent these issues.
-            update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+            update_cipher_from_data(
+                saved_cipher,
+                cipher_data,
+                &headers,
+                None,
+                &conn,
+                &nt,
+                UpdateType::None,
+                ItemSave::Rotation,
+            )
+            .await?;
         }
     }
 
@@ -1048,6 +1058,13 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
         && let Err(e) = UserSettings::delete_by_user(&user.uuid, &conn).await
     {
         warn!("Couldn't forget settings after a key rotation: {e:#?}");
+    }
+    // Keykeeper: and so can't the past versions of their own items
+    // (keykeeper_cipher_versions). Organizations' items keep theirs.
+    if save_result.is_ok()
+        && let Err(e) = CipherVersion::delete_all_by_owner(&user.uuid, &conn).await
+    {
+        warn!("Couldn't forget earlier versions of items after a key rotation: {e:#?}");
     }
 
     // Prevent logging out the client where the user requested this endpoint from.

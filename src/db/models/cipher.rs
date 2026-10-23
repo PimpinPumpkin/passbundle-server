@@ -24,8 +24,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Archive, Attachment, CollectionCipher, CollectionId, Favorite, FolderCipher, FolderId, Group, Membership,
-    MembershipStatus, MembershipType, OrganizationId, User, UserId,
+    Archive, Attachment, CipherVersion, CollectionCipher, CollectionId, Favorite, FolderCipher, FolderId, Group,
+    Membership, MembershipStatus, MembershipType, OrganizationId, User, UserId,
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -468,6 +468,9 @@ impl Cipher {
         CollectionCipher::delete_all_by_cipher(&self.uuid, conn).await?;
         Attachment::delete_all_by_cipher(&self.uuid, conn).await?;
         Favorite::delete_all_by_cipher(&self.uuid, conn).await?;
+        // Keykeeper: its past versions and who saved it, which the database's
+        // cascade deletes too (keykeeper_cipher_versions).
+        CipherVersion::delete_item(&self.uuid, conn).await?;
 
         conn.run(move |conn| {
             diesel::delete(ciphers::table.filter(ciphers::uuid.eq(&self.uuid)))
