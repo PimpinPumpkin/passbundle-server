@@ -1,0 +1,2 @@
+DROP TABLE keykeeper_collections_groups;
+DROP TABLE keykeeper_users_collections;

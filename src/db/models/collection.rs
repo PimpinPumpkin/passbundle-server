@@ -19,6 +19,7 @@ use macros::UuidFromParam;
 use super::{
     CipherId, CollectionGroup, GroupUser, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId,
     User, UserId,
+    keykeeper_folder_permissions::{self, Extras, Grid},
 };
 
 // See (v2026.7.0): https://github.com/bitwarden/server/blob/5d4461aa42cadbacfef8fe2166c5453a5c52773a/src/Core/AdminConsole/Entities/Collection.cs
@@ -96,59 +97,38 @@ impl Collection {
         }
     }
 
+    /// The collection with the person's own capabilities in it. Keykeeper:
+    /// upstream's three fields are the closest preset of their grid, which
+    /// goes beside them (DESIGN.md, "Folders and permissions").
     pub async fn to_json_details(
         &self,
         user_uuid: &UserId,
         cipher_sync_data: Option<&crate::api::core::CipherSyncData>,
         conn: &DbConn,
     ) -> Value {
-        let (read_only, hide_passwords, manage) = if let Some(cipher_sync_data) = cipher_sync_data {
-            match cipher_sync_data.members.get(&self.org_uuid) {
-                // Only for Manager types Bitwarden returns true for the manage option
-                // Owners and Admins always have true. Users are not able to have full access
-                Some(m) if m.has_full_access() => (false, false, m.atype >= MembershipType::Manager),
-                Some(m) => {
-                    // Only let a manager manage collections when the have full read/write access
-                    let is_manager = m.atype == MembershipType::Manager;
-                    if let Some(cu) = cipher_sync_data.user_collections.get(&self.uuid) {
-                        (
-                            cu.read_only,
-                            cu.hide_passwords,
-                            is_manager && (cu.manage || (!cu.read_only && !cu.hide_passwords)),
-                        )
-                    } else if let Some(cg) = cipher_sync_data.user_collections_groups.get(&self.uuid) {
-                        (
-                            cg.read_only,
-                            cg.hide_passwords,
-                            is_manager && (cg.manage || (!cg.read_only && !cg.hide_passwords)),
-                        )
-                    } else {
-                        (false, false, false)
-                    }
-                }
-                _ => (true, true, false),
-            }
+        let grid = if let Some(cipher_sync_data) = cipher_sync_data {
+            cipher_sync_data.access.in_collection(&self.org_uuid, &self.uuid)
         } else {
-            match Membership::find_confirmed_by_user_and_org(user_uuid, &self.org_uuid, conn).await {
-                Some(m) if m.has_full_access() => (false, false, m.atype >= MembershipType::Manager),
-                Some(m) if m.atype == MembershipType::Manager && self.is_manageable_by_user(user_uuid, conn).await => {
-                    (false, false, true)
-                }
-                Some(m) => {
-                    let is_manager = m.atype == MembershipType::Manager;
-                    let read_only = !self.is_writable_by_user(user_uuid, conn).await;
-                    let hide_passwords = self.hide_passwords_for_user(user_uuid, conn).await;
-                    (read_only, hide_passwords, is_manager && !read_only && !hide_passwords)
-                }
-                _ => (true, true, false),
-            }
+            // A database error shows no capabilities, never more than they have.
+            keykeeper_folder_permissions::in_collection(user_uuid, &self.org_uuid, &self.uuid, conn)
+                .await
+                .inspect_err(|e| error!("{e}"))
+                .ok()
+                .flatten()
         };
+        self.to_json_with_grid(grid)
+    }
 
+    /// As to_json_details, with the person's capabilities already known.
+    pub fn to_json_with_grid(&self, grid: Option<Grid>) -> Value {
+        let grid = grid.unwrap_or(Grid::NONE);
+        let (read_only, hide_passwords, manage) = grid.upstream();
         let mut json_object = self.to_json();
         json_object["object"] = json!("collectionDetails");
         json_object["readOnly"] = json!(read_only);
         json_object["hidePasswords"] = json!(hide_passwords);
         json_object["manage"] = json!(manage);
+        json_object["keykeeper"] = grid.to_json();
         json_object
     }
 
@@ -423,251 +403,32 @@ impl Collection {
         }
     }
 
-    pub async fn is_writable_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        let user_uuid = user_uuid.to_string();
-        if CONFIG.org_groups_enabled() {
-            conn.run(move |conn| {
-                collections::table
-                    .filter(collections::uuid.eq(&self.uuid))
-                    .inner_join(
-                        users_organizations::table.on(collections::org_uuid
-                            .eq(users_organizations::org_uuid)
-                            .and(users_organizations::user_uuid.eq(user_uuid.clone()))
-                            .and(users_organizations::status.eq(MembershipStatus::Confirmed as i32))),
-                    )
-                    .left_join(
-                        users_collections::table.on(users_collections::collection_uuid
-                            .eq(collections::uuid)
-                            .and(users_collections::user_uuid.eq(user_uuid))),
-                    )
-                    .left_join(
-                        groups_users::table.on(groups_users::users_organizations_uuid.eq(users_organizations::uuid)),
-                    )
-                    .left_join(
-                        groups::table.on(groups::uuid
-                            .eq(groups_users::groups_uuid)
-                            .and(groups::organizations_uuid.eq(users_organizations::org_uuid))),
-                    )
-                    .left_join(
-                        collections_groups::table.on(collections_groups::groups_uuid
-                            .eq(groups_users::groups_uuid)
-                            .and(collections_groups::collections_uuid.eq(collections::uuid))),
-                    )
-                    .filter(
-                        users_organizations::atype
-                            .le(MembershipType::Admin as i32) // Org admin or owner
-                            .or(users_organizations::access_all.eq(true)) // access_all via membership
-                            .or(users_collections::collection_uuid
-                                .eq(&self.uuid) // write access given to collection
-                                .and(users_collections::read_only.eq(false)))
-                            .or(groups::access_all.eq(true)) // access_all via group
-                            .or(collections_groups::collections_uuid
-                                .is_not_null() // write access given via group
-                                .and(collections_groups::read_only.eq(false))),
-                    )
-                    .count()
-                    .first::<i64>(conn)
-                    .ok()
-                    .unwrap_or(0)
-                    != 0
-            })
-            .await
-        } else {
-            conn.run(move |conn| {
-                collections::table
-                    .filter(collections::uuid.eq(&self.uuid))
-                    .inner_join(
-                        users_organizations::table.on(collections::org_uuid
-                            .eq(users_organizations::org_uuid)
-                            .and(users_organizations::user_uuid.eq(user_uuid.clone()))
-                            .and(users_organizations::status.eq(MembershipStatus::Confirmed as i32))),
-                    )
-                    .left_join(
-                        users_collections::table.on(users_collections::collection_uuid
-                            .eq(collections::uuid)
-                            .and(users_collections::user_uuid.eq(user_uuid))),
-                    )
-                    .filter(
-                        users_organizations::atype
-                            .le(MembershipType::Admin as i32) // Org admin or owner
-                            .or(users_organizations::access_all.eq(true)) // access_all via membership
-                            .or(users_collections::collection_uuid
-                                .eq(&self.uuid) // write access given to collection
-                                .and(users_collections::read_only.eq(false))),
-                    )
-                    .count()
-                    .first::<i64>(conn)
-                    .ok()
-                    .unwrap_or(0)
-                    != 0
-            })
-            .await
+    /// Keykeeper: whether the person manages this folder, from the grid.
+    pub async fn is_coll_manageable_by_user(uuid: &CollectionId, user_uuid: &UserId, conn: &DbConn) -> bool {
+        match Self::find_by_uuid(uuid, conn).await {
+            Some(collection) => {
+                keykeeper_folder_permissions::manages(user_uuid, &collection.org_uuid, uuid, conn).await
+            }
+            None => false,
         }
     }
 
-    pub async fn hide_passwords_for_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        let user_uuid = user_uuid.to_string();
-        conn.run(move |conn| {
-            collections::table
-                .left_join(
-                    users_collections::table.on(users_collections::collection_uuid
-                        .eq(collections::uuid)
-                        .and(users_collections::user_uuid.eq(user_uuid.clone()))),
-                )
-                .left_join(
-                    users_organizations::table.on(collections::org_uuid
-                        .eq(users_organizations::org_uuid)
-                        .and(users_organizations::user_uuid.eq(user_uuid))),
-                )
-                .left_join(groups_users::table.on(groups_users::users_organizations_uuid.eq(users_organizations::uuid)))
-                .left_join(
-                    groups::table.on(groups::uuid
-                        .eq(groups_users::groups_uuid)
-                        .and(groups::organizations_uuid.eq(users_organizations::org_uuid))),
-                )
-                .left_join(
-                    collections_groups::table.on(collections_groups::groups_uuid
-                        .eq(groups_users::groups_uuid)
-                        .and(collections_groups::collections_uuid.eq(collections::uuid))),
-                )
-                .filter(collections::uuid.eq(&self.uuid))
-                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(
-                    users_collections::collection_uuid
-                        .eq(&self.uuid)
-                        .and(users_collections::hide_passwords.eq(true))
-                        .or(
-                            // Directly accessed collection
-                            users_organizations::access_all.eq(true).or(
-                                // access_all in Organization
-                                users_organizations::atype.le(MembershipType::Admin as i32), // Org admin or owner
-                            ),
-                        )
-                        .or(
-                            groups::access_all.eq(true), // access_all in groups
-                        )
-                        .or(
-                            // access via groups
-                            groups_users::users_organizations_uuid.eq(users_organizations::uuid).and(
-                                collections_groups::collections_uuid
-                                    .is_not_null()
-                                    .and(collections_groups::hide_passwords.eq(true)),
-                            ),
-                        ),
-                )
-                .count()
-                .first::<i64>(conn)
-                .ok()
-                .unwrap_or(0)
-                != 0
-        })
-        .await
-    }
-
-    pub async fn is_coll_manageable_by_user(uuid: &CollectionId, user_uuid: &UserId, conn: &DbConn) -> bool {
-        let uuid = uuid.to_string();
-        let user_uuid = user_uuid.to_string();
-        conn.run(move |conn| {
-            collections::table
-                .left_join(
-                    users_collections::table.on(users_collections::collection_uuid
-                        .eq(collections::uuid)
-                        .and(users_collections::user_uuid.eq(user_uuid.clone()))),
-                )
-                .left_join(
-                    users_organizations::table.on(collections::org_uuid
-                        .eq(users_organizations::org_uuid)
-                        .and(users_organizations::user_uuid.eq(user_uuid))),
-                )
-                .left_join(groups_users::table.on(groups_users::users_organizations_uuid.eq(users_organizations::uuid)))
-                .left_join(
-                    groups::table.on(groups::uuid
-                        .eq(groups_users::groups_uuid)
-                        .and(groups::organizations_uuid.eq(users_organizations::org_uuid))),
-                )
-                .left_join(
-                    collections_groups::table.on(collections_groups::groups_uuid
-                        .eq(groups_users::groups_uuid)
-                        .and(collections_groups::collections_uuid.eq(collections::uuid))),
-                )
-                .filter(collections::uuid.eq(&uuid))
-                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(
-                    users_collections::collection_uuid
-                        .eq(&uuid)
-                        .and(users_collections::manage.eq(true))
-                        .or(
-                            // Directly accessed collection
-                            users_organizations::access_all.eq(true).or(
-                                // access_all in Organization
-                                users_organizations::atype.le(MembershipType::Admin as i32), // Org admin or owner
-                            ),
-                        )
-                        .or(
-                            groups::access_all.eq(true), // access_all in groups
-                        )
-                        .or(
-                            // access via groups
-                            groups_users::users_organizations_uuid.eq(users_organizations::uuid).and(
-                                collections_groups::collections_uuid
-                                    .is_not_null()
-                                    .and(collections_groups::manage.eq(true)),
-                            ),
-                        ),
-                )
-                .count()
-                .first::<i64>(conn)
-                .ok()
-                .unwrap_or(0)
-                != 0
-        })
-        .await
-    }
-
     pub async fn is_manageable_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        Self::is_coll_manageable_by_user(&self.uuid, user_uuid, conn).await
+        keykeeper_folder_permissions::manages(user_uuid, &self.org_uuid, &self.uuid, conn).await
     }
 
-    // Whether the user has manage access to at least one collection in the org, directly or via a
-    // group. Org-scoped counterpart of is_coll_manageable_by_user.
+    /// Whether the person manages at least one folder of the organization,
+    /// directly or through a group. Keykeeper: from the grid.
     pub async fn has_manageable_collection_by_user(
         org_uuid: &OrganizationId,
         user_uuid: &UserId,
         conn: &DbConn,
     ) -> bool {
-        let org_uuid = org_uuid.to_string();
-        let user_uuid = user_uuid.to_string();
-        conn.run(move |conn| {
-            collections::table
-                .left_join(
-                    users_collections::table.on(users_collections::collection_uuid
-                        .eq(collections::uuid)
-                        .and(users_collections::user_uuid.eq(user_uuid.clone()))),
-                )
-                .left_join(
-                    users_organizations::table.on(collections::org_uuid
-                        .eq(users_organizations::org_uuid)
-                        .and(users_organizations::user_uuid.eq(user_uuid))),
-                )
-                .left_join(groups_users::table.on(groups_users::users_organizations_uuid.eq(users_organizations::uuid)))
-                .left_join(
-                    collections_groups::table.on(collections_groups::groups_uuid
-                        .eq(groups_users::groups_uuid)
-                        .and(collections_groups::collections_uuid.eq(collections::uuid))),
-                )
-                .filter(collections::org_uuid.eq(&org_uuid))
-                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(
-                    // Manage permission on a collection assigned directly or via a group.
-                    users_collections::manage.eq(true).or(collections_groups::manage.eq(true)),
-                )
-                .count()
-                .first::<i64>(conn)
-                .ok()
-                .unwrap_or(0)
-                != 0
-        })
-        .await
+        let Ok(access) = keykeeper_folder_permissions::Access::in_org(user_uuid, org_uuid, conn).await else {
+            return false;
+        };
+        let collections = Self::find_by_organization(org_uuid, conn).await.into_iter().map(|c| c.uuid).collect();
+        access.manages_any(org_uuid, &collections)
     }
 }
 
@@ -709,8 +470,9 @@ impl CollectionUser {
                         users_collections::read_only,
                         users_collections::hide_passwords,
                         users_collections::manage,
+                        users_collections::user_uuid,
                     ))
-                    .load::<Self>(conn)
+                    .load::<(MembershipId, CollectionId, bool, bool, bool, UserId)>(conn)
                     .expect("Error loading users_collections")
             })
             .await;
@@ -802,8 +564,9 @@ impl CollectionUser {
                         users_collections::read_only,
                         users_collections::hide_passwords,
                         users_collections::manage,
+                        users_collections::user_uuid,
                     ))
-                    .load::<Self>(conn)
+                    .load::<(MembershipId, CollectionId, bool, bool, bool, UserId)>(conn)
                     .expect("Error loading users_collections")
             })
             .await;
@@ -965,31 +728,31 @@ pub struct CollectionMembership {
     pub read_only: bool,
     pub hide_passwords: bool,
     pub manage: bool,
+    /// Keykeeper: whose grant it is, to read its grid.
+    pub user_uuid: UserId,
 }
 
 impl CollectionMembership {
-    pub fn to_json_details_for_member(&self, membership_type: i32) -> Value {
-        json!({
-            "id": self.membership_uuid,
-            "readOnly": self.read_only,
-            "hidePasswords": self.hide_passwords,
-            "manage": membership_type >= MembershipType::Admin
-                || self.manage
-                || (membership_type == MembershipType::Manager
-                    && !self.read_only
-                    && !self.hide_passwords),
-        })
+    /// Keykeeper: the grant as upstream's clients read it, from its grid
+    /// (DESIGN.md, "Folders and permissions"). Upstream showed a Manager's
+    /// editable folders as managed without letting them manage; now what it
+    /// shows is what the server allows.
+    pub fn to_json_details_for_member(&self, extras: &Extras) -> Value {
+        extras
+            .user_grant(&self.user_uuid, &self.collection_uuid, (self.read_only, self.hide_passwords, self.manage))
+            .grant_json(&self.membership_uuid)
     }
 }
 
-impl From<CollectionUser> for CollectionMembership {
-    fn from(c: CollectionUser) -> Self {
+impl From<(MembershipId, CollectionId, bool, bool, bool, UserId)> for CollectionMembership {
+    fn from(c: (MembershipId, CollectionId, bool, bool, bool, UserId)) -> Self {
         Self {
-            membership_uuid: c.user_uuid.to_string().into(),
-            collection_uuid: c.collection_uuid,
-            read_only: c.read_only,
-            hide_passwords: c.hide_passwords,
-            manage: c.manage,
+            membership_uuid: c.0,
+            collection_uuid: c.1,
+            read_only: c.2,
+            hide_passwords: c.3,
+            manage: c.4,
+            user_uuid: c.5,
         }
     }
 }

@@ -30,7 +30,10 @@ use crate::{
     error::MapResult,
 };
 
-use super::{CollectionId, CollectionUser, Membership, MembershipId, MembershipType, OrganizationId, UserId};
+use super::{
+    CollectionId, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, UserId,
+    keykeeper_folder_permissions::{Access, Grid},
+};
 
 /// What a custom role can be allowed to do, by upstream's permission names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +308,28 @@ pub async fn refuse<S>(
     Outcome::Error((Status::Unauthorized, message))
 }
 
+/// For the manager guards: as refuse, but a confirmed member who isn't a
+/// custom member gets 404, as for something that isn't there. A regular
+/// member's web vault can reach a folder's endpoints (a folder they manage,
+/// or one they just stopped managing), and 401 would sign them out.
+pub async fn refuse_on_manager_route<S>(
+    request: &Request<'_>,
+    member: &Membership,
+    message: &'static str,
+) -> request::Outcome<S, &'static str> {
+    if member.status == MembershipStatus::Confirmed as i32
+        && !(member.atype == MembershipType::User as i32
+            && match request.guard::<DbConn>().await {
+                Outcome::Success(conn) => find(&member.uuid, &conn).await.is_some(),
+                _ => false,
+            })
+    {
+        error!(target: "auth", "Not found: {message}");
+        return Outcome::Error((Status::NotFound, message));
+    }
+    refuse(request, member, message).await
+}
+
 /// Refuses a custom member's action on anyone but a regular member: not
 /// themselves, admins, owners, or other custom members.
 pub async fn ensure_regular_target(
@@ -339,28 +364,26 @@ pub fn ensure_regular_grant(
     Ok(())
 }
 
-/// The collections a custom member can give others: the ones they reach
-/// themselves, every one for a member with access to all items. A custom role
-/// never grants more than it has (DESIGN.md, "Roles and permissions"):
-/// otherwise a role that manages users could give a second account of its own
-/// every item, and "no vault items" for a technician would mean nothing.
+/// The collections a custom member can give others, and what they can give in
+/// each: what they have there themselves, merged over all their ways in
+/// (DESIGN.md, "Folders and permissions"), or anything but manage in every
+/// collection for a member with access to all items. A custom role never
+/// grants more than it has (DESIGN.md, "Roles and permissions"): otherwise a
+/// role that manages users could give a second account of its own every item,
+/// and "no vault items" for a technician would mean nothing.
 pub enum Reach {
     All,
-    Only(HashMap<CollectionId, CollectionUser>),
+    Only(HashMap<CollectionId, Grid>),
 }
 
 impl Reach {
-    pub async fn of(actor: &UserId, org_id: &OrganizationId, conn: &DbConn) -> Self {
-        match Membership::find_confirmed_by_user_and_org(actor, org_id, conn).await {
-            Some(member) if member.access_all => Self::All,
-            _ => Self::Only(
-                CollectionUser::find_by_organization_and_user_uuid(org_id, actor, conn)
-                    .await
-                    .into_iter()
-                    .map(|c| (c.collection_uuid.clone(), c))
-                    .collect(),
-            ),
-        }
+    pub async fn of(actor: &UserId, org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Self> {
+        let access = Access::in_org(actor, org_id, conn).await?;
+        Ok(if access.has_full(org_id) {
+            Self::All
+        } else {
+            Self::Only(access.folders)
+        })
     }
 
     pub fn contains(&self, collection: &CollectionId) -> bool {
@@ -370,23 +393,19 @@ impl Reach {
         }
     }
 
-    /// Refuses giving a collection the actor doesn't reach, more rights there
-    /// than the actor has, or the right to manage it.
-    pub fn ensure_grant(
-        &self,
-        collection: &CollectionId,
-        read_only: bool,
-        hide_passwords: bool,
-        manage: bool,
-    ) -> EmptyResult {
-        if manage {
+    /// Refuses giving a collection the actor doesn't reach, any capability
+    /// there the actor doesn't have, or the right to manage it. The grant is
+    /// checked as it will be saved, so a request with only upstream's fields
+    /// is checked as the preset they name.
+    pub fn ensure_grant(&self, collection: &CollectionId, grant: &Grid) -> EmptyResult {
+        if grant.manage {
             err!("Your role can't give others the right to manage a collection")
         }
         match self {
             Self::All => Ok(()),
             Self::Only(mine) => match mine.get(collection) {
                 None => err!("Your role can only give access to collections it can reach"),
-                Some(own) if (own.read_only && !read_only) || (own.hide_passwords && !hide_passwords) => {
+                Some(own) if !grant.within(own) => {
                     err!("Your role can't give more access to a collection than it has")
                 }
                 Some(_) => Ok(()),

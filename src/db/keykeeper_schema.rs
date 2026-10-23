@@ -330,3 +330,35 @@ table! {
         saved_at -> Timestamp,
     }
 }
+
+table! {
+    keykeeper_users_collections (user_uuid, collection_uuid) {
+        user_uuid -> Text,
+        collection_uuid -> Text,
+        read_only -> Bool,
+        hide_passwords -> Bool,
+        manage -> Bool,
+        can_create -> Bool,
+        can_delete -> Bool,
+        can_export -> Bool,
+        can_share -> Bool,
+        can_print -> Bool,
+        can_view_history -> Bool,
+    }
+}
+
+table! {
+    keykeeper_collections_groups (collections_uuid, groups_uuid) {
+        collections_uuid -> Text,
+        groups_uuid -> Text,
+        read_only -> Bool,
+        hide_passwords -> Bool,
+        manage -> Bool,
+        can_create -> Bool,
+        can_delete -> Bool,
+        can_export -> Bool,
+        can_share -> Bool,
+        can_print -> Bool,
+        can_view_history -> Bool,
+    }
+}

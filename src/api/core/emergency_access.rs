@@ -567,7 +567,7 @@ async fn view_emergency_access(emer_id: EmergencyAccessId, headers: Headers, con
     }
 
     let ciphers = Cipher::find_owned_by_user(&emergency_access.grantor_uuid, &conn).await;
-    let cipher_sync_data = CipherSyncData::new(&emergency_access.grantor_uuid, CipherSyncType::User, &conn).await;
+    let cipher_sync_data = CipherSyncData::new(&emergency_access.grantor_uuid, CipherSyncType::User, &conn).await?;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
     for c in ciphers {

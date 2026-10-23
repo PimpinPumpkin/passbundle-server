@@ -24,8 +24,9 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Archive, Attachment, CipherVersion, CollectionCipher, CollectionId, Favorite, FolderCipher, FolderId, Group,
-    Membership, MembershipStatus, MembershipType, OrganizationId, User, UserId,
+    Archive, Attachment, CipherVersion, CollectionCipher, CollectionId, Favorite, FolderCipher, FolderId, Membership,
+    MembershipStatus, MembershipType, OrganizationId, User, UserId,
+    keykeeper_folder_permissions::{self, Grid},
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -178,15 +179,16 @@ impl Cipher {
 
         // We don't need these values at all for Organizational syncs
         // Skip any other database calls if this is the case and just return false.
-        let (read_only, hide_passwords, _) = if sync_type == CipherSyncType::User {
-            if let Some((ro, hp, mn)) = self.get_access_restrictions(user_uuid, cipher_sync_data, conn).await {
-                (ro, hp, mn)
+        // Keykeeper: the person's capabilities on the item, from the grid.
+        let grid = if sync_type == CipherSyncType::User {
+            if let Some(grid) = self.grid_for_user(user_uuid, cipher_sync_data, conn).await {
+                grid
             } else {
                 error!("Cipher ownership assertion failure");
-                (true, true, false)
+                Grid::NONE
             }
         } else {
-            (false, false, false)
+            Grid::ALL
         };
 
         let fields_json: Vec<_> = self
@@ -315,7 +317,10 @@ impl Cipher {
                 Cow::from(Vec::new())
             }
         } else {
-            Cow::from(self.get_admin_collections(user_uuid.clone(), conn).await)
+            // Keykeeper: every folder of the item the person reaches, as sync
+            // lists them, read-only ones included: the item form posts this
+            // list back, and leaving a folder out takes the item out of it.
+            Cow::from(keykeeper_folder_permissions::reached_collections_of(self, user_uuid, conn).await?)
         };
 
         // There are three types of cipher response models in upstream
@@ -382,12 +387,14 @@ impl Cipher {
             // These values are true by default, but can be false if the
             // cipher belongs to a collection or group where the org owner has enabled
             // the "Read Only" or "Hide Passwords" restrictions for the user.
-            json_object["edit"] = json!(!read_only);
-            json_object["viewPassword"] = json!(!hide_passwords);
+            // Keykeeper: from the grid, so upstream clients see exactly what
+            // the server allows: delete and restore follow delete.
+            json_object["edit"] = json!(grid.edit);
+            json_object["viewPassword"] = json!(grid.see_passwords);
             // The new key used by clients since v2025.6.0
             json_object["permissions"] = json!({
-                "delete": !read_only,
-                "restore": !read_only,
+                "delete": grid.delete,
+                "restore": grid.delete,
             });
         }
 
@@ -546,200 +553,63 @@ impl Cipher {
         self.user_uuid.is_some() && self.user_uuid.as_ref().unwrap() == user_uuid
     }
 
-    /// Returns whether this cipher is owned by an org in which the user has full access.
-    async fn is_in_full_access_org(
+    /// Keykeeper: what the person can do with this item (DESIGN.md, "Folders
+    /// and permissions"): everything with their own item, what full access
+    /// to its organization gives them, and otherwise what any shared folder
+    /// holding it allows them, merged over their ways in. None means they
+    /// can't open it, or that their permissions couldn't be read.
+    pub async fn grid_for_user(
         &self,
         user_uuid: &UserId,
         cipher_sync_data: Option<&CipherSyncData>,
         conn: &DbConn,
-    ) -> bool {
-        if let Some(ref org_uuid) = self.organization_uuid {
-            if let Some(cipher_sync_data) = cipher_sync_data {
-                if let Some(cached_member) = cipher_sync_data.members.get(org_uuid) {
-                    return cached_member.has_full_access();
-                }
-            } else if let Some(member) = Membership::find_confirmed_by_user_and_org(user_uuid, org_uuid, conn).await {
-                return member.has_full_access();
-            }
+    ) -> Option<Grid> {
+        let Some(sync) = cipher_sync_data else {
+            return keykeeper_folder_permissions::for_cipher(self, user_uuid, conn)
+                .await
+                .inspect_err(|e| error!("Refused, as the item's permissions couldn't be read: {e}"))
+                .ok()
+                .flatten();
+        };
+        if self.is_owned_by_user(user_uuid) {
+            return Some(Grid::ALL);
         }
-        false
+        let org = self.organization_uuid.as_ref()?;
+        let collections = sync.cipher_collections.get(&self.uuid).map_or(&[][..], Vec::as_slice);
+        sync.access.for_item(org, collections)
     }
 
-    /// Returns whether this cipher is owned by an group in which the user has full access.
-    async fn is_in_full_access_group(
-        &self,
-        user_uuid: &UserId,
-        cipher_sync_data: Option<&CipherSyncData>,
-        conn: &DbConn,
-    ) -> bool {
-        if !CONFIG.org_groups_enabled() {
-            return false;
-        }
-        if let Some(ref org_uuid) = self.organization_uuid {
-            if let Some(cipher_sync_data) = cipher_sync_data {
-                return cipher_sync_data.user_group_full_access_for_organizations.contains(org_uuid);
-            }
-            return Group::is_in_full_access_group(user_uuid, org_uuid, conn).await;
-        }
-        false
-    }
-
-    /// Returns the user's access restrictions to this cipher. A return value
-    /// of None means that this cipher does not belong to the user, and is
-    /// not in any collection the user has access to. Otherwise, the user has
-    /// access to this cipher, and Some(read_only, hide_passwords, manage) represents
-    /// the access restrictions.
+    /// Returns the user's access restrictions to this cipher, as upstream's
+    /// three fields: Some(read_only, hide_passwords, manage), or None when
+    /// the user can't open it. Keykeeper: from the grid (grid_for_user).
     pub async fn get_access_restrictions(
         &self,
         user_uuid: &UserId,
         cipher_sync_data: Option<&CipherSyncData>,
         conn: &DbConn,
     ) -> Option<(bool, bool, bool)> {
-        // Check whether this cipher is directly owned by the user, or is in
-        // a collection that the user has full access to. If so, there are no
-        // access restrictions.
-        if self.is_owned_by_user(user_uuid)
-            || self.is_in_full_access_org(user_uuid, cipher_sync_data, conn).await
-            || self.is_in_full_access_group(user_uuid, cipher_sync_data, conn).await
-        {
-            return Some((false, false, true));
-        }
-
-        let rows = if let Some(cipher_sync_data) = cipher_sync_data {
-            let mut rows: Vec<(bool, bool, bool)> = Vec::new();
-            if let Some(collections) = cipher_sync_data.cipher_collections.get(&self.uuid) {
-                for collection in collections {
-                    // User permissions
-                    if let Some(cu) = cipher_sync_data.user_collections.get(collection) {
-                        rows.push((cu.read_only, cu.hide_passwords, cu.manage));
-                    // Group permissions
-                    } else if let Some(cg) = cipher_sync_data.user_collections_groups.get(collection) {
-                        rows.push((cg.read_only, cg.hide_passwords, cg.manage));
-                    }
-                }
-            }
-            rows
-        } else {
-            let user_permissions = self.get_user_collections_access_flags(user_uuid, conn).await;
-            if user_permissions.is_empty() {
-                self.get_group_collections_access_flags(user_uuid, conn).await
-            } else {
-                user_permissions
-            }
-        };
-
-        if rows.is_empty() {
-            // This cipher isn't in any collections accessible to the user.
-            return None;
-        }
-
-        // A cipher can be in multiple collections with inconsistent access flags.
-        // Also, user permission overrule group permissions
-        // and only user permissions are returned by the code above.
-        //
-        // For example, a cipher could be in one collection where the user has
-        // read-only access, but also in another collection where the user has
-        // read/write access. For a flag to be in effect for a cipher, upstream
-        // requires all collections the cipher is in to have that flag set.
-        // Therefore, we do a boolean AND of all values in each of the `read_only`
-        // and `hide_passwords` columns. This could ideally be done as part of the
-        // query, but Diesel doesn't support a min() or bool_and() function on
-        // booleans and this behavior isn't portable anyway.
-        //
-        // The only exception is for the `manage` flag, that needs a boolean OR!
-        let mut read_only = true;
-        let mut hide_passwords = true;
-        let mut manage = false;
-        for (ro, hp, mn) in &rows {
-            read_only &= ro;
-            hide_passwords &= hp;
-            manage |= mn;
-        }
-
-        Some((read_only, hide_passwords, manage))
+        self.grid_for_user(user_uuid, cipher_sync_data, conn).await.map(|g| (!g.edit, !g.see_passwords, g.manage))
     }
 
-    async fn get_user_collections_access_flags(&self, user_uuid: &UserId, conn: &DbConn) -> Vec<(bool, bool, bool)> {
-        let user_uuid = user_uuid.to_string();
-        conn.run(move |conn| {
-            // Check whether this cipher is in any collections accessible to the
-            // user. If so, retrieve the access flags for each collection.
-            // The user must have a confirmed membership in the cipher's
-            // organization, since users_collections rows are kept when a
-            // membership is revoked or not confirmed yet.
-            ciphers::table
-                .filter(ciphers::uuid.eq(&self.uuid))
-                .inner_join(ciphers_collections::table.on(ciphers::uuid.eq(ciphers_collections::cipher_uuid)))
-                .inner_join(
-                    users_organizations::table.on(ciphers::organization_uuid
-                        .eq(users_organizations::org_uuid.nullable())
-                        .and(users_organizations::user_uuid.eq(user_uuid))
-                        .and(users_organizations::status.eq(MembershipStatus::Confirmed as i32))),
-                )
-                .inner_join(
-                    users_collections::table.on(ciphers_collections::collection_uuid
-                        .eq(users_collections::collection_uuid)
-                        // Only allow collection access via the confirmed membership.
-                        .and(users_organizations::user_uuid.eq(users_collections::user_uuid))),
-                )
-                .select((users_collections::read_only, users_collections::hide_passwords, users_collections::manage))
-                .load::<(bool, bool, bool)>(conn)
-                .expect("Error getting user access restrictions")
-        })
-        .await
-    }
-
-    async fn get_group_collections_access_flags(&self, user_uuid: &UserId, conn: &DbConn) -> Vec<(bool, bool, bool)> {
-        if !CONFIG.org_groups_enabled() {
-            return Vec::new();
-        }
-        conn.run(move |conn| {
-            ciphers::table
-                .filter(ciphers::uuid.eq(&self.uuid))
-                .inner_join(ciphers_collections::table.on(ciphers::uuid.eq(ciphers_collections::cipher_uuid)))
-                .inner_join(
-                    collections_groups::table
-                        .on(collections_groups::collections_uuid.eq(ciphers_collections::collection_uuid)),
-                )
-                .inner_join(groups_users::table.on(groups_users::groups_uuid.eq(collections_groups::groups_uuid)))
-                .inner_join(
-                    users_organizations::table.on(users_organizations::uuid.eq(groups_users::users_organizations_uuid)),
-                )
-                .inner_join(
-                    groups::table.on(groups::uuid
-                        .eq(collections_groups::groups_uuid)
-                        .and(groups::organizations_uuid.eq(users_organizations::org_uuid))),
-                )
-                .filter(users_organizations::user_uuid.eq(user_uuid))
-                // Only allow group access via a confirmed membership, since
-                // groups_users rows are kept when a membership is revoked.
-                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(ciphers::organization_uuid.eq(users_organizations::org_uuid.nullable()))
-                .select((collections_groups::read_only, collections_groups::hide_passwords, collections_groups::manage))
-                .load::<(bool, bool, bool)>(conn)
-                .expect("Error getting group access restrictions")
-        })
-        .await
-    }
-
+    /// Keykeeper: may change the item's contents and attachments.
     pub async fn is_write_accessible_to_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        match self.get_access_restrictions(user_uuid, None, conn).await {
-            Some((read_only, _hide_passwords, manage)) => !read_only || manage,
-            None => false,
-        }
+        self.grid_for_user(user_uuid, None, conn).await.is_some_and(|g| g.edit)
     }
 
-    // used for checking if collection can be edited (only if user has access to a collection they
-    // can write to and also passwords are not hidden to prevent privilege escalation)
+    /// May change which shared folders the item is in: edit it, with its
+    /// passwords showing, so moving it can't show anyone passwords they
+    /// couldn't see (upstream's rule).
     pub async fn is_in_editable_collection_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        match self.get_access_restrictions(user_uuid, None, conn).await {
-            Some((read_only, hide_passwords, manage)) => (!read_only && !hide_passwords) || manage,
-            None => false,
-        }
+        self.grid_for_user(user_uuid, None, conn).await.is_some_and(|g| g.edit && g.see_passwords)
+    }
+
+    /// Keykeeper: may move the item to the trash, restore it, or delete it.
+    pub async fn is_deletable_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
+        self.grid_for_user(user_uuid, None, conn).await.is_some_and(|g| g.delete)
     }
 
     pub async fn is_accessible_to_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        self.get_access_restrictions(user_uuid, None, conn).await.is_some()
+        self.grid_for_user(user_uuid, None, conn).await.is_some()
     }
 
     // Returns whether this cipher is a favorite of the specified user.

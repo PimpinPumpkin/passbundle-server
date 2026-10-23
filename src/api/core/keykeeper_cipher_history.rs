@@ -16,6 +16,7 @@ use crate::{
         DbConn,
         models::{
             Cipher, CipherId, CipherVersion, EventType, Membership, MembershipType, User, UserId,
+            keykeeper_folder_permissions::{Access, Grid, ways_to_cipher},
             keykeeper_roles::{self, Permission},
         },
     },
@@ -28,21 +29,26 @@ pub fn routes() -> Vec<Route> {
     routes![get_history, clear_history, delete_version]
 }
 
-/// The item, and what the caller may do with it: (read only, hide passwords,
-/// manage), as for reading the item. Anyone who can't open it gets 404, the
-/// same as for an item that doesn't exist.
+/// The item, and what the caller may do with it: (hide passwords, may clear
+/// its history). Anyone who can't open it, or whose shared folders don't let
+/// them view its history, gets 404, the same as for an item that doesn't
+/// exist (DESIGN.md, "Folders and permissions"). Each needs both of its
+/// capabilities in one way to the item, not one from each of two folders:
+/// versions' contents need view item history and see passwords together,
+/// and clearing needs view item history and delete together.
 async fn readable(
     cipher_id: &CipherId,
     headers: &Headers,
     conn: &DbConn,
 ) -> Result<(Cipher, bool, bool), crate::Error> {
-    if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await
-        && let Some((read_only, hide_passwords, manage)) =
-            cipher.get_access_restrictions(&headers.user.uuid, None, conn).await
-    {
-        // Who may delete the item, as upstream's delete checks it.
-        let can_delete = !read_only || manage;
-        return Ok((cipher, hide_passwords, can_delete));
+    if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await {
+        let ways: Vec<Grid> =
+            ways_to_cipher(&cipher, &headers.user.uuid, conn).await?.into_iter().filter(|g| g.view_history).collect();
+        if !ways.is_empty() {
+            let shows_passwords = ways.iter().any(|g| g.see_passwords);
+            let clears = ways.iter().any(|g| g.delete);
+            return Ok((cipher, !shows_passwords, clears));
+        }
     }
     err_code!("Item not found", Status::NotFound.code)
 }
@@ -91,25 +97,27 @@ async fn get_history(cipher_id: CipherId, headers: Headers, conn: DbConn) -> Jso
     })))
 }
 
-/// Clears an item's history, for those who may delete the item. Logged in
+/// Clears an item's history, for those who may delete the item and view its
+/// history in the same shared folder. Logged in
 /// an organization's event log for its items.
 #[delete("/keykeeper/ciphers/<cipher_id>/history")]
 async fn clear_history(cipher_id: CipherId, headers: Headers, conn: DbConn) -> EmptyResult {
     let (cipher, _, can_delete) = readable(&cipher_id, &headers, &conn).await?;
     if !can_delete {
-        err_code!("You can't delete this item, so you can't clear its history", Status::Forbidden.code)
+        // 400, not 403, which signs the web vault out.
+        err!("You don't have permission to clear this item's history")
     }
     CipherVersion::delete_all_by_cipher(&cipher.uuid, &conn).await?;
     logged(EventType::KeykeeperCipherHistoryCleared, &cipher, &headers, &conn).await;
     Ok(())
 }
 
-/// Deletes one of an item's past versions, for those who may delete the item.
+/// Deletes one of an item's past versions, for those who may clear its history.
 #[delete("/keykeeper/ciphers/<cipher_id>/history/<version_id>")]
 async fn delete_version(cipher_id: CipherId, version_id: &str, headers: Headers, conn: DbConn) -> EmptyResult {
     let (cipher, _, can_delete) = readable(&cipher_id, &headers, &conn).await?;
     if !can_delete {
-        err_code!("You can't delete this item, so you can't delete its versions", Status::Forbidden.code)
+        err!("You don't have permission to delete this item's versions")
     }
     if !CipherVersion::delete_one(&cipher.uuid, version_id, &conn).await? {
         err_code!("Version not found", Status::NotFound.code)
@@ -133,9 +141,7 @@ fn no_sync_data() -> CipherSyncData {
         cipher_collections: HashMap::new(),
         cipher_archives: HashMap::new(),
         members: HashMap::new(),
-        user_collections: HashMap::new(),
-        user_collections_groups: HashMap::new(),
-        user_group_full_access_for_organizations: HashSet::new(),
+        access: Access::default(),
     }
 }
 
