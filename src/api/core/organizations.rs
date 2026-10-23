@@ -2587,12 +2587,18 @@ async fn get_groups_data(
     let has_full_access = headers.membership.has_full_access()
         || (CONFIG.org_groups_enabled()
             && GroupUser::has_full_access_by_member(&org_id, &headers.membership.uuid, &conn).await);
-    let allowed = if details {
-        has_full_access
-    } else {
-        has_full_access
-            || Collection::has_manageable_collection_by_user(&org_id, &headers.membership.user_uuid, &conn).await
-    };
+    // Keykeeper: a custom role the guard admitted here reads the groups, never
+    // changes them (every other group endpoint needs an owner or admin): the
+    // Members page lists each member's groups, and the member dialogs show
+    // them and the collections they give.
+    let custom = headers.custom_permissions.is_some();
+    let allowed = custom
+        || if details {
+            has_full_access
+        } else {
+            has_full_access
+                || Collection::has_manageable_collection_by_user(&org_id, &headers.membership.user_uuid, &conn).await
+        };
     if !allowed {
         err_code!("Resource not found.", "User does not have access", Status::NotFound.code);
     }
@@ -2602,12 +2608,37 @@ async fn get_groups_data(
         let mut groups_json = Vec::with_capacity(groups.len());
 
         if details {
+            // Keykeeper: without access to all items, a custom member sees in
+            // each group only the collections they reach themselves, as in the
+            // collection list the member dialogs load with it.
+            let reach: Option<HashSet<String>> = if custom && !has_full_access {
+                Some(
+                    Collection::find_by_organization_and_user_uuid(&org_id, &headers.membership.user_uuid, &conn)
+                        .await
+                        .into_iter()
+                        .map(|c| c.uuid.to_string())
+                        .collect(),
+                )
+            } else {
+                None
+            };
             for g in groups {
-                groups_json.push(g.to_json_details(&conn).await);
+                let mut group = g.to_json_details(&conn).await;
+                if custom {
+                    group["externalId"] = Value::Null;
+                }
+                if let (Some(reach), Some(collections)) = (&reach, group["collections"].as_array_mut()) {
+                    collections.retain(|c| c["id"].as_str().is_some_and(|id| reach.contains(id)));
+                }
+                groups_json.push(group);
             }
         } else {
             for g in groups {
-                groups_json.push(g.to_json());
+                let mut group = g.to_json();
+                if custom {
+                    group["externalId"] = Value::Null;
+                }
+                groups_json.push(group);
             }
         }
         groups_json
