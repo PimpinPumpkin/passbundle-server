@@ -27,10 +27,19 @@ use super::{MspClient, MspId, OrganizationId};
 /// organization's email domains. A command without domains can be copied off
 /// any machine it ran on and used with any account, so those joins wait for
 /// approval. See DESIGN.md, "Onboarding through the RMM".
+///
+/// Someone only the directory invited (provisioning) waits for an owner or
+/// admin to let them in, unless they joined with a command limited to email
+/// domains: nothing an app can check vouches for the directory's choice. See
+/// DESIGN.md, "Provisioning from Entra ID".
 pub async fn confirms_automatically(org_auto_confirm: bool, member: &super::Membership, conn: &DbConn) -> bool {
-    org_auto_confirm
-        && (!super::MspEnrollmentJoin::exists_for(&member.uuid, conn).await
-            || !super::EnrollmentDomains::for_org(&member.org_uuid, conn).await.is_empty())
+    if !org_auto_confirm {
+        return false;
+    }
+    if super::MspEnrollmentJoin::exists_for(&member.uuid, conn).await {
+        return !super::EnrollmentDomains::for_org(&member.org_uuid, conn).await.is_empty();
+    }
+    !super::ScimUser::awaits_let_in(member, conn).await
 }
 
 /// Invitations last between an hour and 30 days.

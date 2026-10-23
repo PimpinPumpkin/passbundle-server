@@ -13,6 +13,8 @@ mod keykeeper_msp;
 mod keykeeper_msp_policies;
 mod keykeeper_msp_templates;
 mod keykeeper_orgs;
+mod keykeeper_provisioning;
+pub mod keykeeper_scim;
 mod keykeeper_script_access;
 mod keykeeper_seals;
 mod keykeeper_site_fixes;
@@ -26,6 +28,8 @@ pub use accounts::purge_auth_requests;
 pub use ciphers::{CipherData, CipherSyncData, CipherSyncType, purge_trashed_ciphers};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
+// Keykeeper: provisioning (SCIM), mounted at /scim.
+pub use keykeeper_scim::{catchers as scim_catchers, routes as scim_routes};
 pub use sends::purge_sends;
 
 use reqwest::Method;
@@ -64,6 +68,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_msp_templates::routes());
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
+    routes.append(&mut keykeeper_provisioning::routes());
     routes.append(&mut keykeeper_seals::routes());
     routes.append(&mut keykeeper_script_access::routes());
     routes.append(&mut keykeeper_site_fixes::routes());
@@ -335,10 +340,13 @@ async fn accept_org_invite(
         let Some(org) = Organization::find_by_uuid(&member.org_uuid, conn).await else {
             err!("Organization not found.")
         };
-        let inviter = member.invited_by_email.unwrap_or(org.billing_email);
+        let inviter = member.invited_by_email.clone().unwrap_or(org.billing_email);
         // Keykeeper: where joining is automatic, nobody confirms them, so the
-        // inviter hears that they're in. See DESIGN.md, "Joining".
-        if crate::db::models::effective_joining(&org.uuid, conn).await.0.auto_confirm {
+        // inviter hears that they're in. See DESIGN.md, "Joining". Someone the
+        // directory invited still waits for an owner or admin to let them in
+        // ("Provisioning from Entra ID").
+        let auto = crate::db::models::effective_joining(&org.uuid, conn).await.0.auto_confirm;
+        if crate::db::models::confirms_automatically(auto, &member, conn).await {
             mail::send_member_joined(&inviter, &user.email, &org.name, &org.uuid, false, false, false).await?;
         } else {
             // User was invited to an organization, so they must be confirmed manually after acceptance

@@ -97,7 +97,11 @@ async fn require_token_admin(org_id: &OrganizationId, headers: &Headers, conn: &
     Ok(())
 }
 
-async fn is_token_admin(org_id: &OrganizationId, user_id: &crate::db::models::UserId, conn: &DbConn) -> bool {
+pub(super) async fn is_token_admin(
+    org_id: &OrganizationId,
+    user_id: &crate::db::models::UserId,
+    conn: &DbConn,
+) -> bool {
     let Some(member) = Membership::find_by_user_and_org(user_id, org_id, conn).await.filter(|m| {
         m.status == MembershipStatus::Confirmed as i32
             && (m.atype == MembershipType::Owner as i32 || m.atype == MembershipType::Admin as i32)

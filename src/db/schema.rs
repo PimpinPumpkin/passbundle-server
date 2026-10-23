@@ -76,6 +76,8 @@ table! {
         provider_uuid -> Nullable<Text>,
         provider_user_uuid -> Nullable<Text>,
         provider_org_uuid -> Nullable<Text>,
+        // Keykeeper: upstream's system user that acted (1 is SCIM).
+        system_actor -> Nullable<Integer>,
     }
 }
 

@@ -442,6 +442,10 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
             "createdAt": crate::util::format_date(&client.created_at),
             "members": { "confirmed": confirmed, "accepted": accepted, "invited": invited, "revoked": revoked },
             "you": you,
+            // Keykeeper: whether the client provisions from Entra, and its last sync.
+            "provisioning": crate::db::models::ScimToken::find(&org.uuid, &conn).await.map(|t| json!({
+                "lastUsedAt": t.last_used_at.as_ref().map(crate::util::format_date),
+            })),
         }));
     }
 

@@ -343,6 +343,12 @@ impl Fairing for BetterLogging {
         let uri_path = uri.path();
         let uri_path_str = uri_path.url_decode_lossy();
         let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
+        // Keykeeper: provisioning requests are logged without their query,
+        // whose filters carry people's names and emails.
+        if uri_subpath.starts_with("/scim") {
+            info!(target: "request", "{method} {uri_path_str}");
+            return;
+        }
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             match uri.query() {
                 Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", &q[..q.len().min(30)]),
@@ -358,7 +364,7 @@ impl Fairing for BetterLogging {
         let uri_path = request.uri().path();
         let uri_path_str = uri_path.url_decode_lossy();
         let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
-        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
+        if self.0 || uri_subpath.starts_with("/scim") || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             let status = response.status();
             if let Some(route) = request.route() {
                 info!(target: "response", "{route} => {status}");
