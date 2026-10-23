@@ -104,6 +104,13 @@ const ROUTES: &[(Method, &str, &[Permission])] = &[
     // member without access to all items it lists only the collections
     // they're assigned to.
     (Method::Get, "/organizations/<org_id>/collections/details", &[ManageUsers, AccessImportExport]),
+    // The Members page loads the group list for its Groups column, and the
+    // invite and edit dialogs the groups with their collections. Read only:
+    // creating, editing, or deleting groups and changing anyone's groups need
+    // an owner or admin. For a member without access to all items, each group
+    // lists only the collections they reach.
+    (Method::Get, "/organizations/<org_id>/groups", &[ManageUsers, ManageResetPassword]),
+    (Method::Get, "/organizations/<org_id>/groups/details", &[ManageUsers]),
     // Account recovery
     (Method::Get, "/organizations/<org_id>/users/<member_id>/reset-password-details", &[ManageResetPassword]),
     (Method::Put, "/organizations/<org_id>/users/<member_id>/recover-account", &[ManageResetPassword]),
@@ -114,6 +121,9 @@ const ROUTES: &[(Method, &str, &[Permission])] = &[
     // Event logs
     (Method::Get, "/organizations/<org_id>/events", &[AccessEventLogs]),
     (Method::Get, "/organizations/<org_id>/users/<member_id>/events", &[AccessEventLogs]),
+    // The event log loads the members' names and emails to say who acted.
+    // Read only, and only what the endpoint gives anyone who can call it.
+    (Method::Get, "/organizations/<org_id>/users/mini-details", &[AccessEventLogs]),
     // Export
     (Method::Get, "/organizations/<org_id>/export", &[AccessImportExport]),
 ];
@@ -443,6 +453,35 @@ mod tests {
         );
         assert!(route_permissions(Method::Post, "/organizations/<org_id>/collections").is_empty());
         assert!(route_permissions(Method::Get, "/organizations/<org_id>/collections/<col_id>/details").is_empty());
+    }
+
+    #[test]
+    fn the_members_page_and_member_dialogs_read_groups_and_never_change_them() {
+        assert_eq!(
+            route_permissions(Method::Get, "/organizations/<org_id>/groups"),
+            route_permissions(Method::Get, "/organizations/<org_id>/users")
+        );
+        assert_eq!(route_permissions(Method::Get, "/organizations/<org_id>/groups/details"), &[ManageUsers]);
+        for (method, path) in [
+            (Method::Post, "/organizations/<org_id>/groups"),
+            (Method::Delete, "/organizations/<org_id>/groups"),
+            (Method::Get, "/organizations/<org_id>/groups/<group_id>"),
+            (Method::Get, "/organizations/<org_id>/groups/<group_id>/details"),
+            (Method::Get, "/organizations/<org_id>/groups/<group_id>/users"),
+            (Method::Put, "/organizations/<org_id>/groups/<group_id>"),
+            (Method::Delete, "/organizations/<org_id>/groups/<group_id>"),
+        ] {
+            assert!(route_permissions(method, path).is_empty(), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn the_event_log_can_name_who_acted() {
+        assert_eq!(route_permissions(Method::Get, "/organizations/<org_id>/users/mini-details"), &[AccessEventLogs]);
+        assert_eq!(
+            route_permissions(Method::Get, "/organizations/<org_id>/events"),
+            route_permissions(Method::Get, "/organizations/<org_id>/users/mini-details")
+        );
     }
 
     #[test]

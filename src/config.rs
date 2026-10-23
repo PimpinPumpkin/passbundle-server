@@ -626,7 +626,8 @@ make_config! {
         /// Email domain whitelist |> Allow signups only from this list of comma-separated domains, even when signups are otherwise disabled
         signups_domains_whitelist: String, true, def,   String::new();
         /// Enable event logging |> Enables event logging for organizations.
-        org_events_enabled:     bool,   false,  def,    false;
+        /// Keykeeper: on unless turned off. MSPs and their clients expect an event log.
+        org_events_enabled:     bool,   false,  def,    true;
         /// Org creation users |> Allow org creation only by this list of comma-separated user emails.
         /// Blank or 'all' means all users can create orgs; 'none' means no users can create orgs.
         org_creation_users:     String, true,   def,    String::new();
@@ -809,7 +810,8 @@ make_config! {
         admin_session_lifetime:        i64, true,  def, 20;
 
         /// Enable groups (BETA!) (Know the risks!) |> Enables groups support for organizations (Currently contains known issues!).
-        org_groups_enabled:            bool, false, def, false;
+        /// Keykeeper: on unless turned off. Organizations give shared folders to groups, and the tests cover them.
+        org_groups_enabled:            bool, false, def, true;
 
         /// Increase note size limit (Know the risks!) |> Sets the secure note size limit to 100_000 instead of the default 10_000.
         /// WARNING: This could cause issues with clients. Also exports will not work on Bitwarden servers!
