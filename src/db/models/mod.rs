@@ -10,6 +10,7 @@ mod favorite;
 mod folder;
 mod group;
 // Keykeeper
+mod keykeeper_cipher_versions;
 mod keykeeper_joining;
 mod keykeeper_msp;
 mod keykeeper_orgs;
@@ -38,6 +39,7 @@ pub use self::event::{Event, EventType};
 pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
+pub use self::keykeeper_cipher_versions::CipherVersion;
 pub use self::keykeeper_joining::{
     INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, confirms_automatically, effective_joining,
     invite_hours, msp_default,

@@ -302,3 +302,21 @@ table! {
         revision_date -> Timestamp,
     }
 }
+
+table! {
+    keykeeper_cipher_versions (uuid) {
+        uuid -> Text,
+        cipher_uuid -> Text,
+        atype -> Integer,
+        akey -> Nullable<Text>,
+        name -> Text,
+        notes -> Nullable<Text>,
+        fields -> Nullable<Text>,
+        data -> Text,
+        password_history -> Nullable<Text>,
+        reprompt -> Nullable<Integer>,
+        revision_date -> Timestamp,
+        replaced_at -> Timestamp,
+        replaced_by -> Nullable<Text>,
+    }
+}

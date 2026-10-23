@@ -21,9 +21,9 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            Archive, Attachment, AttachmentId, Cipher, CipherId, Collection, CollectionCipher, CollectionGroup,
-            CollectionId, CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group, KeyId,
-            Membership, MembershipType, OrgPolicy, OrgPolicyType, OrganizationId, RepromptType, Send, UserId,
+            Archive, Attachment, AttachmentId, Cipher, CipherId, CipherVersion, Collection, CollectionCipher,
+            CollectionGroup, CollectionId, CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group,
+            KeyId, Membership, MembershipType, OrgPolicy, OrgPolicyType, OrganizationId, RepromptType, Send, UserId,
         },
     },
     util::{NumberOrString, deser_opt_nonempty_str, save_temp_file},
@@ -480,6 +480,12 @@ pub async fn update_cipher_from_data(
     // Check if this cipher is being transferred from a personal to an organization vault
     let transfer_cipher = cipher.organization_uuid.is_none() && data.organization_id.is_some();
 
+    // Keykeeper: the item as it's stored before this edit, kept as a past
+    // version if the edit changes it (DESIGN.md, "Item history"). Only edits
+    // of an item already saved: not new items, imports, or key rotation.
+    let before =
+        (ut == UpdateType::SyncCipherUpdate && !transfer_cipher).then(|| CipherVersion::of(cipher, &headers.user.uuid));
+
     if let Some(org_id) = data.organization_id {
         match Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, conn).await {
             None => err!("You don't have permission to add item to organization"),
@@ -572,6 +578,18 @@ pub async fn update_cipher_from_data(
     cipher.data = type_data.to_string();
     cipher.password_history = data.password_history.map(|f| f.to_string());
     cipher.reprompt = data.reprompt.filter(|r| *r == RepromptType::None as i32 || *r == RepromptType::Password as i32);
+
+    // Keykeeper: keep the version this edit replaces before saving the edit,
+    // so a failure leaves the item as it was. An item moving into an
+    // organization forgets its versions instead: they're encrypted with its
+    // owner's own key.
+    if transfer_cipher {
+        CipherVersion::delete_all_by_cipher(&cipher.uuid, conn).await?;
+    } else if let Some(before) = before
+        && !before.same_as(cipher)
+    {
+        before.keep(conn).await?;
+    }
 
     cipher.save(conn).await?;
     cipher.move_to_folder(data.folder_id, &headers.user.uuid, conn).await?;

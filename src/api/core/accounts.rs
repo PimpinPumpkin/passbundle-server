@@ -20,10 +20,10 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
-            EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
-            MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId,
-            UserKdfType, UserSettings,
+            AuthRequest, AuthRequestId, Cipher, CipherId, CipherVersion, Device, DeviceId, DeviceType,
+            DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId,
+            Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User,
+            UserId, UserKdfType, UserSettings,
         },
     },
     mail,
@@ -1048,6 +1048,13 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
         && let Err(e) = UserSettings::delete_by_user(&user.uuid, &conn).await
     {
         warn!("Couldn't forget settings after a key rotation: {e:#?}");
+    }
+    // Keykeeper: and so can't the past versions of their own items
+    // (keykeeper_cipher_versions). Organizations' items keep theirs.
+    if save_result.is_ok()
+        && let Err(e) = CipherVersion::delete_all_by_owner(&user.uuid, &conn).await
+    {
+        warn!("Couldn't forget earlier versions of items after a key rotation: {e:#?}");
     }
 
     // Prevent logging out the client where the user requested this endpoint from.

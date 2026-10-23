@@ -6,6 +6,7 @@ mod emergency_access;
 mod events;
 mod folders;
 // Keykeeper
+mod keykeeper_cipher_history;
 mod keykeeper_enrollment;
 mod keykeeper_joining;
 mod keykeeper_msp;
@@ -56,6 +57,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut events::routes());
     routes.append(&mut folders::routes());
     routes.append(&mut organizations::routes());
+    routes.append(&mut keykeeper_cipher_history::routes());
     routes.append(&mut keykeeper_joining::routes());
     routes.append(&mut keykeeper_msp::routes());
     routes.append(&mut keykeeper_msp_policies::routes());
