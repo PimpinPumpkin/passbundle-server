@@ -44,6 +44,10 @@ pub struct Event {
     // Keykeeper: upstream's system user that acted, when no person did (1 is
     // SCIM provisioning). The web vault's event log names it.
     pub system_actor: Option<i32>,
+    // Keykeeper: the event's subject in words, where it has one: the domain of
+    // a domain event (upstream's domainName), or why a single sign-on was
+    // refused. Never a secret or anything from a vault.
+    pub keykeeper_detail: Option<String>,
 }
 
 // Upstream enum: https://github.com/bitwarden/server/blob/v2026.6.2/src/Core/Dirt/Enums/EventType.cs
@@ -108,7 +112,9 @@ pub enum EventType {
     OrganizationUserResetPasswordWithdraw = 1507,
     OrganizationUserAdminResetPassword = 1508,
     // OrganizationUserResetSsoLink = 1509, // Not supported
-    // OrganizationUserFirstSsoLogin = 1510, // Not supported
+    // Keykeeper: someone's Entra account was linked to their account, at
+    // their first sign-in with the organization's single sign-on.
+    OrganizationUserFirstSsoLogin = 1510,
     OrganizationUserRevoked = 1511,
     OrganizationUserRestored = 1512,
     OrganizationUserApprovedAuthRequest = 1513,
@@ -121,14 +127,23 @@ pub enum EventType {
     // OrganizationUserRevoked_TwoFactorNonCompliance = 1520,
     // OrganizationUserRevoked_SingleOrganizationNonCompliance = 1521,
     OrganizationUserNotificationBannerActionClicked = 1522,
+    // Keykeeper: someone signed in with the organization's single sign-on,
+    // or it refused them (the reason is in keykeeper_detail). 1590 and up
+    // are ours. See keykeeper_sso.
+    KeykeeperSsoSignedIn = 1590,
+    KeykeeperSsoRefused = 1591,
 
     // Organization
     OrganizationUpdated = 1600,
     OrganizationPurgedVault = 1601,
     OrganizationClientExportedVault = 1602,
+    // Keykeeper: the organization's single sign-on settings changed (its
+    // tenant, app, secret, or identifier).
+    KeykeeperSsoSettingsChanged = 1694,
     // OrganizationVaultAccessed = 1603,
-    // OrganizationEnabledSso = 1604, // Not supported
-    // OrganizationDisabledSso = 1605, // Not supported
+    // Keykeeper: the organization's single sign-on turned on or off.
+    OrganizationEnabledSso = 1604,
+    OrganizationDisabledSso = 1605,
     // OrganizationEnabledKeyConnector = 1606, // Not supported
     // OrganizationDisabledKeyConnector = 1607, // Not supported
     // OrganizationSponsorshipsSynced = 1608, // Not supported
@@ -146,11 +161,12 @@ pub enum EventType {
     // ProviderOrganizationRemoved = 1902, // Not supported
     // ProviderOrganizationVaultAccessed = 1903, // Not supported
 
-    // OrganizationDomainAdded = 2000, // Not supported
-    // OrganizationDomainRemoved = 2001, // Not supported
-    // OrganizationDomainVerified = 2002, // Not supported
-    // OrganizationDomainNotVerified = 2003, // Not supported
-
+    // Keykeeper: email domains an organization verifies for single sign-on
+    // (the domain is in keykeeper_detail).
+    OrganizationDomainAdded = 2000,
+    OrganizationDomainRemoved = 2001,
+    OrganizationDomainVerified = 2002,
+    OrganizationDomainNotVerified = 2003,
     // SecretRetrieved = 2100, // Not supported
 }
 
@@ -180,6 +196,7 @@ impl Event {
             provider_user_uuid: None,
             provider_org_uuid: None,
             system_actor: None,
+            keykeeper_detail: None,
         }
     }
 
@@ -203,6 +220,10 @@ impl Event {
             "providerUserId": self.provider_user_uuid,
             "providerOrganizationId": self.provider_org_uuid,
             "systemUser": self.system_actor,
+            // Keykeeper: a domain event's domain, as upstream names it, and
+            // our other events' subject in words.
+            "domainName": if (2000..=2099).contains(&self.event_type) { self.keykeeper_detail.as_deref() } else { None },
+            "keykeeperDetail": self.keykeeper_detail,
             // "installationId": null, // Not supported
         })
     }
