@@ -445,6 +445,19 @@ mod tests {
 
     #[test]
     fn dns_setup_does_not_initialize_config() {
+        // Keykeeper: other tests in this binary read CONFIG, so in one process
+        // whether it's set here depends on which tests ran first. Check in a
+        // fresh process of this binary that runs only this test.
+        const CHILD: &str = "KEYKEEPER_DNS_SETUP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "http_client::tests::dns_setup_does_not_initialize_config", "--test-threads=1"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "the check failed in its own process");
+            return;
+        }
         assert!(LazyLock::get(&CONFIG).is_none());
         drop(CustomDns::instance(false));
         assert!(LazyLock::get(&CONFIG).is_none());

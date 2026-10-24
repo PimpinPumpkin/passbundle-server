@@ -209,7 +209,7 @@ impl Organization {
             "useTotp": true,
             "usePolicies": true,
             "useScim": false, // Not supported (Not AGPLv3 Licensed)
-            "useSso": false, // Not supported
+            "useSso": true, // Keykeeper: every organization can set up single sign-on (keykeeper_sso)
             "useKeyConnector": false, // Not supported
             "usePasswordManager": true,
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
@@ -486,7 +486,7 @@ impl Membership {
             "resetPasswordEnrolled": self.reset_password_key.is_some(),
             "useResetPassword": CONFIG.mail_enabled(),
             "ssoBound": false, // Not supported
-            "useSso": false, // Not supported
+            "useSso": true, // Keykeeper: every organization can set up single sign-on (keykeeper_sso)
             "useKeyConnector": false,
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
             "usePasswordManager": true,

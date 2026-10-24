@@ -1501,9 +1501,17 @@ pub async fn refresh_tokens(
         AuthMethod::Sso if CONFIG.sso_enabled() => {
             sso::exchange_refresh_token(&device, &user, client_id, refresh_claims).await?
         }
-        AuthMethod::Sso => err!("SSO is now disabled, Login again using email and master password"),
         AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
-        AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
+        // Keykeeper: someone an organization now requires to sign in with its
+        // single sign-on signs in again, there.
+        AuthMethod::Password
+            if crate::api::core::keykeeper_sso::required_identifier(&user.uuid, conn).await.is_some() =>
+        {
+            err!("Your organization requires you to sign in with single sign-on. Sign in again.")
+        }
+        // Keykeeper: an organization's own single sign-on proves who someone
+        // is once; the session is PassBundle's own, as for a password.
+        AuthMethod::Sso | AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
         _ => err!("Invalid auth method, cannot refresh token"),
     };
 

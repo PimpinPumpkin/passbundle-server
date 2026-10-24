@@ -397,3 +397,62 @@ table! {
         created_at -> Timestamp,
     }
 }
+
+table! {
+    keykeeper_sso (org_uuid) {
+        org_uuid -> Text,
+        enabled -> Bool,
+        identifier -> Text,
+        tenant_id -> Text,
+        client_id -> Text,
+        client_secret -> Nullable<Text>,
+        secret_set_at -> Nullable<Timestamp>,
+        updated_by -> Text,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+table! {
+    keykeeper_sso_domains (uuid) {
+        uuid -> Text,
+        org_uuid -> Text,
+        domain -> Text,
+        txt_token -> Text,
+        created_by -> Text,
+        created_at -> Timestamp,
+        verified_at -> Nullable<Timestamp>,
+        last_checked_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    keykeeper_sso_links (org_uuid, tenant_id, object_id) {
+        org_uuid -> Text,
+        tenant_id -> Text,
+        object_id -> Text,
+        user_uuid -> Text,
+        email -> Text,
+        created_at -> Timestamp,
+        last_used_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    keykeeper_sso_auth (state_hash) {
+        state_hash -> Text,
+        org_uuid -> Text,
+        client_id -> Text,
+        redirect_uri -> Text,
+        client_state -> Text,
+        client_challenge -> Text,
+        nonce -> Text,
+        code_verifier -> Text,
+        binding_hash -> Text,
+        code_hash -> Nullable<Text>,
+        identity -> Nullable<Text>,
+        error -> Nullable<Text>,
+        created_at -> Timestamp,
+        returned_at -> Nullable<Timestamp>,
+    }
+}

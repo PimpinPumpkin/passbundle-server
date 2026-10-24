@@ -11,7 +11,10 @@ use crate::{
         ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
-    auth::{AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, decode_invite},
+    auth::{
+        AdminHeaders, ClientIp, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders,
+        decode_invite,
+    },
     db::{
         DbConn,
         models::{
@@ -370,6 +373,9 @@ async fn get_auto_enroll_status(identifier: &str, headers: Headers, conn: DbConn
             Some(member) => Organization::find_by_uuid(&member.org_uuid, &conn).await,
             None => None,
         }
+    } else if let Some(org) = super::keykeeper_sso::org_for_identifier(identifier, &conn).await {
+        // Keykeeper: an organization's own SSO identifier.
+        Some(org)
     } else {
         Organization::find_by_uuid(&identifier.into(), &conn).await
     };
@@ -913,19 +919,19 @@ async fn get_org_details_impl(
 // Returning a Domain/Organization here allow to prefill it and prevent prompting the user
 // So we return a dummy value, since we only support a single SSO integration, and do not use the response anywhere
 // In use since `v2025.6.0`, appears to use only the first `organizationIdentifier`
-#[post("/organizations/domain/sso/verified")]
-fn get_org_domain_sso_verified() -> JsonResult {
-    // Always return a dummy value, no matter if SSO is enabled or not
-    Ok(Json(json!({
-        "object": "list",
-        "data": [{
-            "organizationIdentifier": FAKE_SSO_IDENTIFIER,
-            // These appear to be unused
-            "organizationName": FAKE_SSO_IDENTIFIER,
-            "domainName": CONFIG.domain()
-        }],
-        "continuationToken": null
-    })))
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrgDomainSsoData {
+    email: String,
+}
+
+// Keykeeper: the organization whose verified domain the email is at, if its
+// single sign-on is on (keykeeper_sso). Upstream's server-wide SSO answered a
+// dummy here.
+#[post("/organizations/domain/sso/verified", data = "<data>")]
+async fn get_org_domain_sso_verified(data: Json<OrgDomainSsoData>, ip: ClientIp, conn: DbConn) -> JsonResult {
+    crate::ratelimit::check_limit_prelogin(&ip.ip)?;
+    Ok(Json(super::keykeeper_sso::verified_for_email(&data.email, &conn).await))
 }
 
 #[derive(FromForm)]
@@ -2360,6 +2366,10 @@ pub(super) async fn set_policy(
             }
         }
     }
+
+    // Keykeeper: "Require single sign-on" needs the organization's single
+    // sign-on and Single organization on, and keeps Single organization on.
+    super::keykeeper_sso::check_policy(org_id, pol_type_enum, data.enabled, conn).await?;
 
     // Keykeeper: only vault lock data the clients can read.
     if pol_type_enum == OrgPolicyType::MaximumVaultTimeout {

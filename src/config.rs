@@ -865,6 +865,10 @@ make_config! {
         sso_client_cache_expiration:    u64,    true,   def,    0;
         /// Log all tokens |> `LOG_LEVEL=debug` or `LOG_LEVEL=info,vaultwarden::sso=debug` is required
         sso_debug_tokens:               bool,   true,   def,    false;
+        /// Microsoft sign-in address |> PassBundle: where organizations' "Sign in with Microsoft Entra ID" goes. Change it only to test against a stand-in on this machine.
+        sso_entra_authority:            String, false,  def,    "https://login.microsoftonline.com".to_owned();
+        /// DNS server for domain checks |> PassBundle: the address and port of the DNS server that checks organizations' domain TXT records. Empty uses the system's resolver.
+        sso_domain_dns_server:          String, false,  option;
     },
 
     /// Yubikey settings
@@ -1120,6 +1124,22 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         err!("All Duo options need to be set for global Duo support")
     }
 
+    // Keykeeper: single sign-on is set up per organization, in its admin
+    // console (api/core/keykeeper_sso). Upstream's one server-wide provider,
+    // which links accounts by email, stays in the code for merges but is
+    // refused here. See DESIGN.md, "Sign in with Microsoft Entra ID".
+    if cfg.sso_enabled {
+        err!(
+            "SSO_ENABLED isn't used by PassBundle: each organization sets up its own single sign-on on its Settings page. Unset SSO_ENABLED."
+        )
+    }
+    validate_entra_authority(&cfg.sso_entra_authority)?;
+    if let Some(server) = &cfg.sso_domain_dns_server
+        && server.parse::<std::net::SocketAddr>().is_err()
+    {
+        err!(format!("`SSO_DOMAIN_DNS_SERVER` must be an address and port, such as 127.0.0.1:53, not {server}"))
+    }
+
     if cfg.sso_enabled {
         if cfg.sso_client_id.is_empty() || cfg.sso_client_secret.is_empty() || cfg.sso_authority.is_empty() {
             err!("`SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` and `SSO_AUTHORITY` must be set for SSO support")
@@ -1304,6 +1324,22 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     if cfg.increase_note_size_limit {
         println!("[WARNING] Secure Note size limit is increased to 100_000!");
         println!("[WARNING] This could cause issues with clients. Also exports will not work on Bitwarden servers!.");
+    }
+    Ok(())
+}
+
+/// Keykeeper: Microsoft's sign-in address over HTTPS, or a stand-in on this
+/// machine for tests.
+fn validate_entra_authority(authority: &str) -> Result<(), Error> {
+    let Ok(url) = Url::parse(authority) else {
+        err!(format!("`SSO_ENTRA_AUTHORITY` isn't a URL: {authority}"))
+    };
+    let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
+        err!("`SSO_ENTRA_AUTHORITY` must use HTTPS (plain HTTP only for a stand-in on this machine)")
+    }
+    if url.query().is_some() || url.fragment().is_some() || !url.path().trim_end_matches('/').is_empty() {
+        err!("`SSO_ENTRA_AUTHORITY` is a scheme and host only, such as https://login.microsoftonline.com")
     }
     Ok(())
 }
