@@ -66,6 +66,9 @@ CREATE TABLE keykeeper_sso_auth (
     binding_hash     TEXT      NOT NULL,
     -- The one-time code this server gave the app, once Entra answered.
     code_hash        TEXT      UNIQUE,
+    -- For linking single sign-on from a signed-in session (upstream's Link
+    -- SSO): the account whose session asked, from its link ticket.
+    link_user_uuid   TEXT      REFERENCES users (uuid) ON DELETE CASCADE,
     -- Who Entra said it was (JSON), or why it didn't work.
     identity         TEXT,
     error            TEXT,
@@ -73,6 +76,13 @@ CREATE TABLE keykeeper_sso_auth (
     returned_at      TIMESTAMP
 );
 CREATE INDEX keykeeper_sso_auth_created ON keykeeper_sso_auth (created_at);
+-- A signed-in session's ticket to link its own account to single sign-on:
+-- five minutes, once, kept only as a SHA-256 hash.
+CREATE TABLE keykeeper_sso_link_tickets (
+    ticket_hash TEXT      NOT NULL PRIMARY KEY,
+    user_uuid   TEXT      NOT NULL REFERENCES users (uuid) ON DELETE CASCADE,
+    created_at  TIMESTAMP NOT NULL
+);
 -- An event's subject in words, where it has one: a domain for domain events
 -- (upstream's domainName), or why a single sign-on was refused.
 ALTER TABLE event ADD COLUMN keykeeper_detail TEXT;

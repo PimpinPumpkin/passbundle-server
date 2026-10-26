@@ -1502,6 +1502,12 @@ pub async fn refresh_tokens(
             sso::exchange_refresh_token(&device, &user, client_id, refresh_claims).await?
         }
         AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
+        // Keykeeper: a session an organization's single sign-on started goes on
+        // only while the account is still linked where single sign-on is on
+        // (unlinking, a tenant change, and turning it off end it).
+        AuthMethod::Sso if !crate::api::core::keykeeper_sso::sso_session_live(&user.uuid, conn).await => {
+            err!("Single sign-on no longer signs in this account. Sign in again.")
+        }
         // Keykeeper: someone an organization now requires to sign in with its
         // single sign-on signs in again, there.
         AuthMethod::Password

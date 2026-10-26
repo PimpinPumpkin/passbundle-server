@@ -411,6 +411,21 @@ pub async fn send_member_joined(
     send_email(address, &subject, body_html, body_text).await
 }
 
+/// Keykeeper: an account was linked to an organization's single sign-on, so
+/// a link nobody expected is seen (DESIGN.md, "Sign in with Microsoft Entra ID").
+pub async fn send_sso_linked(address: &str, org_name: &str, microsoft_email: Option<&str>) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/keykeeper_sso_linked",
+        json!({
+            "url": CONFIG.domain(),
+            "img_src": CONFIG._smtp_img_src(),
+            "org_name": org_name,
+            "microsoft_email": microsoft_email,
+        }),
+    )?;
+    send_email(address, &subject, body_html, body_text).await
+}
+
 pub async fn send_emergency_access_invite(
     address: &str,
     user_id: UserId,

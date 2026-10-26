@@ -450,9 +450,18 @@ table! {
         code_verifier -> Text,
         binding_hash -> Text,
         code_hash -> Nullable<Text>,
+        link_user_uuid -> Nullable<Text>,
         identity -> Nullable<Text>,
         error -> Nullable<Text>,
         created_at -> Timestamp,
         returned_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    keykeeper_sso_link_tickets (ticket_hash) {
+        ticket_hash -> Text,
+        user_uuid -> Text,
+        created_at -> Timestamp,
     }
 }

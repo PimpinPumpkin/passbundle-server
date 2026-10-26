@@ -14,9 +14,10 @@
 // - `oid` (the person's immutable object id) is there.
 //
 // People are identified by `tid` and `oid` only. The `email` claim is kept
-// as a suggestion for linking an account the first time, with Entra's
-// `xms_edov` (whether the email's domain owner is verified), never as an
-// identity. See DESIGN.md, "Sign in with Microsoft Entra ID".
+// as a suggestion for linking an invitation the first time, with Entra's
+// `xms_edov` (whether the email's domain owner is verified) and whether the
+// person is a guest (`acct`, `idp`), never as an identity. See DESIGN.md,
+// "Sign in with Microsoft Entra ID".
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, errors::ErrorKind};
 use serde::{Deserialize, Serialize};
@@ -83,11 +84,18 @@ pub struct Expected<'a> {
 pub struct Identity {
     pub tenant_id: String,
     pub object_id: String,
-    /// The email claim, lowercase. Mutable and unverified: only ever a
-    /// suggestion for which account to link the first time.
+    /// The email claim, lowercase, and only if it's plain ASCII (lowercasing
+    /// other characters can turn one into a letter, as U+212A becomes k).
+    /// Mutable and unverified: only ever a suggestion for which invitation to
+    /// link the first time.
     pub email: Option<String>,
-    /// Entra's `xms_edov`: the email's domain owner is verified.
-    pub email_vouched: bool,
+    /// Entra's `xms_edov` for that email: Some(true) when the email's domain
+    /// owner is verified, Some(false) when Entra says it isn't, None when the
+    /// claim wasn't sent.
+    pub email_edov: Option<bool>,
+    /// A guest in the tenant (`acct` 1, or an `idp` other than the issuer):
+    /// signed in somewhere else, so the tenant's domains don't vouch for them.
+    pub guest: bool,
     pub name: Option<String>,
 }
 
@@ -147,6 +155,8 @@ struct Claims {
     email: Option<String>,
     name: Option<String>,
     xms_edov: Option<Value>,
+    acct: Option<Value>,
+    idp: Option<String>,
 }
 
 /// Whether the token names exactly one audience, the app.
@@ -162,14 +172,27 @@ fn audience_is(aud: Option<&Value>, client_id: &str) -> bool {
     one.eq_ignore_ascii_case(client_id)
 }
 
-/// `xms_edov` as Entra sends it: a boolean, or "1"/"true".
-fn vouched(edov: Option<&Value>) -> bool {
-    match edov {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
-        Some(Value::Number(n)) => n.as_i64() == Some(1),
-        _ => false,
+/// `xms_edov` as Entra sends it: a boolean, or "1"/"true" and "0"/"false".
+/// Anything else counts as not sent.
+fn edov(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) if s == "1" || s.eq_ignore_ascii_case("true") => Some(true),
+        Value::String(s) if s == "0" || s.eq_ignore_ascii_case("false") => Some(false),
+        Value::Number(n) if n.as_i64() == Some(1) => Some(true),
+        Value::Number(n) if n.as_i64() == Some(0) => Some(false),
+        _ => None,
     }
+}
+
+/// `acct` 1 is a guest; so is anyone whose `idp` isn't the tenant's issuer.
+fn is_guest(acct: Option<&Value>, idp: Option<&str>, issuer: &str) -> bool {
+    let guest_acct = match acct {
+        Some(Value::Number(n)) => n.as_i64() == Some(1),
+        Some(Value::String(s)) => s == "1",
+        _ => false,
+    };
+    guest_acct || idp.is_some_and(|idp| idp != issuer)
 }
 
 /// Checks an ID token against the tenant's keys and this sign-in, and says
@@ -244,12 +267,17 @@ pub fn validate(id_token: &str, keys: &[Jwk], expected: &Expected<'_>) -> Result
         return Err(Refusal::NoObjectId);
     };
 
-    let email = claims.email.map(|e| e.trim().to_lowercase()).filter(|e| e.contains('@') && e.len() <= 254);
+    let email = claims
+        .email
+        .map(|e| e.trim().to_owned())
+        .filter(|e| e.is_ascii() && e.contains('@') && e.len() <= 254)
+        .map(|e| e.to_ascii_lowercase());
     Ok(Identity {
         tenant_id: expected.tenant_id.to_owned(),
         object_id,
-        email_vouched: email.is_some() && vouched(claims.xms_edov.as_ref()),
+        email_edov: email.as_ref().and(edov(claims.xms_edov.as_ref())),
         email,
+        guest: is_guest(claims.acct.as_ref(), claims.idp.as_deref(), expected.issuer),
         name: claims.name.map(|n| n.chars().take(50).collect()),
     })
 }
@@ -353,19 +381,27 @@ mod tests {
         assert_eq!(who.tenant_id, TENANT);
         assert_eq!(who.object_id, OID);
         assert_eq!(who.email.as_deref(), Some("ana@acmedental.com"));
-        assert!(!who.email_vouched, "no xms_edov, so the email isn't vouched for");
+        assert_eq!(who.email_edov, None, "no xms_edov");
+        assert!(!who.guest);
         assert_eq!(who.name.as_deref(), Some("Ana Lima"));
     }
 
     #[test]
-    fn the_email_is_vouched_only_by_xms_edov() {
-        for edov in [json!(true), json!("1"), json!("true"), json!(1)] {
-            let who = check(&with(|c| c["xms_edov"] = edov.clone())).unwrap();
-            assert!(who.email_vouched, "{edov}");
-        }
-        for edov in [json!(false), json!("0"), json!(null), json!("yes")] {
-            let who = check(&with(|c| c["xms_edov"] = edov.clone())).unwrap();
-            assert!(!who.email_vouched, "{edov}");
+    fn xms_edov_is_read_as_true_false_or_not_sent() {
+        for (value, read) in [
+            (json!(true), Some(true)),
+            (json!("1"), Some(true)),
+            (json!("true"), Some(true)),
+            (json!(1), Some(true)),
+            (json!(false), Some(false)),
+            (json!("0"), Some(false)),
+            (json!("False"), Some(false)),
+            (json!(0), Some(false)),
+            (json!(null), None),
+            (json!("yes"), None),
+        ] {
+            let who = check(&with(|c| c["xms_edov"] = value.clone())).unwrap();
+            assert_eq!(who.email_edov, read, "{value}");
         }
         // xms_edov without an email vouches for nothing.
         let who = check(&with(|c| {
@@ -374,7 +410,33 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(who.email, None);
-        assert!(!who.email_vouched);
+        assert_eq!(who.email_edov, None);
+    }
+
+    #[test]
+    fn guests_are_told_apart_by_acct_and_idp() {
+        assert!(check(&with(|c| c["acct"] = json!(1))).unwrap().guest);
+        assert!(check(&with(|c| c["acct"] = json!("1"))).unwrap().guest);
+        assert!(!check(&with(|c| c["acct"] = json!(0))).unwrap().guest);
+        assert!(check(&with(|c| c["idp"] = json!("live.com"))).unwrap().guest);
+        assert!(
+            check(&with(|c| c["idp"] = json!("https://sts.windows.net/99999999-8888-7777-6666-555555555555/")))
+                .unwrap()
+                .guest
+        );
+        // idp equal to the issuer is a member of the tenant.
+        assert!(!check(&with(|c| c["idp"] = json!(issuer(AUTHORITY, TENANT)))).unwrap().guest);
+    }
+
+    #[test]
+    fn only_plain_ascii_emails_are_kept() {
+        // U+212A (Kelvin sign) lowercases to k: never match an address by it.
+        let who = check(&with(|c| c["email"] = json!("\u{212A}im@acmedental.com"))).unwrap();
+        assert_eq!(who.email, None);
+        let who = check(&with(|c| c["email"] = json!("ana@acmedentál.com"))).unwrap();
+        assert_eq!(who.email, None);
+        let who = check(&with(|c| c["email"] = json!(" Kim@AcmeDental.com "))).unwrap();
+        assert_eq!(who.email.as_deref(), Some("kim@acmedental.com"));
     }
 
     #[test]
@@ -528,7 +590,7 @@ mod tests {
         let spoofed = check(&sign(&with_email("ceo@acmedental.com"))).unwrap();
         assert_eq!((real.tenant_id, real.object_id), (spoofed.tenant_id, spoofed.object_id));
         assert_eq!(spoofed.email.as_deref(), Some("ceo@acmedental.com"));
-        assert!(!spoofed.email_vouched);
+        assert_eq!(spoofed.email_edov, None);
     }
 
     #[test]

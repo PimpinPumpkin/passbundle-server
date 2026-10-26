@@ -1402,6 +1402,9 @@ struct AuthorizeData {
     #[allow(unused)]
     #[field(name = uncased("ssoToken"))]
     sso_token: Option<String>,
+    // Keykeeper: upstream's Link SSO passes a signed-in session's ticket.
+    #[field(name = uncased("user_identifier"))]
+    user_identifier: Option<String>,
 }
 
 // The `redirect_uri` will change depending of the client (web, android, ios ..)
@@ -1420,6 +1423,7 @@ async fn authorize(
         code_challenge,
         code_challenge_method,
         domain_hint,
+        user_identifier,
         ..
     } = data;
 
@@ -1432,8 +1436,9 @@ async fn authorize(
             code_challenge: code_challenge.to_string(),
             code_challenge_method,
             domain_hint,
+            user_identifier,
         };
-        return keykeeper_sso::authorize(a, cookies, secure.https, &ip.ip, &conn).await;
+        return keykeeper_sso::authorize(a, cookies, &ip.ip, &conn).await;
     }
 
     if code_challenge_method != "S256" {

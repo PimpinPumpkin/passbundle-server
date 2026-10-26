@@ -16,7 +16,9 @@ use crate::{
     api::EmptyResult,
     db::{
         DbConn,
-        keykeeper_schema::{keykeeper_sso, keykeeper_sso_auth, keykeeper_sso_domains, keykeeper_sso_links},
+        keykeeper_schema::{
+            keykeeper_sso, keykeeper_sso_auth, keykeeper_sso_domains, keykeeper_sso_link_tickets, keykeeper_sso_links,
+        },
     },
     error::MapResult,
 };
@@ -356,6 +358,17 @@ impl SsoLink {
         .await
     }
 
+    /// Every organization this account is linked in.
+    pub async fn find_all_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
+        conn.run(move |conn| {
+            keykeeper_sso_links::table
+                .filter(keykeeper_sso_links::user_uuid.eq(user_uuid))
+                .load::<Self>(conn)
+                .unwrap_or_default()
+        })
+        .await
+    }
+
     pub async fn find_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             keykeeper_sso_links::table
@@ -406,6 +419,74 @@ impl SsoLink {
     }
 }
 
+/// How long a signed-in session's ticket to link single sign-on lasts.
+pub const SSO_LINK_TICKET_MINUTES: i64 = 5;
+
+/// A signed-in session's ticket to link its own account to an organization's
+/// single sign-on (upstream's Link SSO): made by an authenticated request,
+/// used once at /identity/connect/authorize, kept only as a hash.
+#[derive(Identifiable, Queryable, Insertable, Clone)]
+#[diesel(table_name = keykeeper_sso_link_tickets)]
+#[diesel(primary_key(ticket_hash))]
+pub struct SsoLinkTicket {
+    pub ticket_hash: String,
+    pub user_uuid: UserId,
+    pub created_at: NaiveDateTime,
+}
+
+impl SsoLinkTicket {
+    /// A new ticket for this account: the ticket itself, and its row.
+    pub fn generate(user_uuid: UserId) -> (String, Self) {
+        let ticket = sso_random();
+        let row = Self {
+            ticket_hash: sso_hash(&ticket),
+            user_uuid,
+            created_at: Utc::now().naive_utc(),
+        };
+        (ticket, row)
+    }
+
+    pub async fn insert(&self, conn: &DbConn) -> EmptyResult {
+        conn.run(move |conn| {
+            // An account's older tickets, and everyone's expired ones, go.
+            let oldest = Utc::now().naive_utc() - TimeDelta::minutes(SSO_LINK_TICKET_MINUTES);
+            diesel::delete(
+                keykeeper_sso_link_tickets::table.filter(
+                    keykeeper_sso_link_tickets::user_uuid
+                        .eq(&self.user_uuid)
+                        .or(keykeeper_sso_link_tickets::created_at.lt(oldest)),
+                ),
+            )
+            .execute(conn)
+            .ok();
+            diesel::insert_into(keykeeper_sso_link_tickets::table)
+                .values(self)
+                .execute(conn)
+                .map_res("Error saving a link ticket")
+        })
+        .await
+    }
+
+    /// Uses a ticket: the account it's for, once, within its five minutes.
+    pub async fn take(ticket: &str, conn: &DbConn) -> Option<UserId> {
+        let hash = sso_hash(ticket);
+        let oldest = Utc::now().naive_utc() - TimeDelta::minutes(SSO_LINK_TICKET_MINUTES);
+        conn.run(move |conn| {
+            let row = keykeeper_sso_link_tickets::table
+                .filter(keykeeper_sso_link_tickets::ticket_hash.eq(&hash))
+                .first::<Self>(conn)
+                .ok()?;
+            let deleted = diesel::delete(
+                keykeeper_sso_link_tickets::table.filter(keykeeper_sso_link_tickets::ticket_hash.eq(&hash)),
+            )
+            .execute(conn)
+            .ok()?;
+            (deleted == 1 && row.created_at >= oldest).then_some(row.user_uuid)
+        })
+        .await
+    }
+}
+
 /// A sign-in in progress. See the migration for what each column holds.
 #[derive(Identifiable, Queryable, Insertable, Clone)]
 #[diesel(table_name = keykeeper_sso_auth)]
@@ -422,6 +503,8 @@ pub struct SsoAuthRow {
     pub code_verifier: String,
     pub binding_hash: String,
     pub code_hash: Option<String>,
+    /// Linking from a signed-in session: the account that asked.
+    pub link_user_uuid: Option<UserId>,
     pub identity: Option<String>,
     pub error: Option<String>,
     pub created_at: NaiveDateTime,

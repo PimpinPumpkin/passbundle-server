@@ -55,17 +55,28 @@ use crate::{
     db::{
         DbConn,
         models::{
-            CONSUMER_TENANT, Event, EventType, Membership, MembershipId, MembershipStatus, MembershipType, MspClient,
-            MspMembership, MspStaff, OrgPolicy, OrgPolicyType, Organization, OrganizationId, SsoAuthRow, SsoConfig,
-            SsoDomain, SsoLink, User, UserId, email_domain, normalize_domain, normalize_guid, normalize_identifier,
-            pkce_challenge, sso_hash, sso_random, txt_value,
+            CONSUMER_TENANT, Device, Event, EventType, Membership, MembershipId, MembershipStatus, MembershipType,
+            MspClient, MspMembership, MspStaff, OrgPolicy, OrgPolicyType, Organization, OrganizationId, SsoAuthRow,
+            SsoConfig, SsoDomain, SsoLink, SsoLinkTicket, User, UserId, email_domain, normalize_domain, normalize_guid,
+            normalize_identifier, pkce_challenge, sso_hash, sso_random, txt_value,
         },
     },
+    mail,
     util::format_date,
 };
 
 pub fn routes() -> Vec<Route> {
-    routes![get_sso, put_sso, add_domain, verify_domain, remove_domain, unlink]
+    routes![
+        get_sso,
+        put_sso,
+        add_domain,
+        verify_domain,
+        remove_domain,
+        unlink,
+        rotate_api_keys,
+        link_ticket,
+        unlink_self
+    ]
 }
 
 /// What this server asks Entra for: an ID token with the person's object id
@@ -164,6 +175,18 @@ async fn record_for_msp(
         audit = audit.detail(detail);
     }
     audit.record(&client.msp_uuid, conn).await
+}
+
+/// Ends these people's sessions on every device (their refresh tokens stop
+/// working), when the single sign-on that may have started them changes.
+async fn end_sessions(users: &[UserId], conn: &DbConn) -> EmptyResult {
+    let mut seen = std::collections::HashSet::new();
+    for user in users {
+        if seen.insert(user.clone()) {
+            Device::rotate_refresh_tokens_by_user(user, conn).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn policy_on(org_id: &OrganizationId, policy: OrgPolicyType, conn: &DbConn) -> bool {
@@ -299,14 +322,23 @@ async fn put_sso(org_id: OrganizationId, data: Json<SsoSettings>, headers: Heade
         }
     }
 
+    // Sessions that single sign-on started end when what vouched for them
+    // goes: the old tenant's people lose their links, and turning it off
+    // ends every linked person's sessions.
+    let mut ended = Vec::new();
     if old.as_ref().is_some_and(|c| c.tenant_id != tenant_id) {
         // Links name the old tenant's people, who can't sign in here anymore.
         for l in SsoLink::find_by_org(&org_id, &conn).await {
             if l.tenant_id != tenant_id {
                 SsoLink::delete(&org_id, &l.user_uuid, &conn).await?;
+                ended.push(l.user_uuid);
             }
         }
     }
+    if was_enabled && !data.enabled {
+        ended.extend(SsoLink::find_by_org(&org_id, &conn).await.into_iter().map(|l| l.user_uuid));
+    }
+    end_sessions(&ended, &conn).await?;
 
     config.enabled = data.enabled;
     config.identifier = identifier;
@@ -481,6 +513,8 @@ async fn unlink(org_id: OrganizationId, user_id: UserId, headers: Headers, conn:
         err_code!("Link not found", rocket::http::Status::NotFound.code)
     };
     SsoLink::delete(&org_id, &user_id, &conn).await?;
+    // Sessions it started end; they sign in again (and link again) from scratch.
+    end_sessions(std::slice::from_ref(&user_id), &conn).await?;
     let member = Membership::find_by_user_and_org(&user_id, &org_id, &conn).await.map(|m| m.uuid);
     log_sso_event(
         EventType::OrganizationUserUnlinkedSso,
@@ -504,6 +538,94 @@ async fn unlink(org_id: OrganizationId, user_id: UserId, headers: Headers, conn:
     Ok(Json(view(&org_id, &conn).await))
 }
 
+/// With "Require single sign-on" on, replaces the API keys of the members it
+/// covers: an API key signs in without single sign-on (the CLI's
+/// client_credentials, as upstream allows), so an admin can make the old
+/// keys stop working. Members get a new key from their account settings,
+/// after signing in with single sign-on.
+#[post("/keykeeper/organizations/<org_id>/sso/rotate-api-keys")]
+async fn rotate_api_keys(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+    require_admin(&org_id, &headers, &conn).await?;
+    if !policy_on(&org_id, OrgPolicyType::RequireSso, &conn).await {
+        err!("Turn on the Require single sign-on policy first.")
+    }
+    let mut replaced = 0;
+    for m in Membership::find_by_org(&org_id, &conn).await {
+        if m.status < MembershipStatus::Accepted as i32 || exempt_from_requirement(&m.user_uuid, &m, &conn).await {
+            continue;
+        }
+        if let Some(mut user) = User::find_by_uuid(&m.user_uuid, &conn).await
+            && user.api_key.is_some()
+        {
+            user.api_key = Some(crate::crypto::generate_api_key());
+            user.save(&conn).await?;
+            replaced += 1;
+        }
+    }
+    let detail = format!("{replaced} members' API keys replaced");
+    log_sso_event(
+        EventType::KeykeeperSsoSettingsChanged,
+        &org_id,
+        None,
+        Some(&headers.user.uuid),
+        Some(detail.clone()),
+        Some(headers.device.atype),
+        &headers.ip.ip,
+        &conn,
+    )
+    .await;
+    record_for_msp(&org_id, "sso_api_keys_replaced", Some(replaced.to_string()), &headers, &conn).await?;
+    let mut answer = view(&org_id, &conn).await;
+    answer["apiKeysReplaced"] = json!(replaced);
+    Ok(Json(answer))
+}
+
+/// Upstream's Link SSO, step one: a signed-in session asks for a ticket that
+/// names its account, and passes it to /identity/connect/authorize as
+/// `user_identifier`. Five minutes, once.
+#[get("/accounts/sso/user-identifier")]
+async fn link_ticket(headers: Headers, conn: DbConn) -> JsonResult {
+    crate::ratelimit::check_limit_prelogin(&headers.ip.ip)?;
+    let (ticket, row) = SsoLinkTicket::generate(headers.user.uuid.clone());
+    row.insert(&conn).await?;
+    Ok(Json(json!(ticket)))
+}
+
+/// Upstream's Unlink SSO: someone unlinks their own account from an
+/// organization's single sign-on. Its sessions end.
+#[delete("/accounts/sso/<org_id>")]
+async fn unlink_self(org_id: OrganizationId, headers: Headers, conn: DbConn) -> EmptyResult {
+    let Some(link) = SsoLink::find_by_user(&org_id, &headers.user.uuid, &conn).await else {
+        err_code!("Link not found", rocket::http::Status::NotFound.code)
+    };
+    SsoLink::delete(&org_id, &headers.user.uuid, &conn).await?;
+    let member = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await.map(|m| m.uuid);
+    log_sso_event(
+        EventType::OrganizationUserUnlinkedSso,
+        &org_id,
+        member.as_ref(),
+        Some(&headers.user.uuid),
+        Some(link.email),
+        Some(headers.device.atype),
+        &headers.ip.ip,
+        &conn,
+    )
+    .await;
+    User::update_uuid_revision(&headers.user.uuid, &conn).await;
+    // Other devices' sessions end; this one signs in again too.
+    end_sessions(std::slice::from_ref(&headers.user.uuid), &conn).await
+}
+
+/// For the apps: the organization's SSO identifier, when its single sign-on
+/// is on, and whether this account is linked to it. Upstream's apps offer
+/// Link SSO, or Unlink SSO, from these.
+pub async fn profile_fields(org_id: &OrganizationId, user_id: &UserId, conn: &DbConn) -> (Option<String>, bool) {
+    match SsoConfig::find(org_id, conn).await.filter(SsoConfig::ready) {
+        Some(config) => (Some(config.identifier), SsoLink::find_by_user(org_id, user_id, conn).await.is_some()),
+        None => (None, false),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What the rest of the server asks.
 
@@ -516,13 +638,10 @@ pub async fn verified_for_email(email: &str, conn: &DbConn) -> Value {
     if let Some(domain) = email_domain(email)
         && let Some(d) = SsoDomain::find_verified(&domain, conn).await
         && let Some(config) = SsoConfig::find(&d.org_uuid, conn).await.filter(SsoConfig::ready)
-        && let Some(org) = Organization::find_by_uuid(&d.org_uuid, conn).await
     {
-        data.push(json!({
-            "organizationIdentifier": config.identifier,
-            "organizationName": org.name,
-            "domainName": domain,
-        }));
+        // Only the identifier, which is all the web vault uses: anyone can ask,
+        // so the answer doesn't name the organization.
+        data.push(json!({ "organizationIdentifier": config.identifier }));
     }
     json!({ "object": "list", "data": data, "continuationToken": null })
 }
@@ -536,7 +655,8 @@ pub async fn org_for_identifier(identifier: &str, conn: &DbConn) -> Option<Organ
 
 /// Whether someone is on an MSP's staff, or in any organization through an
 /// MSP. Their account reaches every client they work in, so no client's
-/// single sign-on signs them in, and none requires it of them.
+/// single sign-on signs them in. Fails closed: a database error counts as
+/// staff (MspStaff::is_staff_anywhere).
 async fn msp_person(user_id: &UserId, memberships: &[Membership], conn: &DbConn) -> bool {
     if MspStaff::is_staff_anywhere(user_id, conn).await {
         return true;
@@ -549,28 +669,63 @@ async fn msp_person(user_id: &UserId, memberships: &[Membership], conn: &DbConn)
     false
 }
 
-/// The SSO identifier of an organization that requires this person to sign
-/// in with its single sign-on, if one does: "Require single sign-on" is on,
-/// its single sign-on is on, and they've joined it (accepted or confirmed)
-/// as anything but an owner. An MSP's staff are never required. The password
-/// login answers with it, and the apps take the person to that sign-in.
-pub async fn required_identifier(user_id: &UserId, conn: &DbConn) -> Option<String> {
-    let memberships = Membership::find_by_user(user_id, conn).await;
-    if msp_person(user_id, &memberships, conn).await {
-        return None;
+/// Whether "Require single sign-on" leaves this membership alone: an owner,
+/// a membership that came through an MSP, or staff of the MSP that manages
+/// this organization. Decided per organization, so joining some other MSP's
+/// staff (or making one) never gets anyone out of it.
+async fn exempt_from_requirement(user_id: &UserId, member: &Membership, conn: &DbConn) -> bool {
+    if member.atype == MembershipType::Owner as i32 {
+        return true;
     }
-    for m in memberships {
-        if m.status < MembershipStatus::Accepted as i32 || m.atype == MembershipType::Owner as i32 {
+    if MspMembership::find_by_membership(&member.uuid, conn).await.is_some() {
+        return true;
+    }
+    match MspClient::find_by_org(&member.org_uuid, conn).await {
+        Some(client) => MspStaff::find(&client.msp_uuid, user_id, conn).await.is_some(),
+        None => false,
+    }
+}
+
+/// The organizations that require this person to sign in with their single
+/// sign-on, with each one's SSO identifier: "Require single sign-on" is on,
+/// its single sign-on is on, and they've joined it (accepted or confirmed)
+/// and aren't exempt there.
+pub async fn required_orgs(user_id: &UserId, conn: &DbConn) -> Vec<(OrganizationId, String)> {
+    let mut required = Vec::new();
+    for m in Membership::find_by_user(user_id, conn).await {
+        if m.status < MembershipStatus::Accepted as i32 {
             continue;
         }
         if !policy_on(&m.org_uuid, OrgPolicyType::RequireSso, conn).await {
             continue;
         }
+        if exempt_from_requirement(user_id, &m, conn).await {
+            continue;
+        }
         if let Some(config) = SsoConfig::find(&m.org_uuid, conn).await.filter(SsoConfig::ready) {
-            return Some(config.identifier);
+            required.push((m.org_uuid, config.identifier));
         }
     }
-    None
+    required
+}
+
+/// The SSO identifier of an organization that requires this person to sign
+/// in with its single sign-on, if one does (`required_orgs`). The password
+/// login answers with it, and the apps take the person to that sign-in.
+pub async fn required_identifier(user_id: &UserId, conn: &DbConn) -> Option<String> {
+    required_orgs(user_id, conn).await.into_iter().next().map(|(_, identifier)| identifier)
+}
+
+/// Whether a session single sign-on started may go on: the account is still
+/// linked in an organization whose single sign-on is on. Checked at every
+/// refresh.
+pub async fn sso_session_live(user_id: &UserId, conn: &DbConn) -> bool {
+    for link in SsoLink::find_all_by_user(user_id, conn).await {
+        if SsoConfig::find(&link.org_uuid, conn).await.is_some_and(|c| c.ready() && c.tenant_id == link.tenant_id) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The checks for "Require single sign-on" and what it depends on, run
@@ -616,6 +771,9 @@ pub struct Authorize {
     pub code_challenge: String,
     pub code_challenge_method: String,
     pub domain_hint: Option<String>,
+    /// Upstream's Link SSO: a signed-in session's link ticket
+    /// (`/api/accounts/sso/user-identifier`).
+    pub user_identifier: Option<String>,
 }
 
 const BINDING_COOKIE: &str = "PB_SSO_BINDING";
@@ -631,13 +789,7 @@ fn looks_like_challenge(challenge: &str) -> bool {
 
 /// Starts a sign-in: checks what the app sent, remembers it, and sends the
 /// browser to the organization's tenant.
-pub async fn authorize(
-    a: Authorize,
-    cookies: &CookieJar<'_>,
-    https: bool,
-    ip: &IpAddr,
-    conn: &DbConn,
-) -> ApiResult<Redirect> {
+pub async fn authorize(a: Authorize, cookies: &CookieJar<'_>, ip: &IpAddr, conn: &DbConn) -> ApiResult<Redirect> {
     // Each start keeps a row for ten minutes, so starts are limited per
     // address, with the allowance pre-login gets.
     crate::ratelimit::check_limit_prelogin(ip)?;
@@ -664,6 +816,14 @@ pub async fn authorize(
     let Some(config) = SsoConfig::find_by_identifier(&identifier, conn).await.filter(SsoConfig::ready) else {
         err!("No organization uses that SSO identifier, or its single sign-on is turned off.")
     };
+    // Linking from a signed-in session: the ticket names the account, once.
+    let link_user_uuid = match a.user_identifier.as_deref().filter(|t| !t.is_empty()) {
+        Some(ticket) => match SsoLinkTicket::take(ticket, conn).await {
+            Some(user) if a.client_id == "web" => Some(user),
+            _ => err!("This request to link single sign-on expired. Choose Link SSO again."),
+        },
+        None => None,
+    };
     let provider = match entra::provider(&config.tenant_id).await {
         Ok(p) => p,
         Err(e) => err!(format!("Microsoft sign-in isn't available for this organization right now: {e}.")),
@@ -681,6 +841,7 @@ pub async fn authorize(
         code_verifier: verifier.clone(),
         binding_hash: sso_hash(&binding),
         code_hash: None,
+        link_user_uuid,
         identity: None,
         error: None,
         created_at: Utc::now().naive_utc(),
@@ -713,7 +874,8 @@ pub async fn authorize(
             // Lax: Microsoft's answer is a top-level navigation from another site.
             .same_site(SameSite::Lax)
             .http_only(true)
-            .secure(https)
+            // From the server's own address, never a request header.
+            .secure(CONFIG.domain().starts_with("https://"))
             .build(),
     );
     Ok(Redirect::temporary(String::from(url)))
@@ -813,9 +975,21 @@ pub async fn callback(
     };
     let our_code = sso_random();
     match outcome {
+        // Linking from a signed-in session finishes here: the app is already
+        // signed in, and goes back to where it was.
+        Ok(identity) if row.link_user_uuid.is_some() => {
+            link_session(&row, &identity, ip, conn).await?;
+            row.delete(conn).await?;
+        }
         Ok(identity) => {
             let identity = serde_json::to_string(&identity)?;
             row.finish(&our_code, Some(identity), None, conn).await?;
+        }
+        Err((message, detail)) if row.link_user_uuid.is_some() => {
+            log_sso_event(EventType::KeykeeperSsoRefused, &row.org_uuid, None, None, Some(detail), None, ip, conn)
+                .await;
+            row.delete(conn).await?;
+            err!(message)
         }
         Err((message, detail)) => {
             log_sso_event(EventType::KeykeeperSsoRefused, &row.org_uuid, None, None, Some(detail), None, ip, conn)
@@ -828,6 +1002,94 @@ pub async fn callback(
     };
     url.query_pairs_mut().append_pair("code", &our_code).append_pair("state", &row.client_state);
     Ok(Redirect::temporary(String::from(url)))
+}
+
+/// Links the signed-in session's account to the Microsoft account that just
+/// signed in (upstream's Link SSO), under the rules in link.rs, then tells
+/// the account by email and logs it.
+async fn link_session(row: &SsoAuthRow, identity: &Identity, ip: &IpAddr, conn: &DbConn) -> EmptyResult {
+    let (Some(user_id), Some(org)) =
+        (row.link_user_uuid.as_ref(), Organization::find_by_uuid(&row.org_uuid, conn).await)
+    else {
+        err!("This request to link single sign-on expired. Choose Link SSO again.")
+    };
+    let Some(user) = User::find_by_uuid(user_id, conn).await else {
+        err!("This account no longer exists.")
+    };
+    let account = candidate(user, &org.uuid, identity, conn).await;
+    let facts = link::SessionFacts {
+        microsoft_account_linked_to: SsoLink::find(&org.uuid, &identity.tenant_id, &identity.object_id, conn)
+            .await
+            .map(|l| l.user_uuid),
+        account,
+    };
+    let member = facts.account.membership.as_ref().map(|(id, _)| id.clone());
+    match link::decide_session(&facts) {
+        Decision::SignIn(_) => Ok(()),
+        Decision::Link(user_id) => {
+            let Some(user) = User::find_by_uuid(&user_id, conn).await else {
+                err!("This account no longer exists.")
+            };
+            make_link(&org, identity, &user, member.as_ref(), None, ip, conn).await
+        }
+        Decision::Refuse(refusal) => {
+            log_sso_event(
+                EventType::KeykeeperSsoRefused,
+                &org.uuid,
+                member.as_ref(),
+                Some(user_id),
+                Some(refusal.detail()),
+                None,
+                ip,
+                conn,
+            )
+            .await;
+            err!(refusal.message(&org.name))
+        }
+    }
+}
+
+/// Makes a link and says so: the organization's event log (the person's
+/// first single sign-on), and an email to the account, so a link nobody
+/// expected is seen.
+async fn make_link(
+    org: &Organization,
+    identity: &Identity,
+    user: &User,
+    member: Option<&MembershipId>,
+    device_type: Option<i32>,
+    ip: &IpAddr,
+    conn: &DbConn,
+) -> EmptyResult {
+    let link = SsoLink::new(
+        org.uuid.clone(),
+        identity.tenant_id.clone(),
+        identity.object_id.clone(),
+        user.uuid.clone(),
+        identity.email.clone().unwrap_or_else(|| user.email.clone()),
+    );
+    if !link.insert(conn).await {
+        err!("This account or Microsoft account was just linked to another. Ask your administrator.")
+    }
+    // The apps learn of the link (Link SSO becomes Unlink SSO) at their next sync.
+    User::update_uuid_revision(&user.uuid, conn).await;
+    log_sso_event(
+        EventType::OrganizationUserFirstSsoLogin,
+        &org.uuid,
+        member,
+        Some(&user.uuid),
+        identity.email.clone(),
+        device_type,
+        ip,
+        conn,
+    )
+    .await;
+    if CONFIG.mail_enabled()
+        && let Err(e) = mail::send_sso_linked(&user.email, &org.name, identity.email.as_deref()).await
+    {
+        error!("Error sending the single sign-on link email: {e:#?}");
+    }
+    Ok(())
 }
 
 /// What the decision needs to know about one account.
@@ -878,7 +1140,8 @@ async fn load_facts(org_id: &OrganizationId, identity: &Identity, conn: &DbConn)
     Facts {
         linked,
         email: identity.email.clone(),
-        email_vouched: identity.email_vouched,
+        email_edov: identity.email_edov,
+        guest: identity.guest,
         email_domain_verified,
         by_email,
     }
@@ -962,6 +1225,26 @@ pub async fn redeem_code(
         err!("This account no longer exists.")
     };
     let member = Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await.map(|m| m.uuid);
+    // Another organization that requires its own single sign-on of this
+    // person isn't satisfied by this one's.
+    let required = required_orgs(&user.uuid, conn).await;
+    if !required.is_empty() && !required.iter().any(|(id, _)| id == &org.uuid) {
+        let (other, _) = &required[0];
+        let other = Organization::find_by_uuid(other, conn).await.map(|o| o.name).unwrap_or_default();
+        log_sso_event(
+            EventType::KeykeeperSsoRefused,
+            &org.uuid,
+            member.as_ref(),
+            Some(&user.uuid),
+            Some(format!("{} must sign in with {other}'s single sign-on", user.email)),
+            None,
+            ip,
+            conn,
+        )
+        .await;
+        row.delete(conn).await?;
+        err!(format!("{other} requires you to sign in with its own single sign-on. Use that instead."))
+    }
     Ok((
         SsoLogin {
             row,
@@ -986,27 +1269,10 @@ pub async fn finish_login(login: &SsoLogin, user: &User, device_type: i32, ip: &
     } = login;
     row.delete(conn).await?;
     if *new_link {
-        let link = SsoLink::new(
-            org_id.clone(),
-            identity.tenant_id.clone(),
-            identity.object_id.clone(),
-            user.uuid.clone(),
-            identity.email.clone().unwrap_or_else(|| user.email.clone()),
-        );
-        if !link.insert(conn).await {
-            err!("This account was just linked to another Microsoft account. Ask your administrator.")
-        }
-        log_sso_event(
-            EventType::OrganizationUserFirstSsoLogin,
-            org_id,
-            member.as_ref(),
-            Some(&user.uuid),
-            identity.email.clone(),
-            Some(device_type),
-            ip,
-            conn,
-        )
-        .await;
+        let Some(org) = Organization::find_by_uuid(org_id, conn).await else {
+            err!("Organization not found")
+        };
+        make_link(&org, identity, user, member.as_ref(), Some(device_type), ip, conn).await?;
     } else if let Some(link) = SsoLink::find(org_id, &identity.tenant_id, &identity.object_id, conn).await {
         link.touch(conn).await?;
     }

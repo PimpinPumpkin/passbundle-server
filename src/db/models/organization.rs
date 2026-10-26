@@ -438,6 +438,11 @@ impl Organization {
 impl Membership {
     pub async fn to_json(&self, conn: &DbConn) -> Value {
         let org = Organization::find_by_uuid(&self.org_uuid, conn).await.unwrap();
+        // Keykeeper: the organization's SSO identifier when its single sign-on
+        // is on, and whether this account is linked to it, for upstream's Link
+        // SSO and Unlink SSO.
+        let (sso_identifier, sso_bound) =
+            crate::api::core::keykeeper_sso::profile_fields(&self.org_uuid, &self.user_uuid, conn).await;
 
         // HACK: Convert the manager type to a custom type
         // It will be converted back on other locations
@@ -468,7 +473,7 @@ impl Membership {
         // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/ProfileOrganizationResponseModel.cs
         json!({
             "id": self.org_uuid,
-            "identifier": null, // Not supported
+            "identifier": sso_identifier,
             "name": org.name,
             "seats": 20, // hardcoded maxEmailsCount in the web-vault
             "maxCollections": null,
@@ -485,7 +490,7 @@ impl Membership {
             "hasPublicAndPrivateKeys": org.private_key.is_some() && org.public_key.is_some(),
             "resetPasswordEnrolled": self.reset_password_key.is_some(),
             "useResetPassword": CONFIG.mail_enabled(),
-            "ssoBound": false, // Not supported
+            "ssoBound": sso_bound,
             "useSso": true, // Keykeeper: every organization can set up single sign-on (keykeeper_sso)
             "useKeyConnector": false,
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)

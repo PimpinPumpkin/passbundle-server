@@ -1788,6 +1788,7 @@ where
     // Keykeeper
     reg!("email/keykeeper_msp_invite", ".html");
     reg!("email/keykeeper_member_joined", ".html");
+    reg!("email/keykeeper_sso_linked", ".html");
     reg!("email/send_single_org_removed_from_org", ".html");
     reg!("email/smtp_test", ".html");
     reg!("email/sso_change_email", ".html");
