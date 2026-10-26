@@ -399,6 +399,50 @@ table! {
 }
 
 table! {
+    event_destinations (uuid) {
+        uuid -> Text,
+        org_uuid -> Nullable<Text>,
+        msp_uuid -> Nullable<Text>,
+        name -> Text,
+        kind -> Text,
+        settings -> Text,
+        secrets -> Text,
+        shown_target -> Text,
+        enabled -> Bool,
+        paused_reason -> Nullable<Text>,
+        failures -> Integer,
+        failing_since -> Nullable<Timestamp>,
+        last_success_at -> Nullable<Timestamp>,
+        last_error -> Nullable<Text>,
+        last_error_at -> Nullable<Timestamp>,
+        dropped -> Integer,
+        lease_until -> Nullable<Timestamp>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+        retry_at -> Nullable<Timestamp>,
+        notified_at -> Nullable<Timestamp>,
+        queued -> Integer,
+        created_by -> Nullable<Text>,
+        slow_count -> Integer,
+        next_due_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    event_deliveries (destination_uuid, event_uuid) {
+        destination_uuid -> Text,
+        event_uuid -> Text,
+        payload -> Text,
+        created_at -> Timestamp,
+        attempts -> Integer,
+        next_attempt_at -> Timestamp,
+        priority -> Integer,
+        merge_key -> Nullable<Text>,
+        source -> Nullable<Text>,
+    }
+}
+
+table! {
     keykeeper_sso (org_uuid) {
         org_uuid -> Text,
         enabled -> Bool,

@@ -951,10 +951,18 @@ impl MspEvent {
     }
 
     pub async fn insert(&self, conn: &DbConn) -> EmptyResult {
-        conn.run(move |conn| {
-            diesel::insert_into(msp_events::table).values(self).execute(conn).map_res("Error recording an MSP event")
-        })
-        .await
+        let inserted: EmptyResult = conn
+            .run(move |conn| {
+                diesel::insert_into(msp_events::table)
+                    .values(self)
+                    .execute(conn)
+                    .map_res("Error recording an MSP event")
+            })
+            .await;
+        inserted?;
+        // And to the MSP's security tools, if it sends its events to any.
+        super::keykeeper_event_streaming::stream_msp(self, conn).await;
+        Ok(())
     }
 
     /// The newest events first, older than `before` if given. With `only`,

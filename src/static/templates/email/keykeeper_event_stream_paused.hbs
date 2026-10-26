@@ -1,0 +1,10 @@
+Events from {{{scope_name}}} stopped going to {{{destination_name}}}
+<!---------------->
+PassBundle stopped sending {{{scope_name}}}'s events to {{{destination_name}}}:
+
+{{{reason}}}
+
+It was turned off because sending to it failed. A destination that's only slow is never turned off: it's sent to less often until it's faster.
+
+The events since then are waiting (up to 10,000). Fix the destination, then turn it back on to send them: {{{url}}}
+{{> email/email_footer_text }}

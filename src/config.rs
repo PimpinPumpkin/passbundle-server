@@ -633,6 +633,18 @@ make_config! {
         org_creation_users:     String, true,   def,    String::new();
         /// Allow creating MSPs |> PassBundle: whether users can create an MSP, which manages client organizations. Off by default on self-hosted servers.
         msp_signups_allowed:    bool,   true,   def,    false;
+        /// Private networks events may go to |> PassBundle: private networks, addresses, or host names that organizations may send their events to, separated by commas, each with an optional port, for a self-hosted server whose security tools share its network: 10.0.0.0/8, 192.168.1.20:6514, [fd00::5]:443, siem.corp.example:443. Loopback only when a loopback address or network is listed itself (127.0.0.1). Link-local addresses and cloud metadata services are refused anyway. Empty: public addresses only.
+        event_streaming_allowed_networks: String, true, def, String::new();
+        /// Microsoft Entra sign-in for Sentinel |> PassBundle: where Sentinel destinations get their tokens, set only in the environment. https://login.microsoftonline.us for Azure Government, https://login.chinacloudapi.cn for Azure in China.
+        event_streaming_azure_login_url: String, false, def, "https://login.microsoftonline.com".to_owned();
+        /// Token scope for Sentinel |> PassBundle: set only in the environment. https://monitor.azure.us//.default for Azure Government, https://monitor.azure.cn//.default for Azure in China.
+        event_streaming_azure_scope: String, false, def, "https://monitor.azure.com//.default".to_owned();
+        /// Ingestion domain for Sentinel |> PassBundle: a Sentinel destination's endpoint must end with this, set only in the environment. .ingest.monitor.azure.us for Azure Government, .ingest.monitor.azure.cn for Azure in China.
+        event_streaming_azure_ingest_suffix: String, false, def, ".ingest.monitor.azure.com".to_owned();
+        /// Sentinel test stand-in |> PassBundle: for tests only. Lets the three settings above name any https host, and EVENT_STREAMING_AZURE_CA_FILE be used. Leave it off.
+        event_streaming_azure_test: bool, false, def, false;
+        /// Certificate authorities for Sentinel |> PassBundle: for tests only, with EVENT_STREAMING_AZURE_TEST: a PEM file whose certificate authorities Sentinel's sign-in and uploads trust instead of the system's. Leave it unset.
+        event_streaming_azure_ca_file: String, false, option;
         /// Allow invitations |> Controls whether users can be invited by organization admins, even when signups are otherwise disabled
         invitations_allowed:    bool,   true,   def,    true;
         /// Invitation token expiration time (in hours) |> The number of hours after which an organization invite token, emergency access invite token,
@@ -956,7 +968,72 @@ make_config! {
     },
 }
 
+/// Keykeeper: Microsoft's clouds, for Sentinel: sign-in hosts, and the
+/// monitoring domains that scopes and ingestion endpoints are under.
+const AZURE_LOGIN_HOSTS: [&str; 4] = [
+    "login.microsoftonline.com",
+    "login.microsoftonline.us",
+    "login.chinacloudapi.cn",
+    "login.partner.microsoftonline.cn",
+];
+const AZURE_MONITOR_DOMAINS: [&str; 3] = ["monitor.azure.com", "monitor.azure.us", "monitor.azure.cn"];
+
+fn check_azure(cfg: &ConfigItems) -> Result<(), String> {
+    let test = cfg.event_streaming_azure_test;
+    if cfg.event_streaming_azure_ca_file.is_some() && !test {
+        return Err(
+            "`EVENT_STREAMING_AZURE_CA_FILE` is only for tests: set `EVENT_STREAMING_AZURE_TEST` too, or unset it"
+                .into(),
+        );
+    }
+    let https_host = |name: &str, value: &str| -> Result<String, String> {
+        match Url::parse(value) {
+            Ok(u) if u.scheme() == "https" && u.host_str().is_some() => Ok(u.host_str().unwrap_or_default().to_owned()),
+            _ => Err(format!("`{name}` must be an https URL")),
+        }
+    };
+    let login = https_host("EVENT_STREAMING_AZURE_LOGIN_URL", &cfg.event_streaming_azure_login_url)?;
+    let scope = https_host("EVENT_STREAMING_AZURE_SCOPE", &cfg.event_streaming_azure_scope)?;
+    let suffix = cfg.event_streaming_azure_ingest_suffix.trim_start_matches('.');
+    if suffix.is_empty() || !suffix.contains('.') {
+        return Err("`EVENT_STREAMING_AZURE_INGEST_SUFFIX` must be a domain, like .ingest.monitor.azure.com".into());
+    }
+    if test {
+        return Ok(());
+    }
+    if !AZURE_LOGIN_HOSTS.contains(&login.as_str()) {
+        return Err(format!(
+            "`EVENT_STREAMING_AZURE_LOGIN_URL` must be Microsoft Entra's sign-in, one of: {}",
+            AZURE_LOGIN_HOSTS.map(|h| format!("https://{h}")).join(", ")
+        ));
+    }
+    if !AZURE_MONITOR_DOMAINS.contains(&scope.as_str()) {
+        return Err(format!(
+            "`EVENT_STREAMING_AZURE_SCOPE` must be Azure Monitor's, like https://monitor.azure.com//.default (on {})",
+            AZURE_MONITOR_DOMAINS.join(", ")
+        ));
+    }
+    if !AZURE_MONITOR_DOMAINS.iter().any(|d| suffix.ends_with(&format!(".{d}"))) {
+        return Err(format!(
+            "`EVENT_STREAMING_AZURE_INGEST_SUFFIX` must be under Azure Monitor's domain ({})",
+            AZURE_MONITOR_DOMAINS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
+    // Keykeeper: event streaming's private networks.
+    if let Err(e) = crate::keykeeper_streaming::guard::Policy::parse(&cfg.event_streaming_allowed_networks) {
+        err!(format!("`EVENT_STREAMING_ALLOWED_NETWORKS` is invalid: {e}"))
+    }
+    // Keykeeper: Sentinel's sign-in, scope, and ingestion domain are
+    // Microsoft's (a public or national cloud), over https, unless a test
+    // stand-in is allowed; only a stand-in has its own certificate authority.
+    if let Err(e) = check_azure(cfg) {
+        err!(e)
+    }
+
     // Validate connection URL is valid and DB feature is enabled
     #[cfg(sqlite)]
     {
@@ -1788,6 +1865,7 @@ where
     // Keykeeper
     reg!("email/keykeeper_msp_invite", ".html");
     reg!("email/keykeeper_member_joined", ".html");
+    reg!("email/keykeeper_event_stream_paused", ".html");
     reg!("email/keykeeper_sso_linked", ".html");
     reg!("email/send_single_org_removed_from_org", ".html");
     reg!("email/smtp_test", ".html");

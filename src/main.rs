@@ -56,6 +56,7 @@ mod crypto;
 #[macro_use]
 mod db;
 mod http_client;
+mod keykeeper_streaming;
 mod mail;
 mod ratelimit;
 mod sso;
@@ -89,6 +90,8 @@ async fn main() -> Result<(), Error> {
 
     let pool = create_db_pool().await;
     schedule_jobs(pool.clone());
+    // Keykeeper: sends queued events to organizations' security tools.
+    keykeeper_streaming::start(pool.clone());
     db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().await.unwrap()).await.unwrap();
     db::models::TwoFactor::migrate_credential_to_passkey(&pool.get().await.unwrap()).await.unwrap();
 

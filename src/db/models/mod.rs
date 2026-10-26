@@ -11,6 +11,7 @@ mod folder;
 mod group;
 // Keykeeper
 mod keykeeper_cipher_versions;
+mod keykeeper_event_streaming;
 pub mod keykeeper_folder_permissions;
 mod keykeeper_joining;
 mod keykeeper_msp;
@@ -44,6 +45,11 @@ pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
 pub use self::keykeeper_cipher_versions::{
     CipherVersion, History, ItemSave, MAX_ITEM_BYTES, MAX_PASSWORD_HISTORY, encrypted_size,
+};
+pub use self::keykeeper_event_streaming::{
+    Added as DestinationAdded, EventDelivery, EventDestination, Kind as EventKind, MAX_DESTINATIONS,
+    MAX_SCOPES_PER_PERSON, Secrets as EventSecrets, Settings as EventSettings, WAKE, describe as describe_event,
+    destination_target, save_with_extras,
 };
 pub use self::keykeeper_joining::{
     INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, confirms_automatically, effective_joining,
