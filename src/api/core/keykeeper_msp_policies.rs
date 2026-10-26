@@ -117,6 +117,8 @@ fn business_policies() -> Vec<(OrgPolicyType, Value)> {
         ),
         // Vault lock: vaults lock when the computer locks or sleeps, then
         // wait as each person chooses (docs/core.md, "Locking by policy").
+        // The web vault, which can't see the computer lock, locks after 15
+        // minutes without use instead, the default when webMinutes is missing.
         (OrgPolicyType::MaximumVaultTimeout, json!({ "type": "onSystemLock", "minutes": null, "action": "lock" })),
     ]
 }
