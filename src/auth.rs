@@ -103,8 +103,11 @@ pub async fn initialize_keys() -> Result<(), Error> {
     }
 
     // Keykeeper: the key for event destinations' secrets at rest, derived the
-    // same way, from the key's DER so another PEM form of it gives the same key.
-    crate::keykeeper_streaming::secrets::init(&zeroize::Zeroizing::new(priv_key.private_key_to_der()?));
+    // same way, from the key's DER so another PEM form of it gives the same key,
+    // and another for single sign-on's client secrets.
+    let priv_key_der = zeroize::Zeroizing::new(priv_key.private_key_to_der()?);
+    crate::keykeeper_streaming::secrets::init(&priv_key_der);
+    crate::api::core::keykeeper_sso::secret::init(&priv_key_der);
 
     // Derived from the RSA key, so it stays the same across restarts without storing another secret
     let prelogin_kdf_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &priv_key_buffer), b"prelogin-kdf");

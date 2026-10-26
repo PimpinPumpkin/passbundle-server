@@ -29,6 +29,7 @@
 pub mod dns;
 mod entra;
 pub mod link;
+pub mod secret;
 pub mod token;
 
 use std::net::IpAddr;
@@ -96,31 +97,6 @@ fn connector_uri() -> String {
 
 /// The most email domains one organization may add.
 const MAX_DOMAINS: usize = 20;
-
-/// The client secret at rest.
-///
-/// Keykeeper: until the event-streaming change (server PR #36) lands its
-/// sealed-secrets module, the secret is kept as it was typed, behind these two
-/// functions, which are the only place it's read or written. When #36 merges,
-/// they call that module (bound to the organization), and nothing else
-/// changes. This branch must not merge before then. See DESIGN.md, "Sign in
-/// with Microsoft Entra ID", "The client secret".
-mod secret {
-    use crate::db::models::OrganizationId;
-
-    const PLAIN: &str = "unsealed.";
-
-    pub fn seal(_org: &OrganizationId, secret: &str) -> Result<String, String> {
-        Ok(format!("{PLAIN}{secret}"))
-    }
-
-    pub fn open(_org: &OrganizationId, stored: &str) -> Result<String, String> {
-        stored
-            .strip_prefix(PLAIN)
-            .map(str::to_owned)
-            .ok_or_else(|| "This server can't read the app's client secret. Enter it again.".to_owned())
-    }
-}
 
 /// Owners and admins of the organization, and an MSP's admins in its clients
 /// (never other MSP staff), as for provisioning. Anyone else gets "not
@@ -230,6 +206,9 @@ async fn view(org_id: &OrganizationId, conn: &DbConn) -> Value {
         "tenantId": config.as_ref().map(|c| c.tenant_id.clone()),
         "clientId": config.as_ref().map(|c| c.client_id.clone()),
         "secretSavedAt": config.as_ref().and_then(|c| c.secret_set_at.as_ref().map(format_date)),
+        // False when the server's keys changed since it was saved, so sign-ins
+        // fail until an admin enters it again (secret.rs).
+        "secretReadable": config.as_ref().and_then(|c| c.client_secret.as_deref()).map(|s| secret::open(org_id, s).is_ok()),
         "updatedBy": config.as_ref().map(|c| c.updated_by.clone()),
         "updatedAt": config.as_ref().map(|c| format_date(&c.updated_at)),
         "callbackUrl": callback_uri(),
@@ -1306,13 +1285,5 @@ mod tests {
         for bad in ["", "short", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c=", &"a".repeat(44)] {
             assert!(!looks_like_challenge(bad), "{bad}");
         }
-    }
-
-    #[test]
-    fn the_secret_shim_round_trips_and_refuses_anything_else() {
-        let org = OrganizationId::from("org".to_owned());
-        let sealed = secret::seal(&org, "s3cr3t~value").unwrap();
-        assert_eq!(secret::open(&org, &sealed).unwrap(), "s3cr3t~value");
-        assert!(secret::open(&org, "s3cr3t~value").is_err());
     }
 }

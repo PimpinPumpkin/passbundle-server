@@ -33,7 +33,15 @@ const LABEL: &[u8] = b"passbundle event streaming secrets v1";
 /// The key for the secrets: HMAC-SHA256 keyed with the server's private
 /// RSA key, DER-encoded (PKCS#1), over a fixed label.
 pub fn derive_key(rsa_private_der: &[u8]) -> Zeroizing<[u8; 32]> {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, rsa_private_der), LABEL);
+    derive_key_for(LABEL, rsa_private_der)
+}
+
+/// `derive_key` over another feature's label. Each feature that keeps its
+/// secrets with this module has a label of its own, so a key of its own, and
+/// what one seals can't be opened as another's: single sign-on's client
+/// secrets (keykeeper_sso::secret) use it.
+pub fn derive_key_for(label: &[u8], rsa_private_der: &[u8]) -> Zeroizing<[u8; 32]> {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, rsa_private_der), label);
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(tag.as_ref());
     key
