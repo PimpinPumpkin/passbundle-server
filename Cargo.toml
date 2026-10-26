@@ -126,6 +126,10 @@ libsqlite3-sys = { version = "0.38.2", optional = true }
 rand = "0.10.3"
 ring = "0.17.14"
 rustls = { version = "0.23.45", features = ["ring", "std"], default-features = false }
+# Keykeeper: syslog over TLS for event streaming, with the same verifier reqwest uses
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "ring", "tls12"] }
+rustls-platform-verifier = "0.7.1"
+zeroize = "1.9.0"
 subtle = "2.6.1"
 
 # UUID generation

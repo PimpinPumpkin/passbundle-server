@@ -160,6 +160,20 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
     if !CONFIG.org_events_enabled() {
         return Ok(());
     }
+    // Keykeeper: at most MAX_COLLECTED events a request (more is refused, not
+    // cut short, and our apps send them in batches that size), and a few
+    // requests a second per person, so one member's app can't flood the
+    // event log and the organization's security tools (keykeeper_streaming).
+    let most = crate::keykeeper_streaming::MAX_COLLECTED;
+    if data.len() > most {
+        err_code!(
+            format!("Send at most {most} events at once; this had {}. Nothing was recorded.", data.len()),
+            rocket::http::Status::PayloadTooLarge.code
+        )
+    }
+    if !crate::keykeeper_streaming::collect_allowed(&headers.user.uuid) {
+        err_code!("Too many events at once. Try again later.", rocket::http::Status::TooManyRequests.code)
+    }
 
     for event in data.iter() {
         let event_date = parse_date(&event.date).map_res("Invalid event date")?;
