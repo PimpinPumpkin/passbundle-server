@@ -434,6 +434,10 @@ pub async fn validate_webauthn_login(user_id: &UserId, response: &str, conn: &Db
     let rsp: PublicKeyCredentialCopy = serde_json::from_str(response)?;
     let rsp: PublicKeyCredential = rsp.into();
 
+    // Keykeeper: an answer made in a frame on another site is refused, which
+    // webauthn-rs only checks when a key is added (DESIGN.md, "Connector pages").
+    crate::keykeeper_origins::check_assertion_origin(rsp.response.client_data_json.as_slice())?;
+
     let mut registrations = get_webauthn_registrations(user_id, conn).await?.1;
 
     // We need to check for and update the backup_eligible flag when needed.
