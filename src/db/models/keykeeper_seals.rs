@@ -135,6 +135,20 @@ impl JoinSeal {
         })
         .await
     }
+
+    /// Removes every seal of one kind in an organization, such as all staff
+    /// seals when a client removes its MSP. Returns how many went.
+    pub async fn delete_kind(org_uuid: &OrganizationId, kind: SealKind, conn: &DbConn) -> Result<usize, crate::Error> {
+        let org = org_uuid.clone();
+        conn.run(move |conn| {
+            diesel::delete(
+                join_seals::table.filter(join_seals::org_uuid.eq(org)).filter(join_seals::kind.eq(kind.as_str())),
+            )
+            .execute(conn)
+            .map_res("Error removing seals")
+        })
+        .await
+    }
 }
 
 #[derive(Identifiable, Queryable, Insertable)]
