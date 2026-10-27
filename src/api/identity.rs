@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
+    // Keykeeper: each organization's own single sign-on.
+    api::core::keykeeper_sso,
     api::{
         ApiResult, EmptyResult, JsonResult,
         core::{
@@ -35,7 +37,8 @@ use crate::{
         },
     },
     error::MapResult,
-    mail, sso,
+    mail,
+    sso,
     sso::{OIDCCode, OIDCCodeChallenge, OIDCCodeVerifier, OIDCState},
     util,
 };
@@ -96,7 +99,20 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
 
             sso_login(data, &mut user_id, &conn, &client_header.ip).await
         }
-        "authorization_code" => err!("SSO sign-in is not available"),
+        // Keykeeper: each organization's own single sign-on (keykeeper_sso).
+        // The server refuses SSO_ENABLED, so this is the only way in.
+        "authorization_code" => {
+            check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
+            check_is_some(data.code.as_ref(), "code cannot be blank")?;
+            check_is_some(data.code_verifier.as_ref(), "code verifier cannot be blank")?;
+            check_is_some(data.redirect_uri.as_ref(), "redirect_uri cannot be blank")?;
+
+            check_is_some(data.device_identifier.as_ref(), "device_identifier cannot be blank")?;
+            check_is_some(data.device_name.as_ref(), "device_name cannot be blank")?;
+            check_is_some(data.device_type.as_ref(), "device_type cannot be blank")?;
+
+            keykeeper_sso_login(data, &mut user_id, &conn, &client_header.ip).await
+        }
         "send_access" => {
             crate::ratelimit::check_limit_unauthenticated(&client_header.ip.ip)?;
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
@@ -368,6 +384,49 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }
 
+/// Keykeeper: a sign-in with an organization's own single sign-on, once the
+/// web vault redeems the code this server gave it. keykeeper_sso decides who
+/// it is (never by the email Microsoft sends); two-step login works as for a
+/// password; and the master password still unlocks, so the answer is a
+/// password login's. See DESIGN.md, "Sign in with Microsoft Entra ID".
+async fn keykeeper_sso_login(
+    data: ConnectData,
+    user_id: &mut Option<UserId>,
+    conn: &DbConn,
+    ip: &ClientIp,
+) -> JsonResult {
+    AuthMethod::Sso.check_scope(data.scope.as_ref())?;
+    crate::ratelimit::check_limit_login(&ip.ip)?;
+    let (Some(code), Some(verifier)) = (data.code.as_ref(), data.code_verifier.as_ref()) else {
+        err!("Got no code in OIDC data")
+    };
+    let (login, mut user) = keykeeper_sso::redeem_code(
+        code,
+        verifier,
+        data.client_id.as_deref(),
+        data.redirect_uri.as_deref(),
+        &ip.ip,
+        conn,
+    )
+    .await?;
+    *user_id = Some(user.uuid.clone());
+
+    let mut device = get_device(&data, conn, &user).await?;
+    let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
+
+    if user.private_key.is_none() {
+        // Invited, with no account yet: Entra vouched for them, so their
+        // email counts as verified, and the apps ask them for a master
+        // password next (upstream's first single sign-on).
+        user.verified_at = Some(Utc::now().naive_utc());
+        user.save(conn).await?;
+    }
+
+    keykeeper_sso::finish_login(&login, &user, device.atype, &ip.ip, conn).await?;
+    let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Sso, data.client_id);
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+}
+
 async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
     // Validate scope
     AuthMethod::Password.check_scope(data.scope.as_ref())?;
@@ -449,6 +508,35 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
         )
     }
 
+    // Keykeeper: someone an organization requires to sign in with its single
+    // sign-on is sent there, once their password checked out, so the answer
+    // says nothing to anyone without it. Owners and an MSP's staff are never
+    // required. Someone not linked to it yet goes on to two-step login, and
+    // then gets a linking session instead of a login (below). See
+    // keykeeper_sso::password_requirement.
+    let requirement = keykeeper_sso::password_requirement(&user.uuid, conn).await;
+    let use_sso = match &requirement {
+        Some(keykeeper_sso::PasswordRequirement::UseSso(identifier)) => Some(identifier.clone()),
+        // Signing in with a device's approval proves no password: it can't
+        // start linking.
+        Some(keykeeper_sso::PasswordRequirement::LinkFirst(_, identifier)) if data.auth_request.is_some() => {
+            Some(identifier.clone())
+        }
+        _ => None,
+    };
+    if let Some(identifier) = use_sso {
+        let message = "Your organization requires you to sign in with single sign-on.";
+        err_json!(
+            json!({
+                "error": "invalid_grant",
+                "error_description": message,
+                "SsoOrganizationIdentifier": identifier,
+                "ErrorModel": { "Message": message, "Object": "error" },
+            }),
+            format!("IP: {}. Username: {log_username}. Single sign-on required.", ip.ip)
+        )
+    }
+
     // Change the KDF Iterations (only when not logging in with an auth request)
     if data.auth_request.is_none() {
         kdf_upgrade(&mut user, password, conn).await?;
@@ -491,6 +579,25 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     let mut device = get_device(&data, conn, &user).await?;
 
     let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
+
+    // Keykeeper: required to use single sign-on and not linked yet: their
+    // password and two-step login checked out, so they get a linking session,
+    // which can only link them to that organization's single sign-on, and no
+    // login. The web vault takes them through linking, then single sign-on.
+    if let Some(keykeeper_sso::PasswordRequirement::LinkFirst(org_id, identifier)) = requirement {
+        let session = keykeeper_sso::start_linking(&user.uuid, &org_id, conn).await?;
+        let message = "Your organization requires single sign-on. Link your Microsoft account to continue.";
+        err_json!(
+            json!({
+                "error": "invalid_grant",
+                "error_description": message,
+                "SsoOrganizationIdentifier": identifier,
+                "KeykeeperSsoLinkSession": session,
+                "ErrorModel": { "Message": message, "Object": "error" },
+            }),
+            format!("IP: {}. Username: {log_username}. Single sign-on required; linking first.", ip.ip)
+        )
+    }
 
     // Like upstream, an auth request can be used for one login only. Marked after 2FA so a 2FA prompt doesn't use it up.
     if let Some(ref auth_request_id) = data.auth_request
@@ -1173,6 +1280,9 @@ struct ConnectData {
     code: Option<OIDCCode>,
     #[field(name = uncased("code_verifier"))]
     code_verifier: Option<OIDCCodeVerifier>,
+    // Keykeeper: checked against the one the sign-in started with.
+    #[field(name = uncased("redirect_uri"))]
+    redirect_uri: Option<String>,
 
     // Needed for send access
     send_id: Option<SendId>,
@@ -1185,8 +1295,18 @@ fn check_is_some<T>(value: Option<&T>, msg: &str) -> EmptyResult {
     Ok(())
 }
 
-#[get("/sso/prevalidate")]
-fn prevalidate() -> JsonResult {
+#[derive(FromForm)]
+struct PrevalidateData {
+    #[field(name = uncased("domainHint"))]
+    domain_hint: Option<String>,
+}
+
+#[get("/sso/prevalidate?<data..>")]
+async fn prevalidate(data: PrevalidateData, ip: ClientIp, conn: DbConn) -> JsonResult {
+    // Keykeeper: each organization's own single sign-on.
+    if !CONFIG.sso_enabled() {
+        return keykeeper_sso::prevalidate(data.domain_hint.as_deref(), &ip.ip, &conn).await;
+    }
     if CONFIG.sso_enabled() {
         let sso_token = sso::encode_ssotoken_claims();
         Ok(Json(json!({
@@ -1200,7 +1320,17 @@ fn prevalidate() -> JsonResult {
 const SSO_BINDING_COOKIE: &str = "VW_SSO_BINDING";
 
 #[get("/connect/oidc-signin?<code>&<state>", rank = 1)]
-async fn oidcsignin(code: OIDCCode, state: String, cookies: &CookieJar<'_>, mut conn: DbConn) -> ApiResult<Redirect> {
+async fn oidcsignin(
+    code: OIDCCode,
+    state: String,
+    cookies: &CookieJar<'_>,
+    ip: ClientIp,
+    mut conn: DbConn,
+) -> ApiResult<Redirect> {
+    // Keykeeper: each organization's own single sign-on.
+    if !CONFIG.sso_enabled() {
+        return keykeeper_sso::callback(&state, Some(&*code), None, cookies, &ip.ip, &conn).await;
+    }
     oidcsignin_redirect(state, code, None, cookies, &mut conn).await
 }
 
@@ -1213,8 +1343,14 @@ async fn oidcsignin_error(
     error: String,
     error_description: Option<String>,
     cookies: &CookieJar<'_>,
+    ip: ClientIp,
     mut conn: DbConn,
 ) -> ApiResult<Redirect> {
+    // Keykeeper: each organization's own single sign-on.
+    if !CONFIG.sso_enabled() {
+        let error = Some((error.as_str(), error_description.as_deref()));
+        return keykeeper_sso::callback(&state, None, error, cookies, &ip.ip, &conn).await;
+    }
     oidcsignin_redirect(
         state.clone(),
         state.into(),
@@ -1293,24 +1429,48 @@ struct AuthorizeData {
     code_challenge_method: String,
     #[allow(unused)]
     response_mode: Option<String>,
-    #[allow(unused)]
     domain_hint: Option<String>,
     #[allow(unused)]
     #[field(name = uncased("ssoToken"))]
     sso_token: Option<String>,
+    // Keykeeper: upstream's Link SSO passes a signed-in session's ticket.
+    #[field(name = uncased("user_identifier"))]
+    user_identifier: Option<String>,
 }
 
 // The `redirect_uri` will change depending of the client (web, android, ios ..)
 #[get("/connect/authorize?<data..>")]
-async fn authorize(data: AuthorizeData, cookies: &CookieJar<'_>, secure: Secure, conn: DbConn) -> ApiResult<Redirect> {
+async fn authorize(
+    data: AuthorizeData,
+    cookies: &CookieJar<'_>,
+    secure: Secure,
+    ip: ClientIp,
+    conn: DbConn,
+) -> ApiResult<Redirect> {
     let AuthorizeData {
         client_id,
         redirect_uri,
         state,
         code_challenge,
         code_challenge_method,
+        domain_hint,
+        user_identifier,
         ..
     } = data;
+
+    // Keykeeper: each organization's own single sign-on.
+    if !CONFIG.sso_enabled() {
+        let a = keykeeper_sso::Authorize {
+            client_id,
+            redirect_uri,
+            state: state.to_string(),
+            code_challenge: code_challenge.to_string(),
+            code_challenge_method,
+            domain_hint,
+            user_identifier,
+        };
+        return keykeeper_sso::authorize(a, cookies, &ip.ip, &conn).await;
+    }
 
     if code_challenge_method != "S256" {
         err!("Unsupported code challenge method");

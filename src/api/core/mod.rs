@@ -20,6 +20,7 @@ pub mod keykeeper_scim;
 mod keykeeper_script_access;
 mod keykeeper_seals;
 mod keykeeper_site_fixes;
+pub mod keykeeper_sso;
 mod keykeeper_user_settings;
 mod keykeeper_vault_lock;
 mod organizations;
@@ -78,6 +79,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_seals::routes());
     routes.append(&mut keykeeper_script_access::routes());
     routes.append(&mut keykeeper_site_fixes::routes());
+    routes.append(&mut keykeeper_sso::routes());
     routes.append(&mut keykeeper_user_settings::routes());
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
