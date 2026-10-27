@@ -371,7 +371,8 @@ pub struct SessionFacts {
 
 impl SessionFacts {
     fn of(request: &Request<'_>) -> Option<Self> {
-        let token = request.headers().get_one("Authorization")?.strip_prefix("Bearer ")?;
+        // The token as the Headers guard reads it, so both see the same one.
+        let token = request.headers().get_one("Authorization")?.rsplit("Bearer ").next()?;
         let claims = decode_login(token).ok()?;
         Some(Self {
             api_key: !claims.scope.iter().any(|s| s == "offline_access"),
