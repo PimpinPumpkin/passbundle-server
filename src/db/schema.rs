@@ -78,6 +78,9 @@ table! {
         provider_org_uuid -> Nullable<Text>,
         // Keykeeper: upstream's system user that acted (1 is SCIM).
         system_actor -> Nullable<Integer>,
+        // Keykeeper: the event's subject in words (a domain, or why a
+        // single sign-on was refused).
+        keykeeper_detail -> Nullable<Text>,
     }
 }
 
