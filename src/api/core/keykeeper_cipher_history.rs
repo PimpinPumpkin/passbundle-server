@@ -60,6 +60,9 @@ async fn readable(
 async fn get_history(cipher_id: CipherId, headers: Headers, conn: DbConn) -> JsonResult {
     let (cipher, hide_passwords, _) = readable(&cipher_id, &headers, &conn).await?;
     let versions = CipherVersion::find_by_cipher(&cipher.uuid, &conn).await?;
+    // Each version says whether the person may see the item's passwords, from
+    // their grid on the item (the versions carry no folders to work it out).
+    let view_password = cipher.grid_for_user(&headers.user.uuid, None, &conn).await.is_some_and(|g| g.see_passwords);
     let mut editors = Editors::new(&cipher, &headers.user.uuid, &conn).await;
     // As an organization's sync sends items: nothing per person, and no
     // attachments, folders, or collections, which aren't part of versions.
@@ -70,10 +73,12 @@ async fn get_history(cipher_id: CipherId, headers: Headers, conn: DbConn) -> Jso
         let item = if hide_passwords {
             Value::Null
         } else {
-            version
+            let mut item = version
                 .as_cipher(&cipher)
                 .to_json(&headers.host, &headers.user.uuid, Some(&no_extras), CipherSyncType::Organization, &conn)
-                .await?
+                .await?;
+            item["viewPassword"] = json!(view_password);
+            item
         };
         data.push(json!({
             "object": "keykeeperCipherVersion",
