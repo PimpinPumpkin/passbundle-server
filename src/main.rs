@@ -56,6 +56,7 @@ mod crypto;
 #[macro_use]
 mod db;
 mod http_client;
+mod keykeeper_origins;
 mod keykeeper_streaming;
 mod mail;
 mod ratelimit;
