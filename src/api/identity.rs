@@ -56,6 +56,7 @@ pub fn routes() -> Vec<Route> {
         register_finish,
         prevalidate,
         authorize,
+        authorize_confirm,
         oidcsignin,
         oidcsignin_error
     ]
@@ -1508,7 +1509,7 @@ async fn authorize(
     secure: Secure,
     ip: ClientIp,
     conn: DbConn,
-) -> ApiResult<Redirect> {
+) -> ApiResult<keykeeper_sso::AuthorizeAnswer> {
     let AuthorizeData {
         client_id,
         redirect_uri,
@@ -1556,5 +1557,23 @@ async fn authorize(
             .build(),
     );
 
-    Ok(Redirect::temporary(String::from(auth_url)))
+    Ok(keykeeper_sso::AuthorizeAnswer::Redirect(Box::new(Redirect::temporary(String::from(auth_url)))))
+}
+
+/// Keykeeper: the Continue on the page that the command-line tool's sign-in
+/// asks first (keykeeper_sso::confirm_cli).
+#[derive(FromForm)]
+struct CliConfirmData {
+    token: String,
+}
+
+#[post("/connect/authorize/confirm", data = "<data>")]
+async fn authorize_confirm(
+    data: Form<CliConfirmData>,
+    from: keykeeper_sso::RequestOrigin,
+    cookies: &CookieJar<'_>,
+    ip: ClientIp,
+    conn: DbConn,
+) -> ApiResult<Redirect> {
+    keykeeper_sso::confirm_cli(&data.token, from, cookies, &ip.ip, &conn).await
 }
