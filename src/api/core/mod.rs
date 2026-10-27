@@ -15,6 +15,7 @@ mod keykeeper_msp_policies;
 mod keykeeper_msp_templates;
 mod keykeeper_orgs;
 mod keykeeper_provisioning;
+mod keykeeper_reload_keys;
 pub mod keykeeper_scim;
 mod keykeeper_script_access;
 mod keykeeper_seals;
@@ -30,6 +31,8 @@ pub use accounts::purge_auth_requests;
 pub use ciphers::{CipherData, CipherSyncData, CipherSyncType, purge_trashed_ciphers};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
+// Keykeeper: a tab's reload key goes when its account's sessions do.
+pub use keykeeper_reload_keys::forget_user as forget_reload_keys;
 // Keykeeper: provisioning (SCIM), mounted at /scim.
 pub use keykeeper_scim::{catchers as scim_catchers, routes as scim_routes};
 pub use sends::purge_sends;
@@ -72,6 +75,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
     routes.append(&mut keykeeper_provisioning::routes());
+    routes.append(&mut keykeeper_reload_keys::routes());
     routes.append(&mut keykeeper_seals::routes());
     routes.append(&mut keykeeper_script_access::routes());
     routes.append(&mut keykeeper_site_fixes::routes());
