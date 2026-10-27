@@ -695,8 +695,8 @@ impl<'r> FromRequest<'r> for LinkCaller {
 const LINK_COOKIE: &str = "PB_SSO_LINK";
 
 /// Step one: a ticket that names the account and the session, and a cookie it
-/// works only with. A signed-in session proves its master password or a
-/// one-time code first; a linking session already did, with its password and
+/// works only with. A signed-in session proves its master password first (a
+/// one-time code only for an account without one); a linking session already did, with its password and
 /// two-step login, and its ticket works only for its organization. Five
 /// minutes, once.
 #[post("/accounts/sso/user-identifier", data = "<data>")]
@@ -709,6 +709,12 @@ async fn link_ticket(
     crate::ratelimit::check_limit_prelogin(caller.ip())?;
     let org = match &caller {
         LinkCaller::Session(h) => {
+            // An account with a master password proves it: a one-time code
+            // only proves the mailbox, which a stolen session's thief may
+            // have too. Only an account without one uses a code.
+            if !h.user.password_hash.is_empty() && (data.master_password_hash.is_none() || data.otp.is_some()) {
+                err!("Enter your master password to link single sign-on.")
+            }
             data.validate(&h.user, true, &conn).await?;
             None
         }
@@ -1144,13 +1150,17 @@ pub async fn authorize(a: Authorize, cookies: &CookieJar<'_>, ip: &IpAddr, conn:
 }
 
 /// Redeems Microsoft's code and checks the ID token it returns.
-async fn exchange(row: &SsoAuthRow, code: &str, conn: &DbConn) -> Result<Identity, String> {
+/// Redeems Microsoft's code and checks the ID token it returns, or says why
+/// not: a fixed reason code (each ID token check has its own, so a code
+/// Microsoft refused can't merge with a bad signature) and a few words.
+async fn exchange(row: &SsoAuthRow, code: &str, conn: &DbConn) -> Result<Identity, (&'static str, String)> {
     // The settings are read again: they may have changed since the sign-in started.
     let Some(config) = SsoConfig::find(&row.org_uuid, conn).await.filter(SsoConfig::ready) else {
-        return Err("Single sign-on was turned off for this organization.".to_owned());
+        return Err(("sso_turned_off", "Single sign-on was turned off for this organization.".to_owned()));
     };
-    let client_secret = secret::open(&row.org_uuid, config.client_secret.as_deref().unwrap_or_default())?;
-    let provider = entra::provider(&config.tenant_id).await?;
+    let client_secret = secret::open(&row.org_uuid, config.client_secret.as_deref().unwrap_or_default())
+        .map_err(|e| ("client_secret_unreadable", e))?;
+    let provider = entra::provider(&config.tenant_id).await.map_err(|e| ("discovery_failed", e))?;
     let id_token = entra::redeem(
         &provider,
         &entra::Redeem {
@@ -1161,7 +1171,8 @@ async fn exchange(row: &SsoAuthRow, code: &str, conn: &DbConn) -> Result<Identit
             redirect_uri: &callback_uri(),
         },
     )
-    .await?;
+    .await
+    .map_err(|e| ("code_redeem_failed", e))?;
     let expected = Expected {
         issuer: &provider.issuer,
         tenant_id: &config.tenant_id,
@@ -1169,16 +1180,16 @@ async fn exchange(row: &SsoAuthRow, code: &str, conn: &DbConn) -> Result<Identit
         nonce: &row.nonce,
         now: Utc::now().timestamp(),
     };
-    let keys = entra::keys(&config.tenant_id, &provider, false).await?;
+    let keys = entra::keys(&config.tenant_id, &provider, false).await.map_err(|e| ("keys_unavailable", e))?;
     let checked = match token::validate(&id_token, &keys, &expected) {
         // Microsoft rolled its keys: fetch them again, once.
         Err(token::Refusal::UnknownKey) => {
-            let keys = entra::keys(&config.tenant_id, &provider, true).await?;
+            let keys = entra::keys(&config.tenant_id, &provider, true).await.map_err(|e| ("keys_unavailable", e))?;
             token::validate(&id_token, &keys, &expected)
         }
         other => other,
     };
-    checked.map_err(|r| r.detail().to_owned())
+    checked.map_err(|r| (r.code(), r.detail().to_owned()))
 }
 
 /// Microsoft's answer (/identity/connect/oidc-signin): taken once, from the
@@ -1232,12 +1243,12 @@ pub async fn callback(
                 format!("Microsoft refused, as the browser reported it: {error}"),
             ))
         }
-        (None, Some(code)) => exchange(&row, code, conn).await.map_err(|detail| {
+        (None, Some(code)) => exchange(&row, code, conn).await.map_err(|(reason, detail)| {
             (
                 format!(
                     "Microsoft's sign-in for this organization didn't check out ({detail}). Ask your administrator to check its single sign-on settings."
                 ),
-                "token_check_failed",
+                reason,
                 detail,
             )
         }),
@@ -1268,13 +1279,12 @@ pub async fn callback(
     Ok(Redirect::temporary(String::from(url)))
 }
 
-/// Microsoft's `error`, if it fits OAuth's grammar for one (RFC 6749, 5.2:
-/// printable ASCII without quotes or backslashes) and is short; otherwise a
-/// fixed word, since the browser brought it.
+/// Microsoft's `error`, if it looks like an OAuth error code (lowercase
+/// letters, digits, and underscores, as RFC 6749's are, at most 64);
+/// otherwise a fixed word, since the browser brought it.
 fn oauth_error_code(error: &str) -> &str {
-    let fits = !error.is_empty()
-        && error.len() <= 64
-        && error.bytes().all(|b| matches!(b, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E));
+    let fits = (1..=64).contains(&error.len())
+        && error.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
     if fits {
         error
     } else {
@@ -1282,8 +1292,9 @@ fn oauth_error_code(error: &str) -> &str {
     }
 }
 
-/// Microsoft's `error_description`, for the person only, if it fits the same
-/// grammar and isn't long.
+/// Microsoft's `error_description`, for the person only, if it fits OAuth's
+/// grammar for one (RFC 6749, 5.2: printable ASCII without quotes or
+/// backslashes) and isn't long.
 fn oauth_error_description(description: &str) -> Option<String> {
     let fits =
         description.len() <= 500 && description.bytes().all(|b| matches!(b, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E));
@@ -1581,10 +1592,21 @@ mod tests {
     }
 
     #[test]
-    fn microsofts_error_is_kept_only_when_it_fits_oauths_grammar() {
+    fn microsofts_error_is_kept_only_when_it_looks_like_an_error_code() {
         assert_eq!(oauth_error_code("access_denied"), "access_denied");
         assert_eq!(oauth_error_code("consent_required"), "consent_required");
-        for made_up in ["", "say \"hello\"", "back\\slash", "line\nbreak", "caf\u{e9}", &"a".repeat(65)] {
+        assert_eq!(oauth_error_code("server_error2"), "server_error2");
+        for made_up in [
+            "",
+            "say \"hello\"",
+            "back\\slash",
+            "line\nbreak",
+            "caf\u{e9}",
+            "Access_Denied",
+            "call 555-0100",
+            "a-b",
+            &"a".repeat(65),
+        ] {
             assert_eq!(oauth_error_code(made_up), "unrecognized_error", "{made_up}");
         }
         assert_eq!(

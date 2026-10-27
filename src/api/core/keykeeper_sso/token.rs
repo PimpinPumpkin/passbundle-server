@@ -119,6 +119,26 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    /// A fixed code for the reason, for security tools: refusals for
+    /// different reasons are never merged into one event.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Malformed => "token_malformed",
+            Self::Algorithm => "token_algorithm",
+            Self::UnknownKey => "token_unknown_key",
+            Self::Signature => "token_signature",
+            Self::Issuer => "token_issuer",
+            Self::Tenant => "token_tenant",
+            Self::Audience => "token_audience",
+            Self::Expired => "token_expired",
+            Self::NotYetValid => "token_not_yet_valid",
+            Self::IssuedAt => "token_issued_at",
+            Self::Nonce => "token_nonce",
+            Self::Version => "token_version",
+            Self::NoObjectId => "token_no_object_id",
+        }
+    }
+
     /// A few words for the organization's event log.
     pub fn detail(&self) -> &'static str {
         match self {
@@ -373,6 +393,28 @@ mod tests {
 
     fn check(token: &str) -> Result<Identity, Refusal> {
         validate(token, std::slice::from_ref(&TENANT_KEY.jwk), &expected())
+    }
+
+    #[test]
+    fn each_check_has_its_own_reason_code() {
+        let all = [
+            Refusal::Malformed,
+            Refusal::Algorithm,
+            Refusal::UnknownKey,
+            Refusal::Signature,
+            Refusal::Issuer,
+            Refusal::Tenant,
+            Refusal::Audience,
+            Refusal::Expired,
+            Refusal::NotYetValid,
+            Refusal::IssuedAt,
+            Refusal::Nonce,
+            Refusal::Version,
+            Refusal::NoObjectId,
+        ];
+        let codes: std::collections::HashSet<_> = all.iter().map(Refusal::code).collect();
+        assert_eq!(codes.len(), all.len());
+        assert!(codes.iter().all(|c| c.starts_with("token_")));
     }
 
     #[test]
