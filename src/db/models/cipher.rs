@@ -365,6 +365,14 @@ impl Cipher {
             "passport": null,
         });
 
+        // Keykeeper: whether the person may see the item's passwords, on every
+        // item sent, so apps can hide them when it's missing rather than show
+        // them (DESIGN.md, "Folders and permissions"). From the grid for the
+        // person's own sync; an organization's admin view (and an item's
+        // version history, which sends contents only to those who may see
+        // them) shows everything.
+        json_object["viewPassword"] = json!(grid.see_passwords);
+
         // These values are only needed for user/default syncs
         // Not during an organizational sync like `get_org_details`
         // Skip adding these fields in that case
@@ -390,7 +398,6 @@ impl Cipher {
             // Keykeeper: from the grid, so upstream clients see exactly what
             // the server allows: delete and restore follow delete.
             json_object["edit"] = json!(grid.edit);
-            json_object["viewPassword"] = json!(grid.see_passwords);
             // The new key used by clients since v2025.6.0
             json_object["permissions"] = json!({
                 "delete": grid.delete,
