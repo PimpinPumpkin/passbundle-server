@@ -75,11 +75,12 @@ pub use util::is_running_in_container;
 async fn main() -> Result<(), Error> {
     install_rustls_crypto_provider();
     parse_args();
-    // Keykeeper: before anything secret is in memory.
-    no_core_dumps();
     launch_info();
 
     let level = init_logging()?;
+    // Keykeeper: once the ENV_FILE is loaded (reading the config does), so it
+    // can set ALLOW_CORE_DUMPS too, and before anything secret is in memory.
+    no_core_dumps();
 
     check_data_folder().await;
     auth::initialize_keys().await.unwrap_or_else(|e| {

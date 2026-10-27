@@ -84,6 +84,9 @@ const MAX_MINUTES: u64 = 365 * 24 * 60;
 const DEFAULT_WEB_MINUTES: u64 = 15;
 /// The tabs one account can keep at once; a new one replaces the stalest.
 const MAX_TABS_PER_ACCOUNT: usize = 20;
+/// A page's id, for its beacon: 16 random bytes in lowercase hex, new at
+/// every page load.
+const PAGE_ID_LEN: usize = 32;
 /// How often expired entries are wiped, and the limiters trimmed.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
@@ -146,9 +149,15 @@ struct Slot {
 type Key = Zeroizing<Box<[u8]>>;
 
 struct Entry {
+    /// Whose it is: only this account, on this device, gets R back.
+    user: UserId,
+    device: DeviceId,
     key: Key,
     /// SHA-256 of the tab's reload cookie, in hex.
     cookie_hash: String,
+    /// The page that has R now (the one that kept it, or the last reload's):
+    /// only its own leaving counts, not a late beacon from an earlier page.
+    page: Option<String>,
     idle_limit: Duration,
     last_active: Instant,
     last_check_in: Instant,
@@ -157,6 +166,10 @@ struct Entry {
 }
 
 impl Entry {
+    fn owned_by(&self, slot: &Slot) -> bool {
+        self.user == slot.user && self.device == slot.device
+    }
+
     /// Whether a request carried this tab's reload cookie.
     fn cookie_matches(&self, cookie: Option<&str>) -> bool {
         cookie.is_some_and(|value| crypto::ct_eq(&self.cookie_hash, crypto::sha256_hex(value.as_bytes())))
@@ -169,11 +182,12 @@ impl Entry {
     }
 }
 
-/// The kept keys. Each call takes the time, so tests can move it. Every call
-/// checks its own entry's expiry; `sweep`, on a timer, wipes the rest.
+/// The kept keys, by tab id, so a call finds its own entry at once. Each call
+/// takes the time, so tests can move it. Every call checks its own entry's
+/// expiry; `sweep`, on a timer, wipes the rest.
 #[derive(Default)]
 struct Store {
-    entries: DashMap<Slot, Entry>,
+    entries: DashMap<String, Entry>,
 }
 
 impl Store {
@@ -181,11 +195,24 @@ impl Store {
         self.entries.retain(|_, e| !e.expired(now));
     }
 
-    fn keep(&self, slot: Slot, key: Key, cookie_hash: String, idle_limit: Duration, now: Instant) {
-        let mut others: Vec<(Slot, Instant)> = self
+    /// Keeps R for a tab. Refused (false) when another account or device
+    /// already has an entry under that tab id.
+    fn keep(
+        &self,
+        slot: Slot,
+        key: Key,
+        cookie_hash: String,
+        page: Option<String>,
+        idle_limit: Duration,
+        now: Instant,
+    ) -> bool {
+        if self.entries.get(&slot.tab).is_some_and(|e| !e.owned_by(&slot) && !e.expired(now)) {
+            return false;
+        }
+        let mut others: Vec<(String, Instant)> = self
             .entries
             .iter()
-            .filter(|e| e.key().user == slot.user && *e.key() != slot && !e.value().expired(now))
+            .filter(|e| e.value().user == slot.user && *e.key() != slot.tab && !e.value().expired(now))
             .map(|e| (e.key().clone(), e.value().last_check_in))
             .collect();
         if others.len() >= MAX_TABS_PER_ACCOUNT {
@@ -195,26 +222,30 @@ impl Store {
             }
         }
         self.entries.insert(
-            slot,
+            slot.tab,
             Entry {
+                user: slot.user,
+                device: slot.device,
                 key,
                 cookie_hash,
+                page,
                 idle_limit,
                 last_active: now,
                 last_check_in: now,
                 leaving_since: None,
             },
         );
+        true
     }
 
     /// A tab is still open, last used `idle` ago. Whether its entry stays.
     /// Without the tab's cookie, nothing changes and the answer is the same
     /// as for no entry. A check-in doesn't undo leaving: only a reload does.
     fn check_in(&self, slot: &Slot, cookie: Option<&str>, idle: Duration, idle_limit: Duration, now: Instant) -> bool {
-        let Some(mut entry) = self.entries.get_mut(slot) else {
+        let Some(mut entry) = self.entries.get_mut(&slot.tab) else {
             return false;
         };
-        if !entry.cookie_matches(cookie) {
+        if !entry.owned_by(slot) || !entry.cookie_matches(cookie) {
             return false;
         }
         let gone = entry.expired(now) || {
@@ -232,7 +263,7 @@ impl Store {
         };
         drop(entry);
         if gone {
-            self.entries.remove(slot);
+            self.entries.remove(&slot.tab);
         }
         !gone
     }
@@ -240,10 +271,18 @@ impl Store {
     /// R, for the tab it belongs to, while its entry lasts, under a policy
     /// cap that may have shrunk since the tab's last check-in. Asking isn't
     /// use: only the tab's check-ins say when it was last used. It is the
-    /// reload a leaving page was waiting for, so the entry stays.
-    fn release(&self, slot: &Slot, cookie: Option<&str>, cap: Option<Duration>, now: Instant) -> Option<Key> {
-        let mut entry = self.entries.get_mut(slot)?;
-        if !entry.cookie_matches(cookie) {
+    /// reload a leaving page was waiting for, so the entry stays, and the
+    /// asking page is now the entry's page.
+    fn release(
+        &self,
+        slot: &Slot,
+        cookie: Option<&str>,
+        page: Option<String>,
+        cap: Option<Duration>,
+        now: Instant,
+    ) -> Option<Key> {
+        let mut entry = self.entries.get_mut(&slot.tab)?;
+        if !entry.owned_by(slot) || !entry.cookie_matches(cookie) {
             return None;
         }
         if let Some(cap) = cap {
@@ -251,40 +290,42 @@ impl Store {
         }
         if entry.expired(now) {
             drop(entry);
-            self.entries.remove(slot);
+            self.entries.remove(&slot.tab);
             return None;
         }
         entry.last_check_in = now;
         entry.leaving_since = None;
+        entry.page = page;
         Some(entry.key.clone())
     }
 
     /// The tab's page is going (closed, navigated away, or reloading): unless
     /// a reload asks for R within LEAVING, the entry ends. Only the tab's own
-    /// cookie can say so; it only ever shortens an entry. Whether it found
-    /// one.
-    fn leaving(&self, tab: &str, cookie: Option<&str>, now: Instant) -> bool {
-        let mut found = false;
-        for mut entry in self.entries.iter_mut() {
-            if entry.key().tab == tab && entry.cookie_matches(cookie) {
-                entry.leaving_since = Some(now);
-                found = true;
-            }
+    /// cookie, from the page that has R now, can say so, and it only ever
+    /// shortens an entry: the first leaving's deadline stands. Whether it
+    /// found one.
+    fn leaving(&self, tab: &str, cookie: Option<&str>, page: Option<&str>, now: Instant) -> bool {
+        let Some(mut entry) = self.entries.get_mut(tab) else {
+            return false;
+        };
+        if !entry.cookie_matches(cookie) || entry.page.as_deref() != page {
+            return false;
         }
-        found
+        entry.leaving_since.get_or_insert(now);
+        true
     }
 
     fn forget(&self, slot: &Slot) {
-        self.entries.remove(slot);
+        self.entries.remove_if(&slot.tab, |_, e| e.owned_by(slot));
     }
 
     /// Whether any account keeps an entry for this tab id.
     fn has_tab(&self, tab: &str, now: Instant) -> bool {
-        self.entries.iter().any(|e| e.key().tab == tab && !e.value().expired(now))
+        self.entries.get(tab).is_some_and(|e| !e.expired(now))
     }
 
     fn forget_user(&self, user: &UserId) {
-        self.entries.retain(|slot, _| slot.user != *user);
+        self.entries.retain(|_, e| e.user != *user);
     }
 }
 
@@ -317,6 +358,20 @@ static LIMITER_ACCOUNT: LazyLock<Limiter<UserId>> = LazyLock::new(|| {
     )
 });
 
+/// Leaving beacons that match no entry, per network address: they come
+/// without a session, so they can't count per account. Beacons that match an
+/// entry (they carry its cookie) aren't counted at all, so nothing here can
+/// keep a real tab's leaving from counting, and this is apart from the
+/// server's shared limit for requests without a session, which sign-ups,
+/// password hints, and other features draw on.
+static LIMITER_LEAVING: LazyLock<Limiter<std::net::IpAddr>> = LazyLock::new(|| {
+    RateLimiter::keyed(
+        Quota::with_period(Duration::from_millis(200))
+            .expect("Non-zero period")
+            .allow_burst(NonZeroU32::new(300).expect("Non-zero burst")),
+    )
+});
+
 fn check_limit(user: &UserId, tab: &str) -> EmptyResult {
     start_sweeping();
     if LIMITER_ACCOUNT.check_key(user).is_err() || LIMITER_TAB.check_key(&(user.clone(), tab.to_owned())).is_err() {
@@ -337,13 +392,27 @@ fn start_sweeping() {
                 STORE.sweep(Instant::now());
                 LIMITER_TAB.retain_recent();
                 LIMITER_ACCOUNT.retain_recent();
+                LIMITER_LEAVING.retain_recent();
             }
         });
     });
 }
 
+fn hex_id(id: &str, len: usize) -> bool {
+    id.len() == len && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn valid_tab(tab: &str) -> bool {
-    tab.len() == TAB_ID_LEN && tab.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    hex_id(tab, TAB_ID_LEN)
+}
+
+/// A page id, if one was sent and it's well formed.
+fn page_id(page: Option<&str>) -> Result<Option<String>, ()> {
+    match page {
+        None => Ok(None),
+        Some(page) if hex_id(page, PAGE_ID_LEN) => Ok(Some(page.to_owned())),
+        Some(_) => Err(()),
+    }
 }
 
 fn slot(headers: &Headers, tab: String) -> Result<Slot, Error> {
@@ -437,6 +506,7 @@ async fn idle_limit(minutes: u64, headers: &Headers, conn: &DbConn) -> Option<Du
 /// put it in a log. R's text is wiped when dropped.
 struct KeepData {
     tab_id: String,
+    page: Option<String>,
     key: Zeroizing<String>,
     timeout_minutes: u64,
 }
@@ -448,8 +518,13 @@ fn read_keep(body: String) -> Option<KeepData> {
         Some(Value::String(k)) => Zeroizing::new(k),
         _ => return None,
     };
+    let page = match value.get("pageId") {
+        None | Some(Value::Null) => None,
+        Some(page) => Some(page.as_str()?.to_owned()),
+    };
     Some(KeepData {
         tab_id: value.get("tabId")?.as_str()?.to_owned(),
+        page,
         key,
         timeout_minutes: value.get("timeoutMinutes")?.as_u64()?,
     })
@@ -480,6 +555,7 @@ async fn keep(body: String, headers: Headers, conn: DbConn, jar: &CookieJar<'_>)
     if !valid_tab(&data.tab_id) {
         return Err(refused());
     }
+    let page = page_id(data.page.as_deref()).map_err(|()| refused())?;
     check_limit(&headers.user.uuid, &data.tab_id)?;
     let key = decode_key(&data.key).ok_or_else(refused)?;
     let limit = idle_limit(data.timeout_minutes, &headers, &conn).await.ok_or_else(refused)?;
@@ -498,7 +574,9 @@ async fn keep(body: String, headers: Headers, conn: DbConn, jar: &CookieJar<'_>)
     }
 
     let value = Zeroizing::new(data_encoding::BASE64URL_NOPAD.encode(&crypto::get_random_bytes::<32>()));
-    STORE.keep(slot, key, crypto::sha256_hex(value.as_bytes()), limit, now);
+    if !STORE.keep(slot, key, crypto::sha256_hex(value.as_bytes()), page, limit, now) {
+        return Err(refused());
+    }
     jar.add(reload_cookie(&data.tab_id, value.to_string(), cookie_path()));
     Ok(())
 }
@@ -538,12 +616,16 @@ async fn check_in(data: Json<CheckInData>, headers: Headers, conn: DbConn, jar: 
 #[serde(rename_all = "camelCase")]
 struct TabData {
     tab_id: String,
+    /// The asking page's id (release).
+    page_id: Option<String>,
 }
 
 /// R, after a reload, for the tab it belongs to.
 #[post("/keykeeper/reload-key/release", data = "<data>")]
 async fn release(data: Json<TabData>, headers: Headers, conn: DbConn, jar: &CookieJar<'_>) -> JsonResult {
-    let slot = slot(&headers, data.into_inner().tab_id)?;
+    let data = data.into_inner();
+    let page = page_id(data.page_id.as_deref()).map_err(|()| not_found())?;
+    let slot = slot(&headers, data.tab_id)?;
     check_limit(&slot.user, &slot.tab)?;
     // A policy that now refuses reload keys, or caps them lower (one the
     // tab's account just joined, or just changed), applies at once.
@@ -557,7 +639,7 @@ async fn release(data: Json<TabData>, headers: Headers, conn: DbConn, jar: &Cook
         Allowed::Unlimited => None,
     };
     let cookie = jar.get(&cookie_name(&slot.tab)).map(|c| Zeroizing::new(c.value().to_owned()));
-    let Some(key) = STORE.release(&slot, cookie.as_deref().map(String::as_str), cap, Instant::now()) else {
+    let Some(key) = STORE.release(&slot, cookie.as_deref().map(String::as_str), page, cap, Instant::now()) else {
         expire_cookie(jar, &slot.tab);
         return Err(not_found());
     };
@@ -569,21 +651,26 @@ async fn release(data: Json<TabData>, headers: Headers, conn: DbConn, jar: &Cook
 
 /// The tab's page is going away (`pagehide`: closed, navigated elsewhere, or
 /// reloading), sent as a beacon that outlives it, so without an access token:
-/// the tab's cookie is what says so, and it can only shorten the entry. A
-/// reload asks for R within LEAVING; a closed tab reopened later, or a Back to
-/// it, finds nothing. Answers the same whether there was one.
+/// the tab's cookie, and the page's id, are what say so, and it can only
+/// shorten the entry. A reload asks for R within LEAVING; a closed tab
+/// reopened later, or a Back to it, finds nothing. Answers the same whether
+/// there was one. Only beacons that match nothing count against a limit, a
+/// limit of their own.
 #[post("/keykeeper/reload-key/leaving", data = "<body>")]
 fn leaving(body: String, ip: ClientIp, jar: &CookieJar<'_>) -> EmptyResult {
-    let ip = ip.ip;
-    crate::ratelimit::check_limit_unauthenticated(&ip)?;
     start_sweeping();
-    let tab = serde_json::from_str::<Value>(&{ body })
-        .ok()
-        .and_then(|v| v.get("tabId").and_then(Value::as_str).map(str::to_owned))
-        .filter(|tab| valid_tab(tab));
-    if let Some(tab) = tab {
-        let cookie = jar.get(&cookie_name(&tab)).map(|c| Zeroizing::new(c.value().to_owned()));
-        STORE.leaving(&tab, cookie.as_deref().map(String::as_str), Instant::now());
+    let ip = ip.ip;
+    let parsed = serde_json::from_str::<Value>(&{ body }).ok();
+    let field = |key: &str| parsed.as_ref().and_then(|v| v.get(key)).and_then(Value::as_str).map(str::to_owned);
+    let found = match (field("tabId"), page_id(field("pageId").as_deref())) {
+        (Some(tab), Ok(page)) if valid_tab(&tab) => {
+            let cookie = jar.get(&cookie_name(&tab)).map(|c| Zeroizing::new(c.value().to_owned()));
+            STORE.leaving(&tab, cookie.as_deref().map(String::as_str), page.as_deref(), Instant::now())
+        }
+        _ => false,
+    };
+    if !found && LIMITER_LEAVING.check_key(&ip).is_err() {
+        return Err(Error::new_msg("Too many requests").with_code(429));
     }
     Ok(())
 }
@@ -632,7 +719,7 @@ mod tests {
         }
 
         fn release_with(&self, slot: &Slot, cap: Option<Duration>, now: Instant) -> Option<Key> {
-            self.release(slot, Some(COOKIE), cap, now)
+            self.release(slot, Some(COOKIE), None, cap, now)
         }
     }
 
@@ -641,6 +728,10 @@ mod tests {
     }
 
     const TAB: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER_TAB: &str = "1123456789abcdef0123456789abcdef";
+    const THIRD_TAB: &str = "2123456789abcdef0123456789abcdef";
+    const PAGE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const NEXT_PAGE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const MIN: Duration = Duration::from_secs(60);
 
     #[test]
@@ -648,7 +739,7 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let mine = at("alice", "laptop", TAB);
-        store.keep(mine.clone(), key(7), hash(), 15 * MIN, now);
+        store.keep(mine.clone(), key(7), hash(), None, 15 * MIN, now);
 
         assert_eq!(store.release_with(&mine, None, now).map(|k| k[0]), Some(7));
         assert!(store.release_with(&at("bob", "laptop", TAB), None, now).is_none());
@@ -663,14 +754,14 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let tab = at("alice", "laptop", TAB);
-        store.keep(tab.clone(), key(7), hash(), 15 * MIN, now);
+        store.keep(tab.clone(), key(7), hash(), None, 15 * MIN, now);
 
         for cookie in [None, Some(""), Some("another-value"), Some("THE-TABS-COOKIE")] {
-            assert!(store.release(&tab, cookie, None, now).is_none(), "{cookie:?}");
+            assert!(store.release(&tab, cookie, None, None, now).is_none(), "{cookie:?}");
             assert!(!store.check_in(&tab, cookie, Duration::ZERO, 15 * MIN, now), "{cookie:?}");
         }
         // Still there for the tab itself, with its cookie.
-        assert_eq!(store.release(&tab, Some(COOKIE), None, now).map(|k| k[0]), Some(7));
+        assert_eq!(store.release(&tab, Some(COOKIE), None, None, now).map(|k| k[0]), Some(7));
         assert!(store.check_in(&tab, Some(COOKIE), Duration::ZERO, 15 * MIN, now));
         assert!(store.has_tab(TAB, now));
         store.forget(&tab);
@@ -710,7 +801,7 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let tab = at("alice", "laptop", TAB);
-        store.keep(tab.clone(), key(1), hash(), 60 * MIN, now);
+        store.keep(tab.clone(), key(1), hash(), None, 60 * MIN, now);
 
         // Checking in keeps it, past the first grace.
         assert!(store.check_in_with(&tab, Duration::ZERO, 60 * MIN, now + 100 * Duration::from_secs(1)));
@@ -729,7 +820,7 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let tab = at("alice", "laptop", TAB);
-        store.keep(tab.clone(), key(1), hash(), 5 * MIN, now);
+        store.keep(tab.clone(), key(1), hash(), None, 5 * MIN, now);
 
         // Used 10 seconds before each check-in: stays, well past 5 minutes.
         let mut t = now;
@@ -754,7 +845,7 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let tab = at("alice", "laptop", TAB);
-        store.keep(tab.clone(), key(1), hash(), 5 * MIN, now);
+        store.keep(tab.clone(), key(1), hash(), None, 5 * MIN, now);
         let s = Duration::from_secs;
         assert!(store.check_in_with(&tab, Duration::ZERO, 5 * MIN, now + s(90)));
         assert!(store.check_in_with(&tab, s(100), 5 * MIN, now + s(120)));
@@ -762,7 +853,7 @@ mod tests {
         assert!(!store.check_in_with(&tab, s(300), 5 * MIN, now + s(180)));
 
         // A smaller limit applies at once: a minute unused is past one.
-        store.keep(tab.clone(), key(1), hash(), 5 * MIN, now);
+        store.keep(tab.clone(), key(1), hash(), None, 5 * MIN, now);
         assert!(!store.check_in_with(&tab, MIN, MIN, now + s(30)));
     }
 
@@ -771,7 +862,7 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let tab = at("alice", "laptop", TAB);
-        store.keep(tab.clone(), key(1), hash(), MIN, now);
+        store.keep(tab.clone(), key(1), hash(), None, MIN, now);
         // Its next check-in says it hasn't been used for 20 minutes.
         assert!(!store.check_in_with(&tab, 20 * MIN, MIN, now + Duration::from_secs(30)));
         assert!(store.release_with(&tab, None, now + Duration::from_secs(31)).is_none());
@@ -782,11 +873,14 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let a = at("alice", "laptop", TAB);
-        let b = at("alice", "desktop", TAB);
-        let c = at("bob", "laptop", TAB);
+        let b = at("alice", "desktop", OTHER_TAB);
+        let c = at("bob", "laptop", THIRD_TAB);
         for s in [&a, &b, &c] {
-            store.keep(s.clone(), key(1), hash(), 15 * MIN, now);
+            store.keep(s.clone(), key(1), hash(), None, 15 * MIN, now);
         }
+        // Only its owner forgets it.
+        store.forget(&at("bob", "laptop", TAB));
+        assert!(store.release_with(&a, None, now).is_some());
         store.forget(&a);
         assert!(store.release_with(&a, None, now).is_none());
         assert!(store.release_with(&b, None, now).is_some());
@@ -796,12 +890,25 @@ mod tests {
     }
 
     #[test]
+    fn another_account_cant_take_a_tab_id_thats_in_use() {
+        let store = Store::default();
+        let now = Instant::now();
+        assert!(store.keep(at("alice", "laptop", TAB), key(1), hash(), None, 15 * MIN, now));
+        assert!(!store.keep(at("bob", "laptop", TAB), key(2), hash(), None, 15 * MIN, now));
+        assert!(!store.keep(at("alice", "phone", TAB), key(2), hash(), None, 15 * MIN, now));
+        assert_eq!(store.release_with(&at("alice", "laptop", TAB), None, now).map(|k| k[0]), Some(1));
+        // The same tab keeping a new R replaces it; an expired one is free.
+        assert!(store.keep(at("alice", "laptop", TAB), key(3), hash(), None, MIN, now));
+        assert!(store.keep(at("bob", "laptop", TAB), key(4), hash(), None, MIN, now + 2 * MIN));
+    }
+
+    #[test]
     fn an_account_keeps_a_bounded_number_of_tabs() {
         let store = Store::default();
         let now = Instant::now();
         for i in 0..(MAX_TABS_PER_ACCOUNT + 5) {
             let t = now + Duration::from_secs(i as u64);
-            store.keep(at("alice", "laptop", &format!("{i:032x}")), key(1), hash(), 15 * MIN, t);
+            store.keep(at("alice", "laptop", &format!("{i:032x}")), key(1), hash(), None, 15 * MIN, t);
         }
         assert_eq!(store.entries.len(), MAX_TABS_PER_ACCOUNT);
         // The stalest went; the newest stayed.
@@ -816,7 +923,7 @@ mod tests {
         let store = Store::default();
         let now = Instant::now();
         let tab = at("alice", "laptop", TAB);
-        store.keep(tab.clone(), key(1), hash(), 15 * MIN, now);
+        store.keep(tab.clone(), key(1), hash(), None, 15 * MIN, now);
         // 90 seconds unused: within 15 minutes and a new cap of 5, past one of 1.
         let later = now + Duration::from_secs(90);
         assert!(store.release_with(&tab, Some(5 * MIN), later).is_some());
@@ -879,37 +986,71 @@ mod tests {
         let now = Instant::now();
         let s = Duration::from_secs;
         let tab = at("alice", "laptop", TAB);
-        store.keep(tab.clone(), key(1), hash(), 15 * MIN, now);
+        store.keep(tab.clone(), key(1), hash(), None, 15 * MIN, now);
 
         // A reload: the page leaves, and the new one asks within the window.
-        assert!(store.leaving(TAB, Some(COOKIE), now + s(10)));
+        assert!(store.leaving(TAB, Some(COOKIE), None, now + s(10)));
         assert!(store.release_with(&tab, None, now + s(14)).is_some());
         // That ended the leaving: later is fine.
         assert!(store.check_in_with(&tab, Duration::ZERO, 15 * MIN, now + s(60)));
 
         // Closed: nothing asks; a check-in doesn't count, a late reopen finds nothing.
-        assert!(store.leaving(TAB, Some(COOKIE), now + s(70)));
+        assert!(store.leaving(TAB, Some(COOKIE), None, now + s(70)));
         assert!(store.check_in_with(&tab, Duration::ZERO, 15 * MIN, now + s(80)));
         assert!(store.release_with(&tab, None, now + s(70) + LEAVING + s(1)).is_none());
         assert!(store.entries.is_empty());
 
         // Without the tab's cookie, or with another, leaving changes nothing.
-        store.keep(tab.clone(), key(1), hash(), 15 * MIN, now);
-        assert!(!store.leaving(TAB, None, now + s(10)));
-        assert!(!store.leaving(TAB, Some("another"), now + s(10)));
-        assert!(!store.leaving("ffffffffffffffffffffffffffffffff", Some(COOKIE), now + s(10)));
+        store.keep(tab.clone(), key(1), hash(), None, 15 * MIN, now);
+        assert!(!store.leaving(TAB, None, None, now + s(10)));
+        assert!(!store.leaving(TAB, Some("another"), None, now + s(10)));
+        assert!(!store.leaving("ffffffffffffffffffffffffffffffff", Some(COOKIE), None, now + s(10)));
         assert!(store.release_with(&tab, None, now + s(10) + LEAVING + s(1)).is_some());
+    }
+
+    #[test]
+    fn repeated_leaving_cant_push_the_deadline_back() {
+        let store = Store::default();
+        let now = Instant::now();
+        let s = Duration::from_secs;
+        let tab = at("alice", "laptop", TAB);
+        store.keep(tab.clone(), key(1), hash(), None, 15 * MIN, now);
+        assert!(store.leaving(TAB, Some(COOKIE), None, now + s(10)));
+        assert!(store.leaving(TAB, Some(COOKIE), None, now + s(20)));
+        // The first deadline stands: 10 + 15 seconds.
+        assert!(store.release_with(&tab, None, now + s(10) + LEAVING + s(1)).is_none());
+    }
+
+    #[test]
+    fn a_late_leaving_from_an_earlier_page_doesnt_end_the_reloaded_one() {
+        let store = Store::default();
+        let now = Instant::now();
+        let s = Duration::from_secs;
+        let tab = at("alice", "laptop", TAB);
+        store.keep(tab.clone(), key(1), hash(), Some(PAGE.to_owned()), 15 * MIN, now);
+
+        // The first page reloads: it leaves, and the next page asks.
+        assert!(store.leaving(TAB, Some(COOKIE), Some(PAGE), now + s(10)));
+        assert!(store.release(&tab, Some(COOKIE), Some(NEXT_PAGE.to_owned()), None, now + s(11)).is_some());
+        // A late beacon from the first page changes nothing now.
+        assert!(!store.leaving(TAB, Some(COOKIE), Some(PAGE), now + s(12)));
+        assert!(!store.leaving(TAB, Some(COOKIE), None, now + s(12)));
+        assert!(store.release(&tab, Some(COOKIE), Some(NEXT_PAGE.to_owned()), None, now + s(60)).is_some());
+        // The page that has it now still can.
+        assert!(store.leaving(TAB, Some(COOKIE), Some(NEXT_PAGE), now + s(61)));
+        assert!(store.check_in_with(&tab, Duration::ZERO, 15 * MIN, now + s(70)));
+        assert!(store.release_with(&tab, None, now + s(61) + LEAVING + s(1)).is_none());
     }
 
     #[test]
     fn the_sweep_wipes_every_expired_entry() {
         let store = Store::default();
         let now = Instant::now();
-        store.keep(at("alice", "laptop", TAB), key(1), hash(), MIN, now);
-        store.keep(at("bob", "laptop", TAB), key(2), hash(), 15 * MIN, now);
+        store.keep(at("alice", "laptop", TAB), key(1), hash(), None, MIN, now);
+        store.keep(at("bob", "laptop", OTHER_TAB), key(2), hash(), None, 15 * MIN, now);
         store.sweep(now + Duration::from_secs(61));
         assert_eq!(store.entries.len(), 1);
-        assert!(!store.has_tab(TAB, now + GRACE + Duration::from_secs(1)));
+        assert!(!store.has_tab(OTHER_TAB, now + GRACE + Duration::from_secs(1)));
         store.sweep(now + GRACE + Duration::from_secs(1));
         assert!(store.entries.is_empty());
     }
@@ -941,5 +1082,8 @@ mod tests {
         assert!(valid_tab(TAB));
         assert!(!valid_tab("0123456789ABCDEF0123456789ABCDEF"));
         assert!(!valid_tab("0123"));
+        assert_eq!(page_id(None), Ok(None));
+        assert_eq!(page_id(Some(PAGE)), Ok(Some(PAGE.to_owned())));
+        assert_eq!(page_id(Some("not-a-page")), Err(()));
     }
 }
