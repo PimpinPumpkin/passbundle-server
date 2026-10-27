@@ -525,6 +525,35 @@ table! {
 }
 
 table! {
+    org_admin_two_step (org_uuid) {
+        org_uuid -> Text,
+        required -> Bool,
+    }
+}
+
+table! {
+    msp_staff_two_step (msp_uuid) {
+        msp_uuid -> Text,
+        required -> Bool,
+    }
+}
+
+table! {
+    two_step_setup_sessions (session_hash) {
+        session_hash -> Text,
+        user_uuid -> Text,
+        device_type -> Integer,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
+    unaccepted_memberships (membership_uuid) {
+        membership_uuid -> Text,
+    }
+}
+
+table! {
     removed_members (org_uuid, user_uuid) {
         org_uuid -> Text,
         user_uuid -> Text,

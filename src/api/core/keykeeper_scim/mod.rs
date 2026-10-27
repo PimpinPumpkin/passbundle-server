@@ -802,6 +802,10 @@ async fn invite(caller: &ScimCaller, email: &str, conn: &DbConn) -> Result<Membe
     let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
     member.status = status;
     member.save(conn).await?;
+    // Joined at once without email, so not by them (two-step login for admins).
+    if status == MembershipStatus::Accepted as i32 {
+        crate::api::core::keykeeper_two_step::accepted_without_them(vec![member.uuid.clone()], conn).await?;
+    }
     // No seal: an earlier one for this address never vouches for this.
     JoinSeal::set(&org.uuid, email, SealKind::Invite, None, conn).await?;
     if CONFIG.mail_enabled() {
@@ -971,6 +975,8 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
                     "An owner or admin turned this person off in PassBundle; they turn them back on there.",
                 ));
             }
+            // Restored, they may come under two-step login for admins.
+            let watch = crate::api::core::keykeeper_two_step::Watch::user(&person.member.user_uuid, conn).await?;
             person.member.restore();
             // Upstream's checks for restoring someone: single organization,
             // two-step login.
@@ -978,6 +984,7 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
                 return Err(ScimError::new(Status::Conflict, None, e.message().to_owned()));
             }
             person.member.save(conn).await?;
+            watch.settle(conn).await?;
             scim.turned_off = false;
             log_scim_event(EventType::OrganizationUserRestored, &person.member.uuid, org, &caller.ip, conn).await;
         } else {
