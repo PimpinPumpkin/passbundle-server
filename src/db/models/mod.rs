@@ -75,7 +75,9 @@ pub use self::keykeeper_sso::{
     SsoLinkSession, SsoLinkTicket, email_domain, normalize_domain, normalize_guid, normalize_identifier,
     pkce_challenge, sso_hash, sso_random, txt_value,
 };
-pub use self::keykeeper_two_step::{MspStaffTwoStep, OrgAdminTwoStep, TwoStepSetupSession, qualifying_two_step};
+pub use self::keykeeper_two_step::{
+    MspStaffTwoStep, OrgAdminTwoStep, TwoStepSetupSession, UnacceptedMembership, qualifying_two_step,
+};
 pub use self::keykeeper_user_settings::{UserSettings, valid_settings};
 pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
 pub use self::organization::{

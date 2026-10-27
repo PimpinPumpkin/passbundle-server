@@ -12,12 +12,12 @@ use crate::{
     api::{ApiResult, EmptyResult},
     db::{
         DbConn,
-        keykeeper_schema::{msp_staff_two_step, org_admin_two_step, two_step_setup_sessions},
+        keykeeper_schema::{msp_staff_two_step, org_admin_two_step, two_step_setup_sessions, unaccepted_memberships},
     },
     error::MapResult,
 };
 
-use super::{MspId, OrganizationId, TwoFactorType, UserId, sso_hash, sso_random};
+use super::{MembershipId, MspId, OrganizationId, TwoFactorType, UserId, sso_hash, sso_random};
 
 /// The second steps that count for a role two-step login is required of: an
 /// authenticator app, a security key or passkey, and Duo. Email codes don't:
@@ -118,6 +118,62 @@ impl MspStaffTwoStep {
                 .values(&row)
                 .execute(conn)
                 .map_res("Error saving an MSP's two-step login setting")
+        })
+        .await
+    }
+}
+
+/// Memberships the server accepted for their person, on a server that sends
+/// no email: upstream joins an existing account at once when it's invited, so
+/// the person never accepted. Two-step login for admins doesn't count one
+/// until they accept it in the web vault, so nobody can sign someone out, or
+/// hold up their sign-in, by inviting them as an admin.
+pub struct UnacceptedMembership;
+
+impl UnacceptedMembership {
+    /// Records that the server, not the person, accepted these memberships.
+    pub async fn mark(ids: Vec<MembershipId>, conn: &DbConn) -> EmptyResult {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        conn.run(move |conn| {
+            for id in &ids {
+                diesel::delete(unaccepted_memberships::table.filter(unaccepted_memberships::membership_uuid.eq(id)))
+                    .execute(conn)
+                    .map_res("Error recording a membership its person hasn't accepted")
+                    .map(|_: usize| ())?;
+                diesel::insert_into(unaccepted_memberships::table)
+                    .values(unaccepted_memberships::membership_uuid.eq(id))
+                    .execute(conn)
+                    .map_res("Error recording a membership its person hasn't accepted")
+                    .map(|_: usize| ())?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Whether the person hasn't accepted this membership.
+    pub async fn is(id: &MembershipId, conn: &DbConn) -> bool {
+        let id = id.clone();
+        conn.run(move |conn| {
+            unaccepted_memberships::table
+                .filter(unaccepted_memberships::membership_uuid.eq(id))
+                .count()
+                .first::<i64>(conn)
+                .is_ok_and(|n| n > 0)
+        })
+        .await
+    }
+
+    /// The person accepted it.
+    pub async fn accept(id: &MembershipId, conn: &DbConn) -> EmptyResult {
+        let id = id.clone();
+        conn.run(move |conn| {
+            diesel::delete(unaccepted_memberships::table.filter(unaccepted_memberships::membership_uuid.eq(id)))
+                .execute(conn)
+                .map_res("Error accepting a membership")
+                .map(|_: usize| ())
         })
         .await
     }

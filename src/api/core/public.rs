@@ -121,6 +121,11 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             new_member.status = member_status;
 
             new_member.save(&conn).await?;
+            // Keykeeper: joined at once without email, so not by them.
+            if member_status == MembershipStatus::Accepted as i32 {
+                crate::api::core::keykeeper_two_step::accepted_without_them(vec![new_member.uuid.clone()], &conn)
+                    .await?;
+            }
 
             // Keykeeper: the organization's invitation lifetime.
             let hours = invite_hours(&org_id, &conn).await;

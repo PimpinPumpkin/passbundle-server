@@ -25,3 +25,11 @@ CREATE TABLE two_step_setup_sessions (
     device_type  INTEGER   NOT NULL,
     created_at   TIMESTAMP NOT NULL
 );
+-- A membership the server accepted for its person, on a server that sends no
+-- email (upstream joins an existing account at once when it's invited). The
+-- person never accepted it, so two-step login for admins doesn't count it
+-- until they do, in the web vault: otherwise anyone could sign someone out,
+-- and hold up their sign-in, by inviting them as an admin.
+CREATE TABLE unaccepted_memberships (
+    membership_uuid TEXT NOT NULL PRIMARY KEY REFERENCES users_organizations (uuid) ON DELETE CASCADE
+);

@@ -797,6 +797,10 @@ async fn invite(caller: &ScimCaller, email: &str, conn: &DbConn) -> Result<Membe
     let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
     member.status = status;
     member.save(conn).await?;
+    // Joined at once without email, so not by them (two-step login for admins).
+    if status == MembershipStatus::Accepted as i32 {
+        crate::api::core::keykeeper_two_step::accepted_without_them(vec![member.uuid.clone()], conn).await?;
+    }
     // No seal: an earlier one for this address never vouches for this.
     JoinSeal::set(&org.uuid, email, SealKind::Invite, None, conn).await?;
     if CONFIG.mail_enabled() {

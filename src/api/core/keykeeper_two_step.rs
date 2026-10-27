@@ -60,13 +60,21 @@ use crate::{
         models::{
             Device, EventType, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId, MspMembership,
             MspStaff, MspStaffTwoStep, OrgAdminTwoStep, Organization, OrganizationId, TwoFactor, TwoFactorType,
-            TwoStepSetupSession, User, UserId, keykeeper_roles, qualifying_two_step,
+            TwoStepSetupSession, UnacceptedMembership, User, UserId, keykeeper_roles, qualifying_two_step,
         },
     },
 };
 
 pub fn routes() -> Vec<Route> {
-    routes![setup_info, get_org_setting, put_org_setting, get_msp_setting, put_msp_setting]
+    routes![
+        setup_info,
+        get_org_setting,
+        put_org_setting,
+        get_msp_setting,
+        put_msp_setting,
+        unaccepted_for_caller,
+        accept_membership
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -135,11 +143,17 @@ fn elevated_permissions(p: &keykeeper_roles::CustomPermissions) -> bool {
 /// or anyone an MSP's membership brought in (its admins and technicians,
 /// whatever their role there: a technician with every vault item and export
 /// reaches as much as an admin), who has joined (accepted or confirmed).
-/// Invited and revoked memberships reach nothing, so they aren't covered.
+/// Invited and revoked memberships reach nothing, so they aren't covered; nor
+/// is one the server accepted for its person, without email, until they
+/// accept it themselves (UnacceptedMembership).
 pub async fn covered_membership(member: &Membership, conn: &DbConn) -> bool {
-    if member.status < MembershipStatus::Accepted as i32 {
-        return false;
-    }
+    member.status >= MembershipStatus::Accepted as i32
+        && !UnacceptedMembership::is(&member.uuid, conn).await
+        && covered_role(member, conn).await
+}
+
+/// Whether a membership's role is one the rule covers, whatever its status.
+async fn covered_role(member: &Membership, conn: &DbConn) -> bool {
     if member.atype == MembershipType::Owner as i32 || member.atype == MembershipType::Admin as i32 {
         return true;
     }
@@ -645,13 +659,7 @@ async fn setup_info(headers: SetupHeaders, conn: DbConn) -> JsonResult {
 /// Someone the rule covers (or would) who has no method that counts.
 async fn person_json(member: &Membership, conn: &DbConn) -> Option<Value> {
     let user = User::find_by_uuid(&member.user_uuid, conn).await?;
-    let role = if member.atype == MembershipType::Owner as i32 {
-        "owner"
-    } else if member.atype == MembershipType::Admin as i32 {
-        "admin"
-    } else {
-        "custom"
-    };
+    let role = role_name(member);
     let through_msp = MspMembership::find_by_membership(&member.uuid, conn).await.is_some();
     let sso = !through_msp
         && member.atype != MembershipType::Owner as i32
@@ -881,6 +889,66 @@ async fn put_msp_setting(
             .await?;
     }
     Ok(Json(msp_view(&msp_id, &caller, &conn).await?))
+}
+
+// ---------------------------------------------------------------------------
+// Memberships the server accepted for their person.
+
+/// Records the memberships the server accepted for their person, on a server
+/// that sends no email (upstream's invitation of an existing account, a
+/// resent one, directory provisioning, and an invited address's sign-up).
+/// The rule doesn't count them until the person accepts (accept_membership).
+pub async fn accepted_without_them(ids: Vec<crate::db::models::MembershipId>, conn: &DbConn) -> EmptyResult {
+    if CONFIG.mail_enabled() {
+        return Ok(());
+    }
+    UnacceptedMembership::mark(ids, conn).await
+}
+
+fn role_name(member: &Membership) -> &'static str {
+    if member.atype == MembershipType::Owner as i32 {
+        "owner"
+    } else if member.atype == MembershipType::Admin as i32 {
+        "admin"
+    } else {
+        "custom"
+    }
+}
+
+/// The caller's memberships the server accepted for them, in a role the rule
+/// covers where the organization requires it: the web vault asks them to
+/// accept each one.
+#[get("/keykeeper/organizations/unaccepted")]
+async fn unaccepted_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
+    let mut out = Vec::new();
+    for member in Membership::find_by_user(&headers.user.uuid, &conn).await {
+        if member.status < MembershipStatus::Accepted as i32
+            || !UnacceptedMembership::is(&member.uuid, &conn).await
+            || !covered_role(&member, &conn).await
+            || !OrgAdminTwoStep::required(&member.org_uuid, &conn).await?
+        {
+            continue;
+        }
+        let name = Organization::find_by_uuid(&member.org_uuid, &conn).await.map(|o| o.name).unwrap_or_default();
+        out.push(json!({ "organizationId": member.org_uuid, "name": name, "role": role_name(&member) }));
+    }
+    Ok(Json(json!({ "data": out })))
+}
+
+/// The person accepts a membership the server accepted for them. From then
+/// on the rule counts it, which may end their sessions now (Watch), as for
+/// anyone who takes on a role that requires two-step login.
+#[post("/keykeeper/organizations/<org_id>/accept")]
+async fn accept_membership(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+    let Some(member) = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await else {
+        err_code!("Organization not found", Status::NotFound.code)
+    };
+    if UnacceptedMembership::is(&member.uuid, &conn).await {
+        let watch = Watch::user(&headers.user.uuid, &conn).await?;
+        UnacceptedMembership::accept(&member.uuid, &conn).await?;
+        watch.settle(&conn).await?;
+    }
+    Ok(Json(json!({ "accepted": true })))
 }
 
 #[cfg(test)]

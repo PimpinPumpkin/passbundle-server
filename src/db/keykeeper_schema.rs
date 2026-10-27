@@ -545,3 +545,9 @@ table! {
         created_at -> Timestamp,
     }
 }
+
+table! {
+    unaccepted_memberships (membership_uuid) {
+        membership_uuid -> Text,
+    }
+}

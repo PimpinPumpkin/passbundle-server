@@ -1162,6 +1162,10 @@ async fn send_invite(
         new_member.atype = new_type;
         new_member.status = member_status;
         new_member.save(&conn).await?;
+        // Keykeeper: joined at once without email, so not by them.
+        if member_status == MembershipStatus::Accepted as i32 {
+            super::keykeeper_two_step::accepted_without_them(vec![new_member.uuid.clone()], &conn).await?;
+        }
         if custom_role.is_some() {
             crate::db::models::keykeeper_roles::set(&new_member.uuid, custom_role.as_ref(), &conn).await?;
         }
@@ -1358,6 +1362,8 @@ async fn reinvite_member_impl(
         let mut member = member;
         member.status = MembershipStatus::Accepted as i32;
         member.save(conn).await?;
+        // Keykeeper: joined at once without email, so not by them.
+        super::keykeeper_two_step::accepted_without_them(vec![member.uuid.clone()], conn).await?;
         watch.settle(conn).await?;
     }
 

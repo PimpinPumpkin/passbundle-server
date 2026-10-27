@@ -356,7 +356,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
                     err!("Registration email does not match invite email")
                 }
             } else if Invitation::take(&email, &conn).await {
-                Membership::accept_user_invitations(&user.uuid, &conn).await?;
+                accept_invitations_for_them(&user.uuid, &conn).await?;
                 user
             } else if CONFIG.is_signup_allowed(&email)
                 || (CONFIG.emergency_access_allowed()
@@ -433,6 +433,20 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     })))
 }
 
+/// Upstream's acceptance of every invitation waiting for an account, on a
+/// server that sends no email. Keykeeper: the server accepted these, not the
+/// person, so two-step login for admins doesn't count them until they do.
+async fn accept_invitations_for_them(user_id: &UserId, conn: &DbConn) -> EmptyResult {
+    let invited: Vec<MembershipId> = Membership::find_any_state_by_user(user_id, conn)
+        .await
+        .into_iter()
+        .filter(|m| m.status == crate::db::models::MembershipStatus::Invited as i32)
+        .map(|m| m.uuid)
+        .collect();
+    Membership::accept_user_invitations(user_id, conn).await?;
+    super::keykeeper_two_step::accepted_without_them(invited, conn).await
+}
+
 #[post("/accounts/set-password", data = "<data>")]
 async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: SetPasswordData = data.into_inner();
@@ -487,7 +501,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     if CONFIG.mail_enabled() {
         mail::send_welcome(&user.email.to_lowercase()).await?;
     } else {
-        Membership::accept_user_invitations(&user.uuid, &conn).await?;
+        accept_invitations_for_them(&user.uuid, &conn).await?;
     }
 
     log_user_event(EventType::UserChangedPassword as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn)
