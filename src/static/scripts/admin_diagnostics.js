@@ -264,7 +264,7 @@ function checkSecurityHeaders(headers, omit) {
             "style-src 'self' 'unsafe-inline'",
             "child-src 'self' https://*.duosecurity.com https://*.duofederal.com",
             "frame-src 'self' https://*.duosecurity.com https://*.duofederal.com",
-            "frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh moz-extension://*",
+            "frame-ancestors 'self'",
             "img-src 'self' data: https://haveibeenpwned.com",
             "connect-src 'self' https://api.pwnedpasswords.com https://api.2fa.directory https://app.simplelogin.io/api/ https://app.addy.io/api/ https://api.fastmail.com/ https://api.forwardemail.net",
         ]
@@ -313,12 +313,13 @@ async function checkHttpResponse() {
         });
     }
 
-    // Check the special `-connector.html` headers, these should have some headers omitted.
-    const omitConnectorHeaders = ["x-frame-options", "content-security-policy"];
-    let connectorErrors = checkSecurityHeaders(webauthnConnector.headers, omitConnectorHeaders);
-    omitConnectorHeaders.forEach((header) => {
-        if (webauthnConnector.headers.get(header) !== null) {
-            connectorErrors.push(`'${header}' is present while it should not`);
+    // PassBundle: the `-connector.html` pages load only their own files, and
+    // may be framed only by the vault itself and PassBundle's extension.
+    let connectorErrors = checkSecurityHeaders(webauthnConnector.headers, ["content-security-policy"]);
+    const connectorCsp = webauthnConnector.headers.get("content-security-policy") ?? "";
+    ["default-src 'self'", "script-src 'self'", "object-src 'none'", "frame-ancestors 'self'"].forEach((expected) => {
+        if (connectorCsp.indexOf(expected) === -1) {
+            connectorErrors.push(`'content-security-policy' does not contain '${expected}'`);
         }
     });
     if (connectorErrors.length >= 1) {

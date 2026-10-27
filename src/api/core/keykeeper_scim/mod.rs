@@ -326,6 +326,11 @@ impl<'r> FromRequest<'r> for ScimCaller {
         let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
             return refused();
         };
+        // Keykeeper: a token works only while whoever made it still manages
+        // the organization, checked on every request (DESIGN.md, "Offboarding").
+        if !super::keykeeper_provisioning::token_maker_has_access(&token, &conn).await {
+            return refused();
+        }
         if let Err(e) = token.mark_used(&ip.to_string(), &conn).await {
             warn!("Couldn't record a provisioning request: {e:?}");
         }
@@ -1047,6 +1052,9 @@ async fn delete_user(caller: &ScimCaller, id: &str, conn: &DbConn, nt: &Notify<'
         return Err(ScimError::forbidden(PROTECTED));
     }
     log_scim_event(EventType::OrganizationUserRemoved, &person.member.uuid, org, &caller.ip, conn).await;
+    // Keykeeper: a removal holds (DESIGN.md, "Offboarding").
+    super::keykeeper_offboarding::before_removal(&person.member, super::keykeeper_offboarding::By::Directory, conn)
+        .await?;
     nt.send_user_update(UpdateType::SyncOrgKeys, &person.user, None, conn).await;
     if !CONFIG.mail_enabled()
         && !Membership::find_invited_by_user(&person.user.uuid, conn)

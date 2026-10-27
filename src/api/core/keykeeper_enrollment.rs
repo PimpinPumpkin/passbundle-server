@@ -18,7 +18,10 @@
 
 use rocket::{Route, serde::json::Json};
 
-use super::keykeeper_msp::{Audit, require_admin, staff_member};
+use super::{
+    keykeeper_msp::{Audit, require_admin, staff_member},
+    keykeeper_offboarding::require_client_place,
+};
 use crate::{
     CONFIG,
     api::JsonResult,
@@ -28,8 +31,8 @@ use crate::{
         models::{
             CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, Membership, MembershipStatus, MembershipType,
             Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
-            OrganizationId, ScimUser, User, effective_joining, email_in_domains, parse_enrollment_domains,
-            valid_encrypted_secret, valid_seal,
+            OrganizationId, RemovedMember, ScimUser, User, effective_joining, email_in_domains,
+            parse_enrollment_domains, valid_encrypted_secret, valid_seal,
         },
     },
     mail,
@@ -82,7 +85,9 @@ async fn setup_json(setup: &OrgSetup, conn: &DbConn) -> serde_json::Value {
 
 /// The install command's parts: the token, the join secret (encrypted with the
 /// organization's key, for the browser to show in the command), the email
-/// domains, and how many joined with it.
+/// domains, how many joined with it, and how many people the organization
+/// removed since the token was made: each may still have the command, so the
+/// apps offer to replace it (DESIGN.md, "Offboarding").
 async fn install_json(
     org_id: &OrganizationId,
     token: Option<&String>,
@@ -96,7 +101,22 @@ async fn install_json(
         "createdAt": created_at.map(crate::util::format_date),
         "joins": MspEnrollmentJoin::count_by_org(org_id, conn).await,
         "domains": EnrollmentDomains::for_org(org_id, conn).await,
+        "removedSinceToken": removed_since(org_id, token, created_at, conn).await,
     })
+}
+
+/// How many people the organization removed since its install command's token
+/// was made; none without a token.
+async fn removed_since(
+    org_id: &OrganizationId,
+    token: Option<&String>,
+    created_at: Option<&chrono::NaiveDateTime>,
+    conn: &DbConn,
+) -> i64 {
+    if token.is_none() {
+        return 0;
+    }
+    RemovedMember::count_since(org_id, created_at.copied(), conn).await
 }
 
 /// A seal from an app, checked to look like one. None when there isn't one.
@@ -152,7 +172,8 @@ async fn save_domains(
 async fn get_enrollment(msp_id: MspId, org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
     let staff = staff_member(&msp_id, &headers.user.uuid, &conn).await?;
     let client = msp_client(&msp_id, &org_id, &conn).await?;
-    if staff.role() == Some(MspRole::Technician) {
+    let technician = staff.role() == Some(MspRole::Technician);
+    if technician {
         if staff.reach(&conn).await.is_some_and(|r| !r.contains(&org_id)) {
             err_code!("Client not found", rocket::http::Status::NotFound.code)
         }
@@ -160,6 +181,10 @@ async fn get_enrollment(msp_id: MspId, org_id: OrganizationId, headers: Headers,
             err_code!("Your MSP's admins haven't given you install commands", rocket::http::Status::Forbidden.code)
         }
     }
+    // Keykeeper: only someone with a place of their own in the client, which
+    // a client that revoked them takes away (keykeeper_offboarding.rs). A
+    // technician's role there is the MSP's choice.
+    require_client_place(&org_id, &headers.user.uuid, !technician, &conn).await?;
     Ok(Json(enrollment_json(&client, &conn).await))
 }
 
@@ -176,6 +201,7 @@ async fn replace_enrollment(
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let secret = checked_secret(data.map(Json::into_inner).unwrap_or_default().secret.as_ref())?;
     let mut client = msp_client(&msp_id, &org_id, &conn).await?;
+    require_client_place(&org_id, &headers.user.uuid, true, &conn).await?;
     client.replace_enrollment_token(secret, &conn).await?;
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
     Audit::by("install_token_replaced", &headers).org(&org_id, &org_name).record(&msp_id, &conn).await?;
@@ -204,6 +230,7 @@ async fn set_enrollment_domains(
 ) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let client = msp_client(&msp_id, &org_id, &conn).await?;
+    require_client_place(&org_id, &headers.user.uuid, true, &conn).await?;
     let domains = save_domains(&org_id, &data, &conn).await?;
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
     Audit::by("install_domains_set", &headers)
@@ -268,7 +295,15 @@ async fn get_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbCo
     }
     if let Some(client) = MspClient::find_by_org(&org_id, &conn).await {
         let provider = Msp::find_by_uuid(&client.msp_uuid, &conn).await.map(|m| m.name).unwrap_or_default();
-        return Ok(Json(json!({ "provider": provider })));
+        // Keykeeper: so the Members page can ask the provider to replace it.
+        let removed = removed_since(
+            &org_id,
+            client.enrollment_token.as_ref(),
+            client.enrollment_token_created_at.as_ref(),
+            &conn,
+        )
+        .await;
+        return Ok(Json(json!({ "provider": provider, "removedSinceToken": removed })));
     }
     let setup = OrgSetup::find_by_org(&org_id, &conn).await;
     let setup = setup.as_ref();
