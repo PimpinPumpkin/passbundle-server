@@ -224,6 +224,9 @@ impl User {
         // this ends (keykeeper_reload_keys).
         crate::api::core::forget_reload_keys(&self.uuid);
         Device::rotate_refresh_tokens_by_user(&self.uuid, conn).await?;
+        // Keykeeper: and any setup session for two-step login for admins (a
+        // password change, account recovery, "Deauthorize sessions").
+        crate::db::models::TwoStepSetupSession::end_for_user(&self.uuid, conn).await?;
         Ok(())
     }
 

@@ -36,7 +36,7 @@ use crate::{
 
 use super::{
     keykeeper_msp::{Audit, require_admin, staff_member},
-    keykeeper_two_step,
+    keykeeper_two_step::{self, SessionFacts},
     organizations::{PolicyData, set_policy},
 };
 
@@ -428,12 +428,17 @@ async fn set_default(
     msp_id: MspId,
     pol_type: i32,
     headers: Headers,
+    session: SessionFacts,
     data: Json<DefaultPolicyData>,
     conn: DbConn,
 ) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let t = offered_type(pol_type)?;
     let data = data.into_inner();
+    // Only someone who meets two-step login for admins turns its default off.
+    if t == Kind::AdminTwoStep && !data.enabled {
+        keykeeper_two_step::require_caller_meets(&headers.user, &session, &conn).await?;
+    }
     let options = data.data.unwrap_or(Value::Null);
     if !(options.is_null() || options.is_object()) {
         err!("Policy options must be an object")
@@ -515,11 +520,17 @@ async fn use_default(
     msp_id: MspId,
     pol_type: i32,
     headers: Headers,
+    session: SessionFacts,
     data: Json<UseDefaultData>,
     conn: DbConn,
 ) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let t = offered_type(pol_type)?;
+    // Putting clients back on a default of off turns two-step login for
+    // admins off there: only someone who meets it does that.
+    if t == Kind::AdminTwoStep && default_effect(&defaults(&msp_id, &conn).await, t).is_none() {
+        keykeeper_two_step::require_caller_meets(&headers.user, &session, &conn).await?;
+    }
 
     // Every client must be this MSP's before anything changes.
     let mut seen = HashSet::new();

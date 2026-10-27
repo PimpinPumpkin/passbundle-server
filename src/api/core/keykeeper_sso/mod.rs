@@ -1457,6 +1457,13 @@ impl SsoLogin {
     pub fn org_id(&self) -> &OrganizationId {
         &self.org_id
     }
+
+    /// Whether this sign-in counts for two-step login for admins: the
+    /// tenant's own MFA (Conditional Access) is what covers it, so not when
+    /// the ID token says it had none (`amr` without "mfa").
+    pub fn counts_for_two_step(&self) -> bool {
+        !self.identity.without_mfa
+    }
 }
 
 /// The app redeems the code this server gave it (grant type

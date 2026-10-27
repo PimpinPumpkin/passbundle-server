@@ -104,7 +104,7 @@ async fn activate_authenticator(
         "object": "twoFactorAuthenticator"
     });
     // Keykeeper: a setup session ends here.
-    finish_setup(headers.session.as_ref(), &user, &mut answer, &conn).await?;
+    finish_setup(headers.session.as_ref(), &mut user, &mut answer, &conn).await?;
     Ok(Json(answer))
 }
 
@@ -211,6 +211,9 @@ struct DisableAuthenticatorData {
 async fn disable_authenticator(data: Json<DisableAuthenticatorData>, headers: Headers, conn: DbConn) -> JsonResult {
     let user = headers.user;
     let type_ = data.r#type.into_i32()?;
+    // Keykeeper: their last method that counts for two-step login for admins
+    // may go, which ends their sessions.
+    let watch = crate::api::core::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
 
     if !user.check_valid_password(&data.master_password_hash) {
         err!("Invalid password");
@@ -230,6 +233,7 @@ async fn disable_authenticator(data: Json<DisableAuthenticatorData>, headers: He
     if TwoFactor::find_by_user(&user.uuid, &conn).await.is_empty() {
         super::enforce_2fa_policy(&user, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await?;
     }
+    watch.settle(&conn).await?;
 
     Ok(Json(json!({
         "enabled": false,

@@ -338,6 +338,8 @@ async fn accept_org_invite(
             "MSP staff can't join an organization's account recovery. Ask its admins to turn off automatic enrollment for you, or join with another account."
         )
     }
+    // Keykeeper: joining may bring them under two-step login for admins.
+    let watch = keykeeper_two_step::Watch::user(&user.uuid, conn).await?;
     member.status = MembershipStatus::Accepted as i32;
     member.reset_password_key = reset_password_key;
 
@@ -345,6 +347,7 @@ async fn accept_org_invite(
     OrgPolicy::check_user_allowed(&member, "join", conn).await?;
 
     member.save(conn).await?;
+    watch.settle(conn).await?;
 
     if CONFIG.mail_enabled() && notify_inviter {
         let Some(org) = Organization::find_by_uuid(&member.org_uuid, conn).await else {

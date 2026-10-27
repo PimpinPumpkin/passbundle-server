@@ -32,7 +32,7 @@ pub mod protected_actions;
 pub mod webauthn;
 pub mod yubikey;
 
-fn has_global_duo_credentials() -> bool {
+pub(crate) fn has_global_duo_credentials() -> bool {
     CONFIG._enable_duo() && CONFIG.duo_host().is_some() && CONFIG.duo_ikey().is_some() && CONFIG.duo_skey().is_some()
 }
 
@@ -132,6 +132,9 @@ struct DisableTwoFactorData {
 async fn disable_twofactor(data: Json<DisableTwoFactorData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: DisableTwoFactorData = data.into_inner();
     let user = headers.user;
+    // Keykeeper: their last method that counts for two-step login for admins
+    // may go, which ends their sessions.
+    let watch = super::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
 
     // Delete directly after a valid token has been provided
     PasswordOrOtpData {
@@ -153,6 +156,7 @@ async fn disable_twofactor(data: Json<DisableTwoFactorData>, headers: Headers, c
     if TwoFactor::find_by_user(&user.uuid, &conn).await.is_empty() {
         enforce_2fa_policy(&user, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await?;
     }
+    watch.settle(&conn).await?;
 
     Ok(Json(json!({
         "enabled": false,

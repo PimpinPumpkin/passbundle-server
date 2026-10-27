@@ -966,6 +966,8 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
                     "An owner or admin turned this person off in PassBundle; they turn them back on there.",
                 ));
             }
+            // Restored, they may come under two-step login for admins.
+            let watch = crate::api::core::keykeeper_two_step::Watch::user(&person.member.user_uuid, conn).await?;
             person.member.restore();
             // Upstream's checks for restoring someone: single organization,
             // two-step login.
@@ -973,6 +975,7 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
                 return Err(ScimError::new(Status::Conflict, None, e.message().to_owned()));
             }
             person.member.save(conn).await?;
+            watch.settle(conn).await?;
             scim.turned_off = false;
             log_scim_event(EventType::OrganizationUserRestored, &person.member.uuid, org, &caller.ip, conn).await;
         } else {

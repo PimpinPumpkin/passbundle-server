@@ -425,12 +425,15 @@ async fn keykeeper_sso_login(
     }
 
     // Keykeeper: two-step login for admins. This organization's single
-    // sign-on meets its own requirement for its admins and custom roles; any
-    // other that isn't met gets a setup session instead of a login.
-    keykeeper_two_step::check_sign_in(&user, Some(login.org_id()), false, device.atype, conn).await?;
+    // sign-on meets its own requirement for its admins and custom roles
+    // (unless its ID token says the sign-in had no MFA), and the session
+    // records it for its refreshes; any other that isn't met gets a setup
+    // session instead of a login.
+    let sso_org = login.counts_for_two_step().then(|| login.org_id().clone());
+    keykeeper_two_step::check_sign_in(&user, sso_org.as_ref(), false, device.atype, conn).await?;
 
     keykeeper_sso::finish_login(&login, &user, device.atype, &ip.ip, conn).await?;
-    let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Sso, data.client_id);
+    let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Sso, data.client_id).with_sso_org(sso_org);
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }
 
@@ -1057,6 +1060,12 @@ async fn twofactor_auth(
 
             // Remove the recovery code, not needed without twofactors
             user.totp_recover = None;
+            // Keykeeper: someone two-step login for admins covers now has no
+            // method that counts, so their other sessions end (as Watch does),
+            // and this sign-in gets a setup session.
+            if !keykeeper_two_step::requirements(&user.uuid, conn).await?.is_empty() {
+                user.reset_security_stamp(conn).await?;
+            }
             user.save(conn).await?;
         }
         _ => err!(

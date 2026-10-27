@@ -170,6 +170,16 @@ async fn activate_duo(data: Json<EnableDuoData>, headers: SetupHeaders, conn: Db
     .validate(&user, true, &conn)
     .await?;
 
+    // Keykeeper: two-step login for admins counts Duo only with this
+    // server's own Duo account, so a setup session can't set up another; and
+    // replacing it with one's own may take someone's last method that counts.
+    if headers.session.is_some() && check_duo_fields_custom(&data) {
+        err!(
+            "Two-step login for your role counts Duo only with this server's own Duo account. Leave the Duo fields empty to use it."
+        )
+    }
+    let watch = crate::api::core::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
+
     let (data, data_str) = if check_duo_fields_custom(&data) {
         let data_req: DuoData = data.into();
         let data_str = serde_json::to_string(&data_req)?;
@@ -195,7 +205,8 @@ async fn activate_duo(data: Json<EnableDuoData>, headers: SetupHeaders, conn: Db
         "object": "twoFactorDuo"
     });
     // Keykeeper: a setup session ends here.
-    finish_setup(headers.session.as_ref(), &user, &mut answer, &conn).await?;
+    finish_setup(headers.session.as_ref(), &mut user, &mut answer, &conn).await?;
+    watch.settle(&conn).await?;
     Ok(Json(answer))
 }
 

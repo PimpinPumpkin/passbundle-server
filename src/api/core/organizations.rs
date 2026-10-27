@@ -1154,6 +1154,9 @@ async fn send_invite(
             }
         };
 
+        // Keykeeper: an account invited without email joins at once, and may
+        // come under two-step login for admins.
+        let watch = super::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
         let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(headers.user.email.clone()));
         new_member.access_all = access_all;
         new_member.atype = new_type;
@@ -1233,6 +1236,7 @@ async fn send_invite(
             let mut group_entry = GroupUser::new(group_id.clone(), new_member.uuid.clone());
             group_entry.save(&conn).await?;
         }
+        watch.settle(&conn).await?;
     }
 
     Ok(())
@@ -1349,9 +1353,12 @@ async fn reinvite_member_impl(
         invitation.save(conn).await?;
     } else {
         Invitation::take(&user.email, conn).await;
+        // Keykeeper: joining may bring them under two-step login for admins.
+        let watch = super::keykeeper_two_step::Watch::user(&user.uuid, conn).await?;
         let mut member = member;
         member.status = MembershipStatus::Accepted as i32;
         member.save(conn).await?;
+        watch.settle(conn).await?;
     }
 
     Ok(())
@@ -1750,6 +1757,8 @@ async fn edit_member(
         }
     }
 
+    // Keykeeper: a new role may bring them under two-step login for admins.
+    let watch = super::keykeeper_two_step::Watch::user(&member_to_edit.user_uuid, &conn).await?;
     member_to_edit.access_all = access_all;
     member_to_edit.atype = new_type as i32;
 
@@ -1805,7 +1814,8 @@ async fn edit_member(
 
     // Keykeeper: keep the custom role in step with the edit.
     crate::db::models::keykeeper_roles::set(&member_to_edit.uuid, custom_role.as_ref(), &conn).await?;
-    member_to_edit.save(&conn).await
+    member_to_edit.save(&conn).await?;
+    watch.settle(&conn).await
 }
 
 #[delete("/organizations/<org_id>/users", data = "<data>")]
@@ -2667,11 +2677,14 @@ async fn restore_member_impl(
                 err!("Only owners can restore other owners")
             }
 
+            // Keykeeper: restored, they may come under two-step login for admins.
+            let watch = super::keykeeper_two_step::Watch::user(&member.user_uuid, conn).await?;
             member.restore();
             // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
             // This check need to be done after restoring to work with the correct status
             OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
             member.save(conn).await?;
+            watch.settle(conn).await?;
 
             log_event(
                 EventType::OrganizationUserRestored,
