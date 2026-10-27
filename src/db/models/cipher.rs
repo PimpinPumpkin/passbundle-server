@@ -177,18 +177,17 @@ impl Cipher {
             }
         }
 
-        // We don't need these values at all for Organizational syncs
-        // Skip any other database calls if this is the case and just return false.
-        // Keykeeper: the person's capabilities on the item, from the grid.
-        let grid = if sync_type == CipherSyncType::User {
-            if let Some(grid) = self.grid_for_user(user_uuid, cipher_sync_data, conn).await {
-                grid
-            } else {
-                error!("Cipher ownership assertion failure");
-                Grid::NONE
-            }
+        // Keykeeper: the person's capabilities on the item, from the grid. An
+        // organization's admin view sends only viewPassword of them, from the
+        // same grid: full access gives see passwords, and anyone else gets
+        // what their shared folders give them.
+        let grid = if let Some(grid) = self.grid_for_user(user_uuid, cipher_sync_data, conn).await {
+            grid
         } else {
-            Grid::ALL
+            if sync_type == CipherSyncType::User {
+                error!("Cipher ownership assertion failure");
+            }
+            Grid::NONE
         };
 
         let fields_json: Vec<_> = self
@@ -367,10 +366,9 @@ impl Cipher {
 
         // Keykeeper: whether the person may see the item's passwords, on every
         // item sent, so apps can hide them when it's missing rather than show
-        // them (DESIGN.md, "Folders and permissions"). From the grid for the
-        // person's own sync; an organization's admin view (and an item's
-        // version history, which sends contents only to those who may see
-        // them) shows everything.
+        // them (DESIGN.md, "Folders and permissions"). From the person's grid,
+        // on their own sync and an organization's admin view alike. (An item's
+        // version history sets it from the person's grid too.)
         json_object["viewPassword"] = json!(grid.see_passwords);
 
         // These values are only needed for user/default syncs
