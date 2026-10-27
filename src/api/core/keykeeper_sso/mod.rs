@@ -971,12 +971,21 @@ pub async fn start_linking(user_id: &UserId, org_id: &OrganizationId, conn: &DbC
 /// linked in an organization whose single sign-on is on. Checked at every
 /// refresh.
 pub async fn sso_session_live(user_id: &UserId, conn: &DbConn) -> bool {
+    !live_sso_orgs(user_id, conn).await.is_empty()
+}
+
+/// The organizations whose single sign-on still signs this account in: it's
+/// linked there, and single sign-on is on with the same tenant. A session
+/// single sign-on started came from one of them (two-step login for admins
+/// counts it for these, keykeeper_two_step::may_refresh).
+pub async fn live_sso_orgs(user_id: &UserId, conn: &DbConn) -> Vec<OrganizationId> {
+    let mut orgs = Vec::new();
     for link in SsoLink::find_all_by_user(user_id, conn).await {
         if SsoConfig::find(&link.org_uuid, conn).await.is_some_and(|c| c.ready() && c.tenant_id == link.tenant_id) {
-            return true;
+            orgs.push(link.org_uuid);
         }
     }
-    false
+    orgs
 }
 
 /// The checks for "Require single sign-on" and what it depends on, run
@@ -1441,6 +1450,13 @@ pub struct SsoLogin {
     org_id: OrganizationId,
     new_link: bool,
     member: Option<MembershipId>,
+}
+
+impl SsoLogin {
+    /// The organization whose single sign-on this is.
+    pub fn org_id(&self) -> &OrganizationId {
+        &self.org_id
+    }
 }
 
 /// The app redeems the code this server gave it (grant type

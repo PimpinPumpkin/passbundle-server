@@ -1157,7 +1157,7 @@ pub fn backoff(attempts: i32) -> TimeDelta {
 
 /// What kind of thing an event is about, its name in words, and how much a
 /// security team should care, by upstream's event type codes. Codes 1190,
-/// 1191, 1590, 1591, and 1690 to 1694 are ours.
+/// 1191, 1590, 1591, and 1690 to 1696 are ours.
 pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
     let (name, severity) = match code {
         1000 => ("Logged in", "low"),
@@ -1242,6 +1242,8 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         1692 => ("Removed a place events are sent", "high"),
         1693 => ("The server stopped sending to a place events are sent", "high"),
         1694 => ("Changed the single sign-on settings", "high"),
+        1695 => ("Turned on two-step login for admins", "high"),
+        1696 => ("Turned off two-step login for admins", "high"),
         1700 => ("Changed a policy", "medium"),
         2000 => ("Added a domain for single sign-on", "high"),
         2001 => ("Removed a domain from single sign-on", "high"),
@@ -1511,6 +1513,11 @@ fn msp_code(action: &str) -> (i32, &'static str, &'static str) {
         "sso_domain_removed" => (9185, "Removed a domain from a client's single sign-on", "high"),
         "sso_unlinked" => (9186, "Unlinked someone's single sign-on in a client", "medium"),
         "sso_api_keys_replaced" => (9187, "Replaced a client's members' API keys for single sign-on", "high"),
+        "staff_two_step_set" => (9190, "Changed whether the MSP's staff must use two-step login", "high"),
+        "client_admin_two_step_set" => (9191, "Changed whether a client's admins must use two-step login", "high"),
+        "admin_two_step_default_set" => {
+            (9192, "Changed whether clients' admins must use two-step login by default", "high")
+        }
         _ => (9199, "MSP activity", "low"),
     }
 }
@@ -1666,6 +1673,23 @@ mod tests {
         ] {
             let (c, _, s) = msp_code(action);
             assert_eq!((c, s), (code, severity), "{action}");
+            assert_eq!(priority(c, s), KEPT, "{action}");
+        }
+    }
+
+    #[test]
+    fn two_step_login_for_admins_is_high_and_kept() {
+        assert_eq!(describe(1695), ("organization", "Turned on two-step login for admins", "high"));
+        assert_eq!(describe(1696), ("organization", "Turned off two-step login for admins", "high"));
+        for code in [1695, 1696] {
+            assert_eq!(priority(code, describe(code).2), KEPT, "{code}");
+            assert!(!merges(code), "{code}");
+        }
+        for (action, code) in
+            [("staff_two_step_set", 9190), ("client_admin_two_step_set", 9191), ("admin_two_step_default_set", 9192)]
+        {
+            let (c, _, s) = msp_code(action);
+            assert_eq!((c, s), (code, "high"), "{action}");
             assert_eq!(priority(c, s), KEPT, "{action}");
         }
     }

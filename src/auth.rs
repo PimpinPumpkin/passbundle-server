@@ -1522,6 +1522,19 @@ pub async fn refresh_tokens(
         {
             err!("Your organization requires you to sign in with single sign-on. Sign in again.")
         }
+        // Keykeeper: someone whose role now requires two-step login, which
+        // they don't have (they turned it off, were promoted, or it was turned
+        // on), signs in again and sets it up there.
+        AuthMethod::Sso | AuthMethod::Password
+            if !crate::api::core::keykeeper_two_step::may_refresh(
+                &user,
+                matches!(refresh_claims.sub, AuthMethod::Sso),
+                conn,
+            )
+            .await =>
+        {
+            err!(crate::api::core::keykeeper_two_step::REFRESH_REFUSED)
+        }
         // Keykeeper: an organization's own single sign-on proves who someone
         // is once; the session is PassBundle's own, as for a password.
         AuthMethod::Sso | AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),

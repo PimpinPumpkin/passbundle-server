@@ -18,7 +18,11 @@ use crate::{
     CONFIG,
     api::{
         EmptyResult, JsonResult, PasswordOrOtpData,
-        core::{log_user_event, two_factor::generate_recover_code},
+        core::{
+            keykeeper_two_step::{SetupHeaders, finish_setup},
+            log_user_event,
+            two_factor::generate_recover_code,
+        },
     },
     auth::Headers,
     crypto::ct_eq,
@@ -107,8 +111,11 @@ impl WebauthnRegistration {
     }
 }
 
+// Keykeeper: the setup endpoints also take a setup session (SetupHeaders),
+// which a sign-in gets when the person's role requires two-step login and
+// they haven't set it up (DESIGN.md, "Two-step login for admins").
 #[post("/two-factor/get-webauthn", data = "<data>")]
-async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     if !CONFIG.is_webauthn_2fa_supported() {
         err!("Configured `DOMAIN` is not compatible with Webauthn")
     }
@@ -129,7 +136,7 @@ async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbC
 }
 
 #[post("/two-factor/get-webauthn-challenge", data = "<data>")]
-async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
@@ -253,7 +260,7 @@ impl From<PublicKeyCredentialCopy> for PublicKeyCredential {
 }
 
 #[post("/two-factor/webauthn", data = "<data>")]
-async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     let data: EnableWebauthnData = data.into_inner();
     let mut user = headers.user;
 
@@ -293,18 +300,21 @@ async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, con
         .await?;
     generate_recover_code(&mut user, &conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device_type, &headers.ip.ip, &conn).await;
 
     let keys_json: Vec<Value> = registrations.iter().map(WebauthnRegistration::to_json).collect();
-    Ok(Json(json!({
+    let mut answer = json!({
         "enabled": true,
         "keys": keys_json,
         "object": "twoFactorU2f"
-    })))
+    });
+    // Keykeeper: a setup session ends here.
+    finish_setup(headers.session.as_ref(), &user, &mut answer, &conn).await?;
+    Ok(Json(answer))
 }
 
 #[put("/two-factor/webauthn", data = "<data>")]
-async fn activate_webauthn_put(data: Json<EnableWebauthnData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_webauthn_put(data: Json<EnableWebauthnData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     activate_webauthn(data, headers, conn).await
 }
 

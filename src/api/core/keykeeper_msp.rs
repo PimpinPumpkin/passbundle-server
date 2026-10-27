@@ -1169,7 +1169,7 @@ async fn get_organization_msp(org_id: OrganizationId, headers: Headers, conn: Db
     Ok(Json(json!({
         "msp": { "id": msp.uuid, "name": msp.name },
         "staff": staff,
-        "ownPolicies": keykeeper_msp_policies::own_policies(&msp.uuid, &org_id, &conn).await,
+        "ownPolicies": keykeeper_msp_policies::own_policies(&msp.uuid, &org_id, &conn).await?,
     })))
 }
 

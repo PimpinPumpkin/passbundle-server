@@ -2,7 +2,12 @@ use data_encoding::BASE32;
 use rocket::{Route, serde::json::Json};
 
 use crate::{
-    api::{EmptyResult, JsonResult, PasswordOrOtpData, core::log_user_event, core::two_factor::generate_recover_code},
+    api::{
+        EmptyResult, JsonResult, PasswordOrOtpData,
+        core::keykeeper_two_step::{SetupHeaders, finish_setup},
+        core::log_user_event,
+        core::two_factor::generate_recover_code,
+    },
     auth::{ClientIp, Headers},
     crypto,
     db::{
@@ -18,8 +23,11 @@ pub fn routes() -> Vec<Route> {
     routes![generate_authenticator, activate_authenticator, activate_authenticator_put, disable_authenticator]
 }
 
+// Keykeeper: the setup endpoints also take a setup session (SetupHeaders),
+// which a sign-in gets when the person's role requires two-step login and
+// they haven't set it up (DESIGN.md, "Two-step login for admins").
 #[post("/two-factor/get-authenticator", data = "<data>")]
-async fn generate_authenticator(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn generate_authenticator(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
@@ -54,7 +62,11 @@ struct EnableAuthenticatorData {
 }
 
 #[post("/two-factor/authenticator", data = "<data>")]
-async fn activate_authenticator(data: Json<EnableAuthenticatorData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_authenticator(
+    data: Json<EnableAuthenticatorData>,
+    headers: SetupHeaders,
+    conn: DbConn,
+) -> JsonResult {
     let data: EnableAuthenticatorData = data.into_inner();
     let key = data.key;
     let token = data.token.into_string();
@@ -84,17 +96,24 @@ async fn activate_authenticator(data: Json<EnableAuthenticatorData>, headers: He
 
     generate_recover_code(&mut user, &conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device_type, &headers.ip.ip, &conn).await;
 
-    Ok(Json(json!({
+    let mut answer = json!({
         "enabled": true,
         "key": key,
         "object": "twoFactorAuthenticator"
-    })))
+    });
+    // Keykeeper: a setup session ends here.
+    finish_setup(headers.session.as_ref(), &user, &mut answer, &conn).await?;
+    Ok(Json(answer))
 }
 
 #[put("/two-factor/authenticator", data = "<data>")]
-async fn activate_authenticator_put(data: Json<EnableAuthenticatorData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_authenticator_put(
+    data: Json<EnableAuthenticatorData>,
+    headers: SetupHeaders,
+    conn: DbConn,
+) -> JsonResult {
     activate_authenticator(data, headers, conn).await
 }
 

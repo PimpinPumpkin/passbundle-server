@@ -13,6 +13,8 @@ use crate::{
     CONFIG,
     // Keykeeper: each organization's own single sign-on.
     api::core::keykeeper_sso,
+    // Keykeeper: two-step login for admins.
+    api::core::keykeeper_two_step,
     api::{
         ApiResult, EmptyResult, JsonResult,
         core::{
@@ -422,6 +424,11 @@ async fn keykeeper_sso_login(
         user.save(conn).await?;
     }
 
+    // Keykeeper: two-step login for admins. This organization's single
+    // sign-on meets its own requirement for its admins and custom roles; any
+    // other that isn't met gets a setup session instead of a login.
+    keykeeper_two_step::check_sign_in(&user, Some(login.org_id()), false, device.atype, conn).await?;
+
     keykeeper_sso::finish_login(&login, &user, device.atype, &ip.ip, conn).await?;
     let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Sso, data.client_id);
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
@@ -598,6 +605,13 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             format!("IP: {}. Username: {log_username}. Single sign-on required; linking first.", ip.ip)
         )
     }
+
+    // Keykeeper: two-step login for admins. Someone whose role requires it
+    // and who has no method that counts (an authenticator app, a security key
+    // or passkey, or Duo; email codes don't) gets a setup session, which can
+    // only set one up, instead of a login. A device's approval proves no
+    // password, so it gets none. See keykeeper_two_step.
+    keykeeper_two_step::check_sign_in(&user, None, data.auth_request.is_some(), device.atype, conn).await?;
 
     // Like upstream, an auth request can be used for one login only. Marked after 2FA so a 2FA prompt doesn't use it up.
     if let Some(ref auth_request_id) = data.auth_request
@@ -776,6 +790,10 @@ async fn user_api_key_login(
             }
         )
     }
+
+    // Keykeeper: an API key skips two-step login, so it doesn't sign in
+    // someone whose role requires two-step login and who hasn't set it up.
+    keykeeper_two_step::check_api_key(&user, conn).await?;
 
     let mut device = get_device(&data, conn, &user).await?;
 
