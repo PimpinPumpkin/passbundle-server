@@ -267,6 +267,8 @@ async fn delete_organization(
     let data: PasswordOrOtpData = data.into_inner();
 
     data.validate(&headers.user, true, &conn).await?;
+    // Keykeeper: an MSP's people can't delete a client that has owners of its own.
+    super::keykeeper_offboarding::ensure_may_delete_org(&org_id, &headers.user, &conn).await?;
 
     match Organization::find_by_uuid(&org_id, &conn).await {
         None => err!("Organization not found"),
@@ -1140,6 +1142,8 @@ async fn send_invite(
                 if Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await.is_some() {
                     err!(format!("User already in organization: {}", email.escape_debug()))
                 }
+                // Keykeeper: a new invitation clears an earlier removal (keykeeper_offboarding.rs).
+                super::keykeeper_offboarding::on_invite(&org_id, &user, &headers.user, &conn).await?;
 
                 if !CONFIG.mail_enabled() {
                     if user.password_hash.is_empty() {
@@ -1566,6 +1570,11 @@ async fn confirm_invite_impl(
     {
         super::keykeeper_msp_templates::give_templates(&member_to_confirm, &client, conn).await?;
     }
+    // Keykeeper: an approval settles an earlier removal, and the invitation's
+    // seal has done its work (keykeeper_offboarding.rs).
+    if save_result.is_ok() {
+        super::keykeeper_offboarding::after_confirm(&member_to_confirm, conn).await?;
+    }
 
     if let Some(user) = User::find_by_uuid(&member_to_confirm.user_uuid, conn).await {
         nt.send_user_update(UpdateType::SyncOrgKeys, &user, headers.device.push_uuid.as_ref(), conn).await;
@@ -1735,6 +1744,18 @@ async fn edit_member(
     {
         err!("Only Owners can grant and remove Admin or Owner privileges")
     }
+    // Keykeeper: the client sets its MSP's people's roles by removing or
+    // revoking them, and an MSP's people don't demote the client's own owners
+    // (keykeeper_offboarding.rs).
+    super::keykeeper_offboarding::check_role_change(
+        &member_to_edit,
+        new_type,
+        access_all,
+        custom_role.as_ref(),
+        &headers.user,
+        &conn,
+    )
+    .await?;
 
     if member_to_edit.atype == MembershipType::Owner && headers.membership_type != MembershipType::Owner {
         err!("Only Owners can edit Owner users")
@@ -1888,6 +1909,15 @@ async fn delete_member_impl(
             err!("Can't delete the last owner")
         }
     }
+    // Keykeeper: an MSP's people don't remove the client's own owners, and a
+    // removal holds (keykeeper_offboarding.rs).
+    super::keykeeper_offboarding::protect_own_owner(&member_to_delete, &headers.user, "remove", conn).await?;
+    super::keykeeper_offboarding::before_removal(
+        &member_to_delete,
+        super::keykeeper_offboarding::By::Member(&headers.user),
+        conn,
+    )
+    .await?;
 
     log_event(
         EventType::OrganizationUserRemoved,
@@ -2563,6 +2593,15 @@ async fn revoke_member_impl(
             {
                 err!("Organization must have at least one confirmed owner")
             }
+            // Keykeeper: an MSP's people don't revoke the client's own owners,
+            // and a revoke of the MSP's people holds (keykeeper_offboarding.rs).
+            super::keykeeper_offboarding::protect_own_owner(&member, &headers.user, "revoke", conn).await?;
+            super::keykeeper_offboarding::before_revoke(
+                &member,
+                super::keykeeper_offboarding::By::Member(&headers.user),
+                conn,
+            )
+            .await?;
 
             member.revoke();
             member.save(conn).await?;
@@ -2666,12 +2705,17 @@ async fn restore_member_impl(
             if member.atype == MembershipType::Owner && headers.membership_type != MembershipType::Owner {
                 err!("Only owners can restore other owners")
             }
+            // Keykeeper: only the client's own people restore its MSP's people
+            // they revoked (keykeeper_offboarding.rs).
+            let by = super::keykeeper_offboarding::By::Member(&headers.user);
+            super::keykeeper_offboarding::check_restore(&member, by, conn).await?;
 
             member.restore();
             // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
             // This check need to be done after restoring to work with the correct status
             OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
             member.save(conn).await?;
+            super::keykeeper_offboarding::after_restore(&member, by, conn).await?;
 
             log_event(
                 EventType::OrganizationUserRestored,
@@ -3312,6 +3356,9 @@ async fn check_reset_password_applicable_and_permissions(
         conn,
     )
     .await?;
+    // Keykeeper: an MSP's people don't recover the client's own owners
+    // (keykeeper_offboarding.rs).
+    super::keykeeper_offboarding::protect_own_owner(&target_user, &headers.user, "recover", conn).await?;
 
     // Resetting user must be higher/equal to user to reset
     match headers.membership_type {
@@ -3381,6 +3428,29 @@ async fn put_reset_password_enrollment(
         }
         .validate(&headers.user, true, &conn)
         .await?;
+    }
+
+    // Keykeeper: someone who just set their master password after their first
+    // single sign-on joins here, with the recovery key, as accepting an
+    // emailed invitation does (accounts.rs, post_set_password). Only for an
+    // account the organization's single sign-on linked.
+    if membership.status == MembershipStatus::Invited as i32
+        && reset_password_key.is_some()
+        && crate::db::models::SsoLink::find_by_user(&org_id, &headers.user.uuid, &conn).await.is_some()
+    {
+        let member_id = membership.uuid.clone();
+        accept_org_invite(&headers.user, membership, reset_password_key, true, &conn).await?;
+        log_event(
+            EventType::OrganizationUserResetPasswordEnroll,
+            &member_id,
+            &org_id,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &conn,
+        )
+        .await;
+        return Ok(());
     }
 
     membership.reset_password_key = reset_password_key;

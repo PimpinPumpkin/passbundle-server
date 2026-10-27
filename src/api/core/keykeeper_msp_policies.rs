@@ -357,6 +357,16 @@ async fn set_default(
             kept.push(client_json(&org));
             continue;
         }
+        // Keykeeper: never in a client where the caller has no place of their
+        // own, such as one that revoked them (keykeeper_offboarding.rs).
+        if !super::keykeeper_offboarding::has_client_place(&org.uuid, &headers.user.uuid, true, &conn).await {
+            refused.push(json!({
+                "id": org.uuid,
+                "name": org.name,
+                "error": super::keykeeper_offboarding::client_place_refusal(&org.uuid, &conn).await,
+            }));
+            continue;
+        }
         match apply(&org.uuid, t, Some(&default), &headers, &conn).await {
             Ok(()) => changed.push(client_json(&org)),
             Err(e) => refused.push(refused_json(&org, &e)),
@@ -426,6 +436,15 @@ async fn use_default(
     let (mut changed, mut refused) = (Vec::new(), Vec::new());
     for org in &orgs {
         if client_effect(&org.uuid, t, &conn).await == want {
+            continue;
+        }
+        // Keykeeper: as in set_default.
+        if !super::keykeeper_offboarding::has_client_place(&org.uuid, &headers.user.uuid, true, &conn).await {
+            refused.push(json!({
+                "id": org.uuid,
+                "name": org.name,
+                "error": super::keykeeper_offboarding::client_place_refusal(&org.uuid, &conn).await,
+            }));
             continue;
         }
         match apply(&org.uuid, t, defaults.get(&(t as i32)), &headers, &conn).await {
