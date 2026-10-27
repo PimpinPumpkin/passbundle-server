@@ -803,8 +803,14 @@ make_config! {
         /// Bypass admin page security (Know the risks!) |> Disables the Admin Token for the admin page so you may use your own auth in-front
         disable_admin_token:    bool,   false,  def,    false;
 
-        /// Allowed iframe ancestors (Know the risks!) |> Allows other domains to embed the web vault into an iframe, useful for embedding into secure intranets
+        /// Allowed iframe ancestors (Know the risks!) |> Allows other domains to embed the web vault into an iframe, useful for embedding into secure intranets. PassBundle: never the connector pages (security key, Duo, single sign-on), which only the vault itself and PassBundle's extension may frame
         allowed_iframe_ancestors: String, true, def,    String::new();
+
+        /// HSTS for subdomains too |> PassBundle: adds includeSubDomains to the Strict-Transport-Security header, which the server sends when DOMAIN is https on a host name (never localhost or an address). Turn it on only when every name under DOMAIN's host serves HTTPS.
+        hsts_include_subdomains:  bool,  true,  def,    false;
+
+        /// PassBundle extension IDs |> PassBundle: the Chrome and Edge extension IDs, separated by commas, that may frame the vault's pages and ask for a security key's answer from them. Change it only for a development build of the extension loaded with another key.
+        extension_ids:            String, false, def,   crate::keykeeper_origins::PASSBUNDLE_EXTENSION_IDS.to_owned();
 
         /// Allowed connect-src (Know the risks!) |> Allows other domains to URLs which can be loaded using script interfaces like the Forwarded email alias feature
         allowed_connect_src:      String, true, def,    String::new();
@@ -1131,6 +1137,11 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         err!(
             "DOMAIN variable needs to contain the protocol (http, https). Use 'http[s]://bw.example.com' instead of 'bw.example.com'"
         );
+    }
+
+    // Keykeeper: the extensions that may frame the vault's pages.
+    if let Err(e) = crate::keykeeper_origins::validate_extension_ids(&cfg.extension_ids) {
+        err!(e);
     }
 
     let connect_src = cfg.allowed_connect_src.to_lowercase();

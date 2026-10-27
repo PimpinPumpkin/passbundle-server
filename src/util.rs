@@ -76,12 +76,27 @@ impl Fairing for AppHeaders {
             res.set_raw_header("Cross-Origin-Resource-Policy", "same-origin");
         }
 
-        // Do not send the Content-Security-Policy (CSP) Header and X-Frame-Options for the *-connector.html files.
-        // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
-        // This is the same behavior as upstream Bitwarden.
+        // Keykeeper: HTTPS only from the first visit on, when DOMAIN is https
+        // on a real host name; never for localhost or an address, and the
+        // names under the vault's host only with HSTS_INCLUDE_SUBDOMAINS.
+        // Rocket's Shield adds its own HSTS to a release build serving TLS
+        // itself, so it's taken off where none belongs.
+        match crate::keykeeper_origins::hsts_value(&CONFIG.domain(), CONFIG.hsts_include_subdomains()) {
+            Some(hsts) => {
+                res.set_raw_header("Strict-Transport-Security", hsts);
+            }
+            None => res.remove_header("Strict-Transport-Security"),
+        }
+
+        // Keykeeper: the *-connector.html pages (security key, Duo, single
+        // sign-on) read their inputs from the address. Upstream sent them with
+        // no CSP and no X-Frame-Options, so any site could frame them, and a
+        // phishing page could receive a security key's answer through one.
+        // Only the vault itself and PassBundle's extension may frame them now,
+        // never ALLOWED_IFRAME_ANCESTORS, and they load only their own files
+        // (DESIGN.md, "Connector pages").
         if req_uri_path.ends_with("connector.html") {
-            // It looks like this header get's set somewhere else also, make sure this is not sent for these files, it will cause MFA issues.
-            res.remove_header("X-Frame-Options");
+            res.set_raw_header("Content-Security-Policy", crate::keykeeper_origins::connector_csp());
         } else {
             let csp = if is_image {
                 // Prevent scripts, frames, objects, etc., from loading with images, mainly for SVG images, since these could contain JavaScript and other unsafe items.
@@ -91,9 +106,9 @@ impl Fairing for AppHeaders {
                 )
             } else {
                 // # Frame Ancestors:
-                // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
-                // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
-                // Firefox Browser Add-ons: https://addons.mozilla.org/en-US/firefox/addon/bitwarden-password-manager/
+                // Keykeeper: the vault itself and PassBundle's own extension
+                // (keykeeper_origins), not upstream's extensions or every
+                // Firefox extension, plus ALLOWED_IFRAME_ANCESTORS.
                 // # img/child/frame src:
                 // Have I Been Pwned to allow those calls to work.
                 // # Connect src:
@@ -113,11 +128,7 @@ impl Fairing for AppHeaders {
                     style-src 'self' 'unsafe-inline'; \
                     child-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
                     frame-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
-                    frame-ancestors 'self' \
-                    chrome-extension://nngceckbapebfimnlniiiahkandclblb \
-                    chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh \
-                    moz-extension://* \
-                    {allowed_iframe_ancestors}; \
+                    frame-ancestors {frame_ancestors} {allowed_iframe_ancestors}; \
                     img-src 'self' data: \
                     https://haveibeenpwned.com \
                     {icon_service_csp}; \
@@ -130,6 +141,7 @@ impl Fairing for AppHeaders {
                     https://api.forwardemail.net \
                     {allowed_connect_src};\
                     ",
+                    frame_ancestors = crate::keykeeper_origins::frame_ancestors(),
                     icon_service_csp = CONFIG._icon_service_csp(),
                     allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors(),
                     allowed_connect_src = CONFIG.allowed_connect_src(),
@@ -137,8 +149,8 @@ impl Fairing for AppHeaders {
             };
 
             res.set_raw_header("Content-Security-Policy", csp);
-            res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
         }
+        res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
 
         // Disable cache unless otherwise specified
         if !res.headers().contains("cache-control") {
