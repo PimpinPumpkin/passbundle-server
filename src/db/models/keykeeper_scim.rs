@@ -23,7 +23,7 @@ use crate::{
     error::MapResult,
 };
 
-use super::{GroupId, Membership, MembershipId, MembershipType, OrganizationId, User};
+use super::{GroupId, Membership, MembershipId, MembershipType, OrganizationId, User, UserId};
 
 /// What every token starts with, so secret scanners and people can tell what
 /// it is. The version is for a later format, never for a weaker one.
@@ -42,6 +42,9 @@ pub struct ScimToken {
     pub created_at: NaiveDateTime,
     pub last_used_at: Option<NaiveDateTime>,
     pub last_used_ip: Option<String>,
+    /// The account that made it: the token works only while they still
+    /// manage the organization (keykeeper_provisioning::creator_has_access).
+    pub created_by_user: Option<UserId>,
 }
 
 /// The base64 SHA-256 of a token, as the server keeps it. A token is 256
@@ -70,6 +73,7 @@ impl ScimToken {
             created_at: Utc::now().naive_utc(),
             last_used_at: None,
             last_used_ip: None,
+            created_by_user: None,
         };
         (token, row)
     }

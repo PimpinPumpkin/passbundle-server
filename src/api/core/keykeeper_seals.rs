@@ -13,6 +13,7 @@ use serde_json::json;
 
 use super::keykeeper_enrollment::{checked_seal, checked_secret};
 use super::keykeeper_msp::require_admin;
+use super::keykeeper_offboarding::require_client_place;
 use crate::{
     api::JsonResult,
     auth::Headers,
@@ -120,6 +121,18 @@ async fn set_msp_seals(msp_id: MspId, data: Json<MspSealsData>, headers: Headers
     for s in &data.secrets {
         ours(&s.organization_id)?;
         checked_secret(Some(&s.secret))?;
+    }
+    // Keykeeper: and only in clients where the caller has a place of their
+    // own, which a client that revoked them takes away (keykeeper_offboarding.rs).
+    let touched: std::collections::HashSet<&OrganizationId> = data
+        .staff
+        .iter()
+        .map(|s| &s.organization_id)
+        .chain(data.joining.iter().map(|s| &s.organization_id))
+        .chain(data.secrets.iter().map(|s| &s.organization_id))
+        .collect();
+    for org in touched {
+        require_client_place(org, &headers.user.uuid, true, &conn).await?;
     }
     for s in &data.staff {
         JoinSeal::set(&s.organization_id, &s.email, SealKind::Staff, Some(&s.seal), &conn).await?;

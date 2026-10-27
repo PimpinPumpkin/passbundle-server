@@ -374,6 +374,7 @@ table! {
         created_at -> Timestamp,
         last_used_at -> Nullable<Timestamp>,
         last_used_ip -> Nullable<Text>,
+        created_by_user -> Nullable<Text>,
     }
 }
 
@@ -523,5 +524,15 @@ table! {
         user_uuid -> Text,
         org_uuid -> Text,
         created_at -> Timestamp,
+    }
+}
+
+table! {
+    removed_members (org_uuid, user_uuid) {
+        org_uuid -> Text,
+        user_uuid -> Text,
+        removed_at -> Timestamp,
+        msp_uuid -> Nullable<Text>,
+        revoked -> Bool,
     }
 }
