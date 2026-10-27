@@ -525,11 +525,14 @@ async fn enable_user(user_id: UserId, _token: AdminToken, conn: DbConn) -> Empty
 #[post("/users/<user_id>/remove-2fa", format = "application/json")]
 async fn remove_2fa(user_id: UserId, token: AdminToken, conn: DbConn) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &conn).await?;
+    // Keykeeper: their sessions end if two-step login for admins covers them.
+    let watch = crate::api::core::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
     TwoFactor::delete_all_by_user(&user.uuid, &conn).await?;
     Device::clear_twofactor_remember_by_user(&user.uuid, &conn).await?;
     two_factor::enforce_2fa_policy(&user, &ACTING_ADMIN_USER.into(), 14, &token.ip.ip, &conn).await?;
     user.totp_recover = None;
-    user.save(&conn).await
+    user.save(&conn).await?;
+    watch.settle(&conn).await
 }
 
 #[post("/users/<user_id>/invite/resend", format = "application/json")]
@@ -587,6 +590,8 @@ async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToke
         }
     }
 
+    // Keykeeper: a new role may bring them under two-step login for admins.
+    let watch = crate::api::core::keykeeper_two_step::Watch::user(&member_to_edit.user_uuid, &conn).await?;
     member_to_edit.atype = new_type;
     // Keykeeper: a new type here ends any custom role, as an edit in the
     // admin console would.
@@ -605,7 +610,8 @@ async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToke
     )
     .await;
 
-    member_to_edit.save(&conn).await
+    member_to_edit.save(&conn).await?;
+    watch.settle(&conn).await
 }
 
 #[post("/users/update_revision", format = "application/json")]

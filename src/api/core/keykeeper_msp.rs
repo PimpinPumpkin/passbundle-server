@@ -20,7 +20,10 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::{EmptyResult, JsonResult, core::keykeeper_msp_policies},
+    api::{
+        EmptyResult, JsonResult,
+        core::{keykeeper_msp_policies, keykeeper_two_step},
+    },
     auth::Headers,
     db::{
         DbConn,
@@ -384,12 +387,15 @@ async fn create_msp(headers: Headers, data: Json<CreateMspData>, conn: DbConn) -
     if !CONFIG.msp_signups_allowed() {
         err_code!("This server doesn't allow creating MSPs", rocket::http::Status::Forbidden.code)
     }
+    // Its staff come under two-step login for admins, on by default.
+    let watch = keykeeper_two_step::Watch::user(&headers.user.uuid, &conn).await?;
     let msp = Msp::new(clean_name(&data.name)?);
     msp.insert(&conn).await?;
     MspStaff::new(msp.uuid.clone(), headers.user.uuid.clone(), MspRole::Admin).insert(&conn).await?;
     end_recovery_enrollments(&headers.user.uuid, &conn).await?;
     keykeeper_msp_policies::seed_defaults(&msp.uuid, &conn).await?;
     Audit::by("msp_created", &headers).detail(msp.name.clone()).record(&msp.uuid, &conn).await?;
+    watch.settle(&conn).await?;
     Ok(Json(json!({ "id": msp.uuid, "name": msp.name, "role": MspRole::Admin.as_str() })))
 }
 
@@ -580,6 +586,9 @@ async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientD
     }
     let data = data.into_inner();
     let name = clean_name(&data.name)?;
+    // The staff it reaches may come under two-step login for admins there.
+    let staff_ids = MspStaff::find_by_msp(&msp_id, &conn).await.into_iter().map(|s| s.user_uuid);
+    let watch = keykeeper_two_step::Watch::users(staff_ids, &conn).await?;
     let business = match data.preset.as_deref() {
         None | Some("none") => false,
         Some(BUSINESS_PRESET) => true,
@@ -639,6 +648,7 @@ async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientD
         })
         .record(&msp_id, &conn)
         .await?;
+    watch.settle(&conn).await?;
     Ok(Json(org.to_json()))
 }
 
@@ -676,6 +686,8 @@ async fn add_to_staff(
     added_by: &str,
     conn: &DbConn,
 ) -> EmptyResult {
+    // Joining the staff may bring them under two-step login for admins.
+    let watch = keykeeper_two_step::Watch::user(&user.uuid, conn).await?;
     let mut staff = MspStaff::new(msp_id.clone(), user.uuid.clone(), role);
     staff.insert(conn).await?;
     end_recovery_enrollments(&user.uuid, conn).await?;
@@ -686,7 +698,8 @@ async fn add_to_staff(
         staff.set_access(access, conn).await?;
     }
     let inviter = User::find_by_mail(added_by, conn).await.map(|u| u.uuid);
-    sync_staff_memberships(msp_id, &staff, inviter.as_ref(), added_by, conn).await
+    sync_staff_memberships(msp_id, &staff, inviter.as_ref(), added_by, conn).await?;
+    watch.settle(conn).await
 }
 
 /// Checks a technician's access before storing it: chosen clients must be the
@@ -1004,8 +1017,10 @@ async fn change_staff_role(
     if role == MspRole::Technician {
         ensure_owners_remain(&staff_memberships(&msp_id, &user_id, &conn).await, &conn).await?;
     }
+    let watch = keykeeper_two_step::Watch::user(&user_id, &conn).await?;
     staff.set_role(role, &conn).await?;
     sync_staff_memberships(&msp_id, &staff, Some(&headers.user.uuid), &headers.user.email, &conn).await?;
+    watch.settle(&conn).await?;
     let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
     Audit::by("staff_role_changed", &headers).target(&email).detail(role.as_str()).record(&msp_id, &conn).await
 }
@@ -1030,8 +1045,10 @@ async fn set_staff_access(
         err!("MSP admins are owners of every client. Make them a technician to limit their access.")
     }
     let access = validate_access(&msp_id, data.into_inner(), &conn).await?;
+    let watch = keykeeper_two_step::Watch::user(&user_id, &conn).await?;
     staff.set_access(&access, &conn).await?;
     sync_staff_memberships(&msp_id, &staff, Some(&headers.user.uuid), &headers.user.email, &conn).await?;
+    watch.settle(&conn).await?;
     let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
     // Clients they no longer reach lose their staff seal there too.
     if let Some(reach) = staff.reach(&conn).await {
@@ -1251,7 +1268,7 @@ async fn get_organization_msp(org_id: OrganizationId, headers: Headers, conn: Db
     Ok(Json(json!({
         "msp": { "id": msp.uuid, "name": msp.name },
         "staff": staff,
-        "ownPolicies": keykeeper_msp_policies::own_policies(&msp.uuid, &org_id, &conn).await,
+        "ownPolicies": keykeeper_msp_policies::own_policies(&msp.uuid, &org_id, &conn).await?,
     })))
 }
 

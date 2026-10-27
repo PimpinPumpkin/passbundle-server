@@ -246,6 +246,11 @@ pub struct LoginJwtClaims {
     // device"); one that doesn't say (None) can't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keykeeper_signin: Option<AuthMethod>,
+
+    // Keykeeper: the organization whose single sign-on started this session,
+    // when it counts for two-step login for admins (keykeeper_two_step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kk_sso_org: Option<OrganizationId>,
 }
 
 impl LoginJwtClaims {
@@ -302,6 +307,7 @@ impl LoginJwtClaims {
             scope,
             amr: vec!["Application".into()],
             keykeeper_signin: None,
+            kk_sso_org: None,
         }
     }
 
@@ -732,6 +738,14 @@ impl<'r> FromRequest<'r> for Headers {
             }
         }
 
+        // Keykeeper: an API key's token doesn't do admin work for someone
+        // two-step login for admins covers (keykeeper_two_step::api_key_refused).
+        if crate::api::core::keykeeper_two_step::admin_route(request)
+            && crate::api::core::keykeeper_two_step::api_key_refused(request, &user.uuid).await
+        {
+            err_handler!(crate::api::core::keykeeper_two_step::API_KEY_REFUSED)
+        }
+
         Outcome::Success(Headers {
             host,
             device,
@@ -873,6 +887,11 @@ impl<'r> FromRequest<'r> for AdminHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
+        // Keykeeper: an API key's token doesn't do admin work for someone
+        // two-step login for admins covers (keykeeper_two_step::api_key_refused).
+        if crate::api::core::keykeeper_two_step::api_key_refused(request, &headers.user.uuid).await {
+            err_handler!(crate::api::core::keykeeper_two_step::API_KEY_REFUSED)
+        }
         if headers.is_confirmed_and_admin() {
             Outcome::Success(Self {
                 host: headers.host,
@@ -944,6 +963,11 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
+        // Keykeeper: an API key's token doesn't do admin work for someone
+        // two-step login for admins covers (keykeeper_two_step::api_key_refused).
+        if crate::api::core::keykeeper_two_step::api_key_refused(request, &headers.user.uuid).await {
+            err_handler!(crate::api::core::keykeeper_two_step::API_KEY_REFUSED)
+        }
         if headers.is_confirmed_and_manager() {
             if let Some(col_id) = get_col_id(request) {
                 let Outcome::Success(conn) = DbConn::from_request(request).await else {
@@ -1053,6 +1077,11 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
+        // Keykeeper: an API key's token doesn't do admin work for someone
+        // two-step login for admins covers (keykeeper_two_step::api_key_refused).
+        if crate::api::core::keykeeper_two_step::api_key_refused(request, &headers.user.uuid).await {
+            err_handler!(crate::api::core::keykeeper_two_step::API_KEY_REFUSED)
+        }
         if headers.is_confirmed_and_manager() {
             Outcome::Success(Self {
                 custom_permissions: None,
@@ -1161,6 +1190,11 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
+        // Keykeeper: an API key's token doesn't do admin work for someone
+        // two-step login for admins covers (keykeeper_two_step::api_key_refused).
+        if crate::api::core::keykeeper_two_step::api_key_refused(request, &headers.user.uuid).await {
+            err_handler!(crate::api::core::keykeeper_two_step::API_KEY_REFUSED)
+        }
         if headers.is_confirmed_and_owner() {
             Outcome::Success(Self {
                 device: headers.device,
@@ -1438,6 +1472,10 @@ pub struct RefreshJwtClaims {
     pub device_token: String,
 
     pub token: Option<TokenWrapper>,
+
+    // Keykeeper: as in LoginJwtClaims, carried from refresh to refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kk_sso_org: Option<OrganizationId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1482,12 +1520,22 @@ impl AuthTokens {
             sub,
             device_token: device.refresh_token.clone(),
             token: None,
+            kk_sso_org: None,
         };
 
         Self {
             refresh_claims,
             access_claims,
         }
+    }
+
+    /// Keykeeper: records the organization whose single sign-on started the
+    /// session, when it counts for two-step login for admins.
+    #[must_use]
+    pub fn with_sso_org(mut self, org: Option<OrganizationId>) -> Self {
+        self.access_claims.kk_sso_org.clone_from(&org);
+        self.refresh_claims.kk_sso_org = org;
+        self
     }
 }
 
@@ -1541,12 +1589,31 @@ pub async fn refresh_tokens(
         {
             err!("Your organization requires you to sign in with single sign-on. Sign in again.")
         }
+        // Keykeeper: someone whose role now requires two-step login, which
+        // they don't have (they turned it off, were promoted, or it was turned
+        // on), signs in again and sets it up there, whether the session began
+        // with a password, single sign-on, or a device's approval. A session
+        // single sign-on started counts for that organization only.
+        AuthMethod::Sso | AuthMethod::Password | AuthMethod::AuthRequest
+            if !crate::api::core::keykeeper_two_step::may_refresh(
+                &user,
+                if matches!(refresh_claims.sub, AuthMethod::Sso) {
+                    refresh_claims.kk_sso_org.as_ref()
+                } else {
+                    None
+                },
+                conn,
+            )
+            .await =>
+        {
+            err!(crate::api::core::keykeeper_two_step::REFRESH_REFUSED)
+        }
         // Keykeeper: an organization's own single sign-on proves who someone
         // is once; the session is PassBundle's own, as for a password. A
         // session from a device's approval refreshes as a password's does, and
         // keeps saying how it began.
         AuthMethod::Sso | AuthMethod::Password | AuthMethod::AuthRequest => {
-            AuthTokens::new(&device, &user, refresh_claims.sub, client_id)
+            AuthTokens::new(&device, &user, refresh_claims.sub, client_id).with_sso_org(refresh_claims.kk_sso_org)
         }
         _ => err!("Invalid auth method, cannot refresh token"),
     };

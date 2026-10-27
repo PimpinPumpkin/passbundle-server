@@ -97,6 +97,12 @@ pub struct Identity {
     /// signed in somewhere else, so the tenant's domains don't vouch for them.
     pub guest: bool,
     pub name: Option<String>,
+    /// The token's `amr` (how the person signed in) is there and has no
+    /// "mfa": the tenant says this sign-in had no second step, so it doesn't
+    /// count for two-step login for admins. Entra's v2.0 ID tokens usually
+    /// leave `amr` out; then the tenant's Conditional Access is relied on.
+    #[serde(default)]
+    pub without_mfa: bool,
 }
 
 /// Why a token was refused. The words are for the event log and the person
@@ -177,6 +183,7 @@ struct Claims {
     xms_edov: Option<Value>,
     acct: Option<Value>,
     idp: Option<String>,
+    amr: Option<Value>,
 }
 
 /// Whether the token names exactly one audience, the app.
@@ -213,6 +220,17 @@ fn is_guest(acct: Option<&Value>, idp: Option<&str>, issuer: &str) -> bool {
         _ => false,
     };
     guest_acct || idp.is_some_and(|idp| idp != issuer)
+}
+
+/// Whether `amr` says the sign-in had no second step: it's there, and has no
+/// "mfa". Left out (or null), it says nothing.
+fn says_without_mfa(amr: Option<&Value>) -> bool {
+    match amr {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(methods)) => !methods.iter().any(|m| m.as_str() == Some("mfa")),
+        Some(Value::String(method)) => method != "mfa",
+        Some(_) => true,
+    }
 }
 
 /// Checks an ID token against the tenant's keys and this sign-in, and says
@@ -299,6 +317,7 @@ pub fn validate(id_token: &str, keys: &[Jwk], expected: &Expected<'_>) -> Result
         email,
         guest: is_guest(claims.acct.as_ref(), claims.idp.as_deref(), expected.issuer),
         name: claims.name.map(|n| n.chars().take(50).collect()),
+        without_mfa: says_without_mfa(claims.amr.as_ref()),
     })
 }
 
@@ -468,6 +487,19 @@ mod tests {
         );
         // idp equal to the issuer is a member of the tenant.
         assert!(!check(&with(|c| c["idp"] = json!(issuer(AUTHORITY, TENANT)))).unwrap().guest);
+    }
+
+    #[test]
+    fn a_sign_in_amr_says_had_no_mfa_is_told_apart() {
+        // Left out, as Entra's v2.0 ID tokens usually do: it says nothing.
+        assert!(!check(&sign(&claims())).unwrap().without_mfa);
+        assert!(!check(&with(|c| c["amr"] = json!(null))).unwrap().without_mfa);
+        assert!(!check(&with(|c| c["amr"] = json!(["pwd", "mfa"]))).unwrap().without_mfa);
+        assert!(!check(&with(|c| c["amr"] = json!("mfa"))).unwrap().without_mfa);
+        assert!(check(&with(|c| c["amr"] = json!(["pwd"]))).unwrap().without_mfa);
+        assert!(check(&with(|c| c["amr"] = json!([]))).unwrap().without_mfa);
+        assert!(check(&with(|c| c["amr"] = json!("pwd"))).unwrap().without_mfa);
+        assert!(check(&with(|c| c["amr"] = json!({ "mfa": true }))).unwrap().without_mfa);
     }
 
     #[test]

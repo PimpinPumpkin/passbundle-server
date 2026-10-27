@@ -15,6 +15,8 @@ use crate::{
     api::core::keykeeper_device_approval,
     // Keykeeper: each organization's own single sign-on.
     api::core::keykeeper_sso,
+    // Keykeeper: two-step login for admins.
+    api::core::keykeeper_two_step,
     api::{
         ApiResult, EmptyResult, JsonResult,
         core::{
@@ -425,8 +427,16 @@ async fn keykeeper_sso_login(
         user.save(conn).await?;
     }
 
+    // Keykeeper: two-step login for admins. This organization's single
+    // sign-on meets its own requirement for its admins and custom roles
+    // (unless its ID token says the sign-in had no MFA), and the session
+    // records it for its refreshes; any other that isn't met gets a setup
+    // session instead of a login.
+    let sso_org = login.counts_for_two_step().then(|| login.org_id().clone());
+    keykeeper_two_step::check_sign_in(&user, sso_org.as_ref(), device.atype, conn).await?;
+
     keykeeper_sso::finish_login(&login, &user, device.atype, &ip.ip, conn).await?;
-    let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Sso, data.client_id);
+    let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Sso, data.client_id).with_sso_org(sso_org);
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }
 
@@ -593,8 +603,8 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
 
     // Keykeeper: the organizations' rules for a sign-in with a device's
     // approval, which proves no password: the hook for any rule that must
-    // hold for it as well as for a password (requiring single sign-on now;
-    // an admin two-step rule belongs there too). See
+    // hold for it as well as for a password (requiring single sign-on, and
+    // two-step login for admins). See
     // keykeeper_device_approval::approved_sign_in_rules.
     if data.auth_request.is_some() {
         keykeeper_device_approval::approved_sign_in_rules(&user, &device, conn).await?;
@@ -617,6 +627,16 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             }),
             format!("IP: {}. Username: {log_username}. Single sign-on required; linking first.", ip.ip)
         )
+    }
+
+    // Keykeeper: two-step login for admins. Someone whose role requires it
+    // and who has no method that counts (an authenticator app, a security key
+    // or passkey, or Duo; email codes don't) gets a setup session, which can
+    // only set one up, instead of a login. A device's approval proves no
+    // password, so it gets none: approved_sign_in_rules refused it above.
+    // See keykeeper_two_step.
+    if data.auth_request.is_none() {
+        keykeeper_two_step::check_sign_in(&user, None, device.atype, conn).await?;
     }
 
     // Like upstream, an auth request can be used for one login only. Marked after 2FA so a 2FA prompt doesn't use it up.
@@ -804,6 +824,10 @@ async fn user_api_key_login(
         )
     }
 
+    // Keykeeper: an API key skips two-step login, so it doesn't sign in
+    // someone whose role requires two-step login and who hasn't set it up.
+    keykeeper_two_step::check_api_key(&user, conn).await?;
+
     let mut device = get_device(&data, conn, &user).await?;
 
     if CONFIG.mail_enabled() && device.is_new() {
@@ -957,13 +981,19 @@ async fn twofactor_auth(
 
     TwoFactorIncomplete::mark_incomplete(&user.uuid, &device.uuid, &device.name, device.atype, ip, conn).await?;
 
-    let twofactor_ids: Vec<_> = twofactors
+    let mut twofactor_ids: Vec<_> = twofactors
         .iter()
         .filter_map(|tf| {
             let provider_type = TwoFactorType::from_i32(tf.atype)?;
             (tf.enabled && is_twofactor_provider_usable(&provider_type, Some(&tf.data))).then_some(tf.atype)
         })
         .collect();
+    // Keykeeper: someone whose role requires two-step login, and who has a
+    // method that counts, signs in with it: email codes aren't offered or
+    // taken, since the people who run their mailbox could read them.
+    if keykeeper_two_step::email_codes_refused(&user.uuid, conn).await {
+        twofactor_ids.retain(|t| *t != TwoFactorType::Email as i32);
+    }
     if twofactor_ids.is_empty() {
         err!("No enabled and usable two factor providers are available for this account")
     }
@@ -1060,6 +1090,12 @@ async fn twofactor_auth(
 
             // Remove the recovery code, not needed without twofactors
             user.totp_recover = None;
+            // Keykeeper: someone two-step login for admins covers now has no
+            // method that counts, so their other sessions end (as Watch does),
+            // and this sign-in gets a setup session.
+            if !keykeeper_two_step::requirements(&user.uuid, conn).await?.is_empty() {
+                user.reset_security_stamp(conn).await?;
+            }
             user.save(conn).await?;
         }
         _ => err!(
