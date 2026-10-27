@@ -1,5 +1,5 @@
-//! PassBundle: which pages may frame the vault's pages, and where a security
-//! key's answer may come from (DESIGN.md, "Connector pages").
+//! PassBundle: which pages may frame the vault's pages, where a security
+//! key's answer may come from, and HTTPS only (DESIGN.md, "Connector pages").
 //!
 //! The web vault's connector pages (`*-connector.html`) read their inputs from
 //! the address, so a page anywhere could frame one. Upstream sent them with no
@@ -7,8 +7,9 @@
 //! connector answered whatever `parent` the address named: a phishing page
 //! could frame it, relay the vault's sign-in challenge, and receive the key's
 //! signature. The server now lets only the vault itself and PassBundle's own
-//! extension frame any page, and refuses a security key's answer made in a
-//! frame on another site, whichever page asked for it.
+//! extension frame any page, gives connector pages a policy of their own, and
+//! refuses every security key answer made in a frame, whichever page asked
+//! for it.
 
 use serde::Deserialize;
 
@@ -49,17 +50,44 @@ pub fn extension_origins() -> Vec<String> {
 /// every Firefox extension were allowed before), and nothing else on
 /// connector pages; the vault's other pages add ALLOWED_IFRAME_ANCESTORS.
 /// The extension opens connector pages in tabs of their own, never in frames,
-/// so its origin here only keeps a framed flow of our own possible.
+/// and a security key answer made in a frame is refused anyway.
 pub fn frame_ancestors() -> String {
     let mut sources = vec!["'self'".to_owned()];
     sources.extend(extension_origins());
     sources.join(" ")
 }
 
-/// Whether a page at this origin may ask for a security key's answer to the
-/// vault from a frame: the vault itself, or PassBundle's extension.
-fn is_allowed_top_origin(origin: &str) -> bool {
-    origin == CONFIG.domain_origin() || extension_origins().iter().any(|o| o == origin)
+/// The policy for connector pages: their own scripts, styles, images, and
+/// translations, nothing else, no plugins, and frame-ancestors above. Duo's
+/// connector leaves for Duo by navigating, which the policy doesn't limit;
+/// there are no captcha connectors anymore.
+pub fn connector_csp() -> String {
+    format!(
+        "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors {}",
+        frame_ancestors()
+    )
+}
+
+/// The Strict-Transport-Security value for a server at this DOMAIN: none
+/// unless it's https on a real host name, since browsers would then insist on
+/// HTTPS for localhost or an address (the Windows Hello test kit runs at
+/// https://localhost, and the e2e tests at an address). includeSubDomains
+/// only when HSTS_INCLUDE_SUBDOMAINS is on, since it binds every name under
+/// the vault's host too.
+pub fn hsts_value(domain: &str, include_subdomains: bool) -> Option<&'static str> {
+    let url = url::Url::parse(domain).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    match url.host()? {
+        url::Host::Domain(host) if host != "localhost" && !host.ends_with(".localhost") => {}
+        _ => return None,
+    }
+    Some(if include_subdomains {
+        "max-age=31536000; includeSubDomains"
+    } else {
+        "max-age=31536000"
+    })
 }
 
 #[derive(Deserialize)]
@@ -71,11 +99,11 @@ struct ClientData {
 }
 
 /// Refuses a security key's answer (its clientDataJSON) that was made in a
-/// frame on another site: `crossOrigin` true, unless the page around it
-/// (`topOrigin`) is the vault itself or PassBundle's extension. webauthn-rs
-/// checks crossOrigin when a key is added, but not when it signs in. An
-/// answer that says it's cross-origin without naming the page around it is
-/// refused too, as is one that names a page elsewhere either way.
+/// frame: `crossOrigin` true, whatever page was around it, and any answer
+/// that names a `topOrigin` at all. No PassBundle flow asks a key in a frame
+/// that isn't on the vault's own origin: the web vault frames its own
+/// connector, and the extension opens a tab. webauthn-rs checks crossOrigin
+/// when a key is added, but not when it signs in.
 pub fn check_assertion_origin(client_data_json: &[u8]) -> Result<(), Error> {
     let Ok(data) = serde_json::from_slice::<ClientData>(client_data_json) else {
         err!(
@@ -85,10 +113,9 @@ pub fn check_assertion_origin(client_data_json: &[u8]) -> Result<(), Error> {
             }
         )
     };
-    let top_allowed = data.top_origin.as_deref().map(is_allowed_top_origin);
-    match (data.cross_origin.unwrap_or(false), top_allowed) {
-        (_, Some(false)) | (true, None) => err!(
-            "Your security key was used on a page of another site. Sign in on your vault's own page.",
+    match (data.cross_origin.unwrap_or(false), &data.top_origin) {
+        (true, _) | (_, Some(_)) => err!(
+            "Your security key was used inside another page. Sign in on your vault's own page.",
             format!(
                 "Refused a security key answer made in a frame (crossOrigin {:?}, topOrigin {:?})",
                 data.cross_origin, data.top_origin
@@ -122,6 +149,30 @@ mod tests {
     #[test]
     fn frame_ancestors_are_the_vault_and_our_extension() {
         assert_eq!(frame_ancestors(), "'self' chrome-extension://cenoidjoogmoieibpcokkafjnaabhokg");
+        assert_eq!(
+            connector_csp(),
+            "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; \
+             frame-ancestors 'self' chrome-extension://cenoidjoogmoieibpcokkafjnaabhokg"
+        );
+    }
+
+    #[test]
+    fn hsts_only_for_https_on_a_host_name() {
+        assert_eq!(hsts_value("https://vault.example.com", false), Some("max-age=31536000"));
+        assert_eq!(hsts_value("https://vault.example.com:8443/path", false), Some("max-age=31536000"));
+        assert_eq!(hsts_value("https://vault.example.com", true), Some("max-age=31536000; includeSubDomains"));
+        for domain in [
+            "http://vault.example.com",
+            "https://localhost",
+            "https://localhost:8443",
+            "https://vault.localhost",
+            "https://127.0.0.1:8091",
+            "https://10.0.0.5",
+            "https://[::1]:8443",
+            "not a url",
+        ] {
+            assert_eq!(hsts_value(domain, true), None, "{domain}");
+        }
     }
 
     #[test]
@@ -135,25 +186,18 @@ mod tests {
     }
 
     #[test]
-    fn answers_framed_by_the_vault_or_our_extension_pass() {
-        let origin = CONFIG.domain_origin();
-        assert!(check(&format!(r#"{{"origin":"{origin}","crossOrigin":true,"topOrigin":"{origin}"}}"#)));
-        assert!(check(&format!(
-            r#"{{"origin":"{origin}","crossOrigin":true,"topOrigin":"chrome-extension://cenoidjoogmoieibpcokkafjnaabhokg"}}"#
-        )));
-    }
-
-    #[test]
-    fn answers_framed_elsewhere_are_refused() {
+    fn answers_made_in_a_frame_are_refused_whatever_page_is_around_it() {
         let origin = CONFIG.domain_origin();
         for top in [
+            origin.as_str(),
+            "chrome-extension://cenoidjoogmoieibpcokkafjnaabhokg",
             "https://attacker.example.net",
             "chrome-extension://nngceckbapebfimnlniiiahkandclblb",
             "moz-extension://4b1e6a52-0000-4000-8000-000000000000",
             "null",
         ] {
             assert!(!check(&format!(r#"{{"origin":"{origin}","crossOrigin":true,"topOrigin":"{top}"}}"#)), "{top}");
-            // Naming a page elsewhere is refused whatever crossOrigin says.
+            // Naming a page around it is refused whatever crossOrigin says.
             assert!(!check(&format!(r#"{{"origin":"{origin}","crossOrigin":false,"topOrigin":"{top}"}}"#)), "{top}");
         }
         // Cross-origin, without saying where.

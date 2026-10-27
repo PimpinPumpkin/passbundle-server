@@ -76,10 +76,16 @@ impl Fairing for AppHeaders {
             res.set_raw_header("Cross-Origin-Resource-Policy", "same-origin");
         }
 
-        // Keykeeper: HTTPS only from the first visit on, for the vault and its
-        // subdomains, when the server is reached over HTTPS.
-        if CONFIG.domain_origin().starts_with("https://") {
-            res.set_raw_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+        // Keykeeper: HTTPS only from the first visit on, when DOMAIN is https
+        // on a real host name; never for localhost or an address, and the
+        // names under the vault's host only with HSTS_INCLUDE_SUBDOMAINS.
+        // Rocket's Shield adds its own HSTS to a release build serving TLS
+        // itself, so it's taken off where none belongs.
+        match crate::keykeeper_origins::hsts_value(&CONFIG.domain(), CONFIG.hsts_include_subdomains()) {
+            Some(hsts) => {
+                res.set_raw_header("Strict-Transport-Security", hsts);
+            }
+            None => res.remove_header("Strict-Transport-Security"),
         }
 
         // Keykeeper: the *-connector.html pages (security key, Duo, single
@@ -87,12 +93,10 @@ impl Fairing for AppHeaders {
         // no CSP and no X-Frame-Options, so any site could frame them, and a
         // phishing page could receive a security key's answer through one.
         // Only the vault itself and PassBundle's extension may frame them now,
-        // never ALLOWED_IFRAME_ANCESTORS (DESIGN.md, "Connector pages").
+        // never ALLOWED_IFRAME_ANCESTORS, and they load only their own files
+        // (DESIGN.md, "Connector pages").
         if req_uri_path.ends_with("connector.html") {
-            res.set_raw_header(
-                "Content-Security-Policy",
-                format!("frame-ancestors {}", crate::keykeeper_origins::frame_ancestors()),
-            );
+            res.set_raw_header("Content-Security-Policy", crate::keykeeper_origins::connector_csp());
         } else {
             let csp = if is_image {
                 // Prevent scripts, frames, objects, etc., from loading with images, mainly for SVG images, since these could contain JavaScript and other unsafe items.

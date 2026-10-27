@@ -313,13 +313,15 @@ async function checkHttpResponse() {
         });
     }
 
-    // PassBundle: the `-connector.html` pages may be framed only by the vault
-    // itself and PassBundle's extension, so their policy is frame-ancestors alone.
+    // PassBundle: the `-connector.html` pages load only their own files, and
+    // may be framed only by the vault itself and PassBundle's extension.
     let connectorErrors = checkSecurityHeaders(webauthnConnector.headers, ["content-security-policy"]);
-    const connectorCsp = webauthnConnector.headers.get("content-security-policy");
-    if (connectorCsp === null || !connectorCsp.startsWith("frame-ancestors 'self'")) {
-        connectorErrors.push("'content-security-policy' should be \"frame-ancestors 'self'\" and PassBundle's extension");
-    }
+    const connectorCsp = webauthnConnector.headers.get("content-security-policy") ?? "";
+    ["default-src 'self'", "script-src 'self'", "object-src 'none'", "frame-ancestors 'self'"].forEach((expected) => {
+        if (connectorCsp.indexOf(expected) === -1) {
+            connectorErrors.push(`'content-security-policy' does not contain '${expected}'`);
+        }
+    });
     if (connectorErrors.length >= 1) {
         respErrorElm.innerHTML += "<b>2FA Connector calls:</b><br>";
         connectorErrors.forEach((errMsg) => {
