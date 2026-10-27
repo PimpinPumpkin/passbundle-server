@@ -948,13 +948,19 @@ async fn twofactor_auth(
 
     TwoFactorIncomplete::mark_incomplete(&user.uuid, &device.uuid, &device.name, device.atype, ip, conn).await?;
 
-    let twofactor_ids: Vec<_> = twofactors
+    let mut twofactor_ids: Vec<_> = twofactors
         .iter()
         .filter_map(|tf| {
             let provider_type = TwoFactorType::from_i32(tf.atype)?;
             (tf.enabled && is_twofactor_provider_usable(&provider_type, Some(&tf.data))).then_some(tf.atype)
         })
         .collect();
+    // Keykeeper: someone whose role requires two-step login, and who has a
+    // method that counts, signs in with it: email codes aren't offered or
+    // taken, since the people who run their mailbox could read them.
+    if keykeeper_two_step::email_codes_refused(&user.uuid, conn).await {
+        twofactor_ids.retain(|t| *t != TwoFactorType::Email as i32);
+    }
     if twofactor_ids.is_empty() {
         err!("No enabled and usable two factor providers are available for this account")
     }

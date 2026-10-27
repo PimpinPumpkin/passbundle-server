@@ -52,8 +52,8 @@ use crate::{
     db::{
         DbConn,
         models::{
-            EventType, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId, MspMembership, MspStaff,
-            MspStaffTwoStep, OrgAdminTwoStep, Organization, OrganizationId, TwoFactor, TwoFactorType,
+            Device, EventType, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId, MspMembership,
+            MspStaff, MspStaffTwoStep, OrgAdminTwoStep, Organization, OrganizationId, TwoFactor, TwoFactorType,
             TwoStepSetupSession, User, UserId, keykeeper_roles, qualifying_two_step,
         },
     },
@@ -183,6 +183,14 @@ pub async fn unmet(user_id: &UserId, sso_orgs: &[OrganizationId], conn: &DbConn)
         return Ok(Vec::new());
     }
     Ok(requirements(user_id, conn).await?.into_iter().filter(|r| !r.met_by_sso(sso_orgs)).collect())
+}
+
+/// Whether a sign-in's second step can't be an email code: the person's role
+/// requires two-step login and they have a method that counts, which they use
+/// instead. (Without one, an email code still proves the mailbox, and the
+/// sign-in then gets a setup session.) A database error counts as yes.
+pub async fn email_codes_refused(user_id: &UserId, conn: &DbConn) -> bool {
+    has_qualifying(user_id, conn).await && requirements(user_id, conn).await.map_or(true, |r| !r.is_empty())
 }
 
 /// The names in a sentence: "A", "A and B", "A, B, and C".
@@ -361,15 +369,20 @@ impl SetupHeaders {
     }
 }
 
-/// After a method that counts was set up: a setup session ends here, and the
-/// answer carries the account's recovery code, which the person can't fetch
-/// later without signing in. Nothing changes for a signed-in session.
+/// After a method that counts was set up. For someone the rule covers,
+/// devices remembered for two-step login are forgotten: they may have been
+/// remembered with an email code, so each proves the new method once. A setup
+/// session ends here, and the answer carries the account's recovery code,
+/// which the person can't fetch later without signing in.
 pub async fn finish_setup(
     session: Option<&TwoStepSetupSession>,
     user: &User,
     answer: &mut Value,
     conn: &DbConn,
 ) -> EmptyResult {
+    if !requirements(&user.uuid, conn).await?.is_empty() {
+        Device::clear_twofactor_remember_by_user(&user.uuid, conn).await?;
+    }
     if session.is_none() {
         return Ok(());
     }
