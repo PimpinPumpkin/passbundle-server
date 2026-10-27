@@ -38,14 +38,19 @@ pub mod link;
 pub mod secret;
 pub mod token;
 
-use std::net::IpAddr;
+use std::{
+    net::IpAddr,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
+use dashmap::DashMap;
 use rocket::{
-    Request, Route,
+    Request, Responder, Route,
     http::{Cookie, CookieJar, SameSite, Status},
     request::{FromRequest, Outcome},
-    response::Redirect,
+    response::{Redirect, content::RawHtml},
     serde::json::Json,
 };
 use serde_json::{Value, json};
@@ -114,7 +119,9 @@ fn connector_uri() -> String {
 fn redirect_allowed(client_id: &str, redirect_uri: &str) -> Result<(), &'static str> {
     match client_id {
         "web" | "browser" if redirect_uri == connector_uri() => Ok(()),
-        "cli" if (8065..=8070).any(|port| redirect_uri == format!("http://localhost:{port}")) => Ok(()),
+        "cli" if CLI_LISTENER_PORTS.into_iter().any(|port| redirect_uri == format!("http://localhost:{port}")) => {
+            Ok(())
+        }
         "web" | "browser" | "cli" => Err("Unsupported redirect URI"),
         _ => Err("Single sign-on works from the web vault, the browser extension, and the command-line tool."),
     }
@@ -1031,6 +1038,7 @@ pub async fn prevalidate(identifier: Option<&str>, ip: &IpAddr, conn: &DbConn) -
 }
 
 /// What the app sent to /identity/connect/authorize.
+#[derive(Clone)]
 pub struct Authorize {
     pub client_id: String,
     pub redirect_uri: String,
@@ -1054,9 +1062,24 @@ fn looks_like_challenge(challenge: &str) -> bool {
     challenge.len() == 43 && challenge.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// What /identity/connect/authorize answers: the way to the organization's
+/// tenant, or, for the command-line tool, a page that asks first
+/// (`ask_cli`).
+#[derive(Responder)]
+pub enum AuthorizeAnswer {
+    Redirect(Box<Redirect>),
+    Confirm(RawHtml<String>),
+}
+
 /// Starts a sign-in: checks what the app sent, remembers it, and sends the
-/// browser to the organization's tenant.
-pub async fn authorize(a: Authorize, cookies: &CookieJar<'_>, ip: &IpAddr, conn: &DbConn) -> ApiResult<Redirect> {
+/// browser to the organization's tenant; for the command-line tool, first to
+/// a page of this server's that asks (`ask_cli`).
+pub async fn authorize(
+    a: Authorize,
+    cookies: &CookieJar<'_>,
+    ip: &IpAddr,
+    conn: &DbConn,
+) -> ApiResult<AuthorizeAnswer> {
     // Each start keeps a row for ten minutes, so starts are limited per
     // address, with the allowance pre-login gets.
     crate::ratelimit::check_limit_prelogin(ip)?;
@@ -1099,6 +1122,25 @@ pub async fn authorize(a: Authorize, cookies: &CookieJar<'_>, ip: &IpAddr, conn:
         }
         None => None,
     };
+    if a.client_id == "cli" {
+        return Ok(AuthorizeAnswer::Confirm(ask_cli(a, &config, cookies, conn).await?));
+    }
+    let link = link.map(|l| (l.user_uuid, l.session_ref));
+    let url = start_sign_in(a, &config, link, cookies, conn).await?;
+    Ok(AuthorizeAnswer::Redirect(Box::new(Redirect::temporary(url))))
+}
+
+/// Sends the browser to the organization's tenant: remembers the app's
+/// request, makes this server's own state, nonce, and PKCE verifier, and sets
+/// the cookie that ties Microsoft's answer to this browser. For linking,
+/// `link` is the account and the session that asked. The address to go to.
+async fn start_sign_in(
+    a: Authorize,
+    config: &SsoConfig,
+    link: Option<(UserId, String)>,
+    cookies: &CookieJar<'_>,
+    conn: &DbConn,
+) -> ApiResult<String> {
     let provider = match entra::provider(&config.tenant_id).await {
         Ok(p) => p,
         Err(e) => err!(format!("Microsoft sign-in isn't available for this organization right now: {e}.")),
@@ -1116,8 +1158,8 @@ pub async fn authorize(a: Authorize, cookies: &CookieJar<'_>, ip: &IpAddr, conn:
         code_verifier: verifier.clone(),
         binding_hash: sso_hash(&binding),
         code_hash: None,
-        link_user_uuid: link.as_ref().map(|l| l.user_uuid.clone()),
-        link_session: link.as_ref().map(|l| l.session_ref.clone()),
+        link_user_uuid: link.as_ref().map(|(user, _)| user.clone()),
+        link_session: link.as_ref().map(|(_, session)| session.clone()),
         identity: None,
         error: None,
         created_at: Utc::now().naive_utc(),
@@ -1159,7 +1201,209 @@ pub async fn authorize(a: Authorize, cookies: &CookieJar<'_>, ip: &IpAddr, conn:
             .secure(CONFIG.domain().starts_with("https://"))
             .build(),
     );
-    Ok(Redirect::temporary(String::from(url)))
+    Ok(String::from(url))
+}
+
+// ---------------------------------------------------------------------------
+// The command-line tool's sign-in asks first. Its answer goes to a listener
+// on the computer (`http://localhost:<port>`), where anything else listening
+// on that port (another person's program, on a shared server) could take it.
+// So a link alone, which anyone can send, must never get as far as Microsoft,
+// which may sign someone in without asking: authorize answers with a page of
+// this server's that says what the sign-in is for, and only a same-origin
+// POST from that page (its one-time token, and a SameSite=Strict cookie that
+// no other site's page can make a browser send) goes on. See DESIGN.md, "Sign
+// in with Microsoft Entra ID", "Threat model".
+
+const CLI_CONFIRM_COOKIE: &str = "PB_SSO_CLI_CONFIRM";
+/// How long the page's question stands, as a sign-in's state does.
+const CLI_CONFIRM_TTL: Duration = Duration::from_mins(10);
+/// At most this many waiting questions; a start beyond them is refused.
+const CLI_CONFIRM_MAX: usize = 10_000;
+
+/// A question the page asks, by its token's hash: what the tool sent, and the
+/// hash of the cookie the page's browser got with it.
+struct CliConfirmation {
+    authorize: Authorize,
+    org_uuid: OrganizationId,
+    cookie_hash: String,
+    expires: Instant,
+}
+
+/// The waiting questions, in this server's memory only: one is good for ten
+/// minutes, once, from the browser it was asked in. A restart forgets them,
+/// and the person starts the sign-in again.
+#[derive(Default)]
+struct CliConfirmations {
+    entries: DashMap<String, CliConfirmation>,
+}
+
+impl CliConfirmations {
+    fn remember(&self, token_hash: String, confirmation: CliConfirmation, now: Instant) -> bool {
+        self.entries.retain(|_, c| c.expires > now);
+        if self.entries.len() >= CLI_CONFIRM_MAX {
+            return false;
+        }
+        self.entries.insert(token_hash, confirmation);
+        true
+    }
+
+    /// The question for this token, once, if it hasn't expired and the cookie
+    /// is the one its browser got.
+    fn take(&self, token_hash: &str, cookie: Option<&str>, now: Instant) -> Option<CliConfirmation> {
+        let (_, confirmation) = self.entries.remove(token_hash)?;
+        let cookie_matches = cookie.is_some_and(|c| ct_eq(sso_hash(c), &confirmation.cookie_hash));
+        (confirmation.expires > now && cookie_matches).then_some(confirmation)
+    }
+}
+
+static CLI_CONFIRMATIONS: LazyLock<CliConfirmations> = LazyLock::new(CliConfirmations::default);
+
+/// Text for an HTML page.
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+/// The page that asks: which organization, which listener, and to go on only
+/// for a sign-in the person just started themselves.
+fn cli_confirm_page(organization: &str, listener: &str, token: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in to the command-line tool</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}button{{font:inherit;padding:.5rem 1rem}}</style>
+</head>
+<body>
+<main>
+<h1>Sign in to the PassBundle command-line tool?</h1>
+<p>This signs in the <code>passbundle</code> command on the computer this browser runs on, with {organization}'s single sign-on, and hands the sign-in to the program listening at <code>{listener}</code>.</p>
+<p>Go on only if you just ran <code>passbundle login --sso</code> yourself. If a link someone sent you opened this page, close it.</p>
+<form method="post" action="{action}">
+<input type="hidden" name="token" value="{token}">
+<button type="submit">Continue to Microsoft</button>
+</form>
+</main>
+</body>
+</html>
+"#,
+        organization = html_escape(organization),
+        listener = html_escape(listener),
+        action = html_escape(&format!("{}/identity/connect/authorize/confirm", CONFIG.domain())),
+        token = html_escape(token),
+    )
+}
+
+/// The command-line tool's listeners, as upstream's tool asks for them.
+const CLI_LISTENER_PORTS: std::ops::RangeInclusive<u16> = 8065..=8070;
+
+/// What the page's policy adds to `form-action`, by path: the page's Continue
+/// posts to this server, which sends the browser on to the tenant's sign-in,
+/// back here, and on to the tool's listener, and browsers hold every step of
+/// that to the policy of the page the form was on. So the command-line tool's
+/// page (authorize's answer) names the sign-in's host and the tool's
+/// listeners; no other page does.
+pub fn form_action_sources(path: &str) -> String {
+    if !path.ends_with("/identity/connect/authorize") {
+        return String::new();
+    }
+    let authority = url::Url::parse(CONFIG.sso_entra_authority().trim_end_matches('/'))
+        .map(|a| format!(" {}", a.origin().ascii_serialization()))
+        .unwrap_or_default();
+    let listeners: Vec<String> = CLI_LISTENER_PORTS.map(|port| format!("http://localhost:{port}")).collect();
+    format!("{authority} {}", listeners.join(" "))
+}
+
+/// For the command-line tool: remembers its request, and answers with the
+/// page that asks, with a cookie only this server's own pages make a browser
+/// send.
+async fn ask_cli(
+    a: Authorize,
+    config: &SsoConfig,
+    cookies: &CookieJar<'_>,
+    conn: &DbConn,
+) -> ApiResult<RawHtml<String>> {
+    let organization = Organization::find_by_uuid(&config.org_uuid, conn).await.map(|o| o.name).unwrap_or_default();
+    let (token, cookie) = (sso_random(), sso_random());
+    let listener = a.redirect_uri.clone();
+    let confirmation = CliConfirmation {
+        authorize: a,
+        org_uuid: config.org_uuid.clone(),
+        cookie_hash: sso_hash(&cookie),
+        expires: Instant::now() + CLI_CONFIRM_TTL,
+    };
+    if !CLI_CONFIRMATIONS.remember(sso_hash(&token), confirmation, Instant::now()) {
+        err!("Too many sign-ins are waiting. Try again in a few minutes.")
+    }
+    cookies.add(
+        Cookie::build((CLI_CONFIRM_COOKIE, cookie))
+            .path(binding_cookie_path())
+            .max_age(time::Duration::minutes(10))
+            // Strict: a page of another site can't make the browser send it.
+            .same_site(SameSite::Strict)
+            .http_only(true)
+            .secure(CONFIG.domain().starts_with("https://"))
+            .build(),
+    );
+    Ok(RawHtml(cli_confirm_page(&organization, &listener, &token)))
+}
+
+/// Where a request came from, as the browser says: its `Origin`, and its
+/// `Sec-Fetch-Site` if it sends one.
+pub struct RequestOrigin {
+    origin: Option<String>,
+    fetch_site: Option<String>,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for RequestOrigin {
+    type Error = ();
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let headers = request.headers();
+        Outcome::Success(Self {
+            origin: headers.get_one("Origin").map(str::to_owned),
+            fetch_site: headers.get_one("Sec-Fetch-Site").map(str::to_owned),
+        })
+    }
+}
+
+impl RequestOrigin {
+    /// From this server's own page: the same origin, and no browser saying otherwise.
+    fn same_origin(&self) -> bool {
+        self.origin.as_deref() == Some(CONFIG.domain_origin().as_str())
+            && self.fetch_site.as_deref().is_none_or(|s| s == "same-origin")
+    }
+}
+
+/// The page's Continue: the question's token, from the page itself, in the
+/// browser it was asked in, once. Then on to the tenant, as for any app.
+pub async fn confirm_cli(
+    token: &str,
+    from: RequestOrigin,
+    cookies: &CookieJar<'_>,
+    ip: &IpAddr,
+    conn: &DbConn,
+) -> ApiResult<Redirect> {
+    crate::ratelimit::check_limit_prelogin(ip)?;
+    let cookie = cookies.get(CLI_CONFIRM_COOKIE).map(|c| c.value().to_owned());
+    cookies.remove(Cookie::build(CLI_CONFIRM_COOKIE).path(binding_cookie_path()).build());
+    if !from.same_origin() {
+        err!("Continue from the sign-in page itself.")
+    }
+    let Some(confirmation) = CLI_CONFIRMATIONS.take(&sso_hash(token), cookie.as_deref(), Instant::now()) else {
+        err!(
+            "This sign-in expired, was already used, or was started in another browser. Run passbundle login --sso again."
+        )
+    };
+    let Some(config) = SsoConfig::find(&confirmation.org_uuid, conn).await.filter(SsoConfig::ready) else {
+        err!("No organization uses that SSO identifier, or its single sign-on is turned off.")
+    };
+    let url = start_sign_in(confirmation.authorize, &config, None, cookies, conn).await?;
+    // 303: the browser goes there with a GET, not this POST again.
+    Ok(Redirect::to(url))
 }
 
 /// Redeems Microsoft's code and checks the ID token it returns.
@@ -1632,6 +1876,87 @@ mod tests {
         for client in ["desktop", "mobile", "connector", ""] {
             assert!(redirect_allowed(client, &connector).is_err(), "{client}");
         }
+    }
+
+    fn waiting(cookie: &str, expires: Instant) -> CliConfirmation {
+        CliConfirmation {
+            authorize: Authorize {
+                client_id: "cli".to_owned(),
+                redirect_uri: "http://localhost:8065".to_owned(),
+                state: "state".to_owned(),
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+                code_challenge_method: "S256".to_owned(),
+                domain_hint: Some("contoso".to_owned()),
+                user_identifier: None,
+            },
+            org_uuid: OrganizationId::from("org".to_owned()),
+            cookie_hash: sso_hash(cookie),
+            expires,
+        }
+    }
+
+    #[test]
+    fn the_tools_question_goes_on_once_only_with_its_browsers_cookie_in_time() {
+        let now = Instant::now();
+        let later = now + CLI_CONFIRM_TTL;
+        let asked = CliConfirmations::default();
+
+        assert!(asked.remember(sso_hash("token"), waiting("cookie", later), now));
+        assert!(asked.take(&sso_hash("token"), Some("cookie"), now).is_some());
+        // Once.
+        assert!(asked.take(&sso_hash("token"), Some("cookie"), now).is_none());
+
+        // Another browser's cookie, or none, ends the question too.
+        for cookie in [Some("another"), None] {
+            assert!(asked.remember(sso_hash("token"), waiting("cookie", later), now));
+            assert!(asked.take(&sso_hash("token"), cookie, now).is_none());
+            assert!(asked.take(&sso_hash("token"), Some("cookie"), now).is_none());
+        }
+
+        // Too late.
+        assert!(asked.remember(sso_hash("token"), waiting("cookie", later), now));
+        assert!(asked.take(&sso_hash("token"), Some("cookie"), later).is_none());
+
+        // A token that was never asked.
+        assert!(asked.take(&sso_hash("made up"), Some("cookie"), now).is_none());
+    }
+
+    #[test]
+    fn the_tools_questions_are_capped_and_expired_ones_make_room() {
+        let now = Instant::now();
+        let asked = CliConfirmations::default();
+        for i in 0..CLI_CONFIRM_MAX {
+            assert!(asked.remember(sso_hash(&i.to_string()), waiting("c", now + CLI_CONFIRM_TTL), now));
+        }
+        assert!(!asked.remember(sso_hash("one more"), waiting("c", now + CLI_CONFIRM_TTL), now));
+        // Once they've expired, they make room.
+        let later = now + CLI_CONFIRM_TTL + Duration::from_secs(1);
+        assert!(asked.remember(sso_hash("one more"), waiting("c", later + CLI_CONFIRM_TTL), later));
+        assert_eq!(asked.entries.len(), 1);
+    }
+
+    #[test]
+    fn only_the_tools_page_may_post_on_to_the_tenant() {
+        let authority = url::Url::parse(CONFIG.sso_entra_authority().trim_end_matches('/')).unwrap();
+        assert_eq!(
+            form_action_sources("/identity/connect/authorize"),
+            format!(
+                " {} http://localhost:8065 http://localhost:8066 http://localhost:8067 http://localhost:8068 http://localhost:8069 http://localhost:8070",
+                authority.origin().ascii_serialization()
+            )
+        );
+        for path in ["/", "/identity/connect/token", "/identity/connect/authorize/confirm", "/api/sync"] {
+            assert_eq!(form_action_sources(path), "", "{path}");
+        }
+    }
+
+    #[test]
+    fn the_tools_page_escapes_what_it_shows() {
+        let page = cli_confirm_page("<b>Acme</b> & \"Co\"", "http://localhost:8065", "tok'en");
+        assert!(page.contains("&lt;b&gt;Acme&lt;/b&gt; &amp; &quot;Co&quot;"));
+        assert!(page.contains("value=\"tok&#39;en\""));
+        assert!(page.contains("<form method=\"post\""));
+        assert!(!page.contains("<script"));
     }
 
     #[test]

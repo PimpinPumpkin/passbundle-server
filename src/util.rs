@@ -106,7 +106,7 @@ impl Fairing for AppHeaders {
                     font-src 'self'; \
                     manifest-src 'self'; \
                     base-uri 'self'; \
-                    form-action 'self'; \
+                    form-action 'self'{form_action}; \
                     media-src 'self'; \
                     object-src 'self' blob:; \
                     script-src 'self' 'wasm-unsafe-eval'; \
@@ -131,6 +131,9 @@ impl Fairing for AppHeaders {
                     {allowed_connect_src};\
                     ",
                     icon_service_csp = CONFIG._icon_service_csp(),
+                    // Keykeeper: the command-line tool's sign-in page posts
+                    // to this server, which sends the browser on to the tenant.
+                    form_action = crate::api::core::keykeeper_sso::form_action_sources(req_uri_path.as_str()),
                     allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors(),
                     allowed_connect_src = CONFIG.allowed_connect_src(),
                 )
