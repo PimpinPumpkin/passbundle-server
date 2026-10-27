@@ -410,8 +410,9 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             )
         };
 
-        let expiration_time = auth_request.creation_date + chrono::Duration::minutes(5);
-        let request_expired = Utc::now().naive_utc() >= expiration_time;
+        // Keykeeper: the request's own 15 minutes, as everywhere else
+        // (DESIGN.md, "Approving a sign-in from another device").
+        let request_expired = auth_request.is_expired();
 
         if auth_request.user_uuid != user.uuid
             || !auth_request.approved.unwrap_or(false)
@@ -505,7 +506,14 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
         )
     }
 
-    let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Password, data.client_id);
+    // Keykeeper: a session that came from a device's approval says so, and
+    // never approves another sign-in itself.
+    let method = if data.auth_request.is_some() {
+        AuthMethod::AuthRequest
+    } else {
+        AuthMethod::Password
+    };
+    let auth_tokens = auth::AuthTokens::new(&device, &user, method, data.client_id);
 
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }

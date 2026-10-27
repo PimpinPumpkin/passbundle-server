@@ -235,6 +235,14 @@ pub struct LoginJwtClaims {
     pub scope: Vec<String>,
     // [ "Application" ]
     pub amr: Vec<String>,
+
+    // Keykeeper: how this session signed in, as its refresh token keeps it
+    // (the master password, a device's approval, SSO, or an API key). Only a
+    // session that signed in with the master password approves another
+    // device's sign-in (DESIGN.md, "Approving a sign-in from another
+    // device"); one that doesn't say (None) can't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keykeeper_signin: Option<AuthMethod>,
 }
 
 impl LoginJwtClaims {
@@ -290,20 +298,24 @@ impl LoginJwtClaims {
             client_id: client_id.unwrap_or("undefined".to_owned()),
             scope,
             amr: vec!["Application".into()],
+            keykeeper_signin: None,
         }
     }
 
     pub fn default(device: &Device, user: &User, auth_method: &AuthMethod, client_id: Option<String>) -> Self {
         let time_now = Utc::now();
-        Self::new(
-            device,
-            user,
-            time_now.timestamp(),
-            (time_now + *DEFAULT_ACCESS_VALIDITY).timestamp(),
-            auth_method.scope_vec(),
-            client_id,
-            time_now,
-        )
+        Self {
+            keykeeper_signin: Some(auth_method.clone()),
+            ..Self::new(
+                device,
+                user,
+                time_now.timestamp(),
+                (time_now + *DEFAULT_ACCESS_VALIDITY).timestamp(),
+                auth_method.scope_vec(),
+                client_id,
+                time_now,
+            )
+        }
     }
 
     pub fn token(&self) -> String {
@@ -1374,6 +1386,10 @@ pub enum AuthMethod {
     Password,
     Sso,
     UserApiKey,
+    /// Keykeeper: the password grant with an approved sign-in request (a
+    /// device's approval) instead of the master password. It refreshes like
+    /// a password session, and never approves another sign-in.
+    AuthRequest,
 }
 
 impl AuthMethod {
@@ -1381,7 +1397,7 @@ impl AuthMethod {
         match self {
             AuthMethod::OrgApiKey => "api.organization".to_owned(),
             AuthMethod::UserApiKey => "api".to_owned(),
-            AuthMethod::Password | AuthMethod::Sso => "api offline_access".to_owned(),
+            AuthMethod::Password | AuthMethod::Sso | AuthMethod::AuthRequest => "api offline_access".to_owned(),
         }
     }
 
@@ -1506,8 +1522,12 @@ pub async fn refresh_tokens(
             sso::exchange_refresh_token(&device, &user, client_id, refresh_claims).await?
         }
         AuthMethod::Sso => err!("SSO is now disabled, Login again using email and master password"),
-        AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
-        AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
+        AuthMethod::Password | AuthMethod::AuthRequest if CONFIG.sso_enabled() && CONFIG.sso_only() => {
+            err!("SSO is now required, Login again")
+        }
+        AuthMethod::Password | AuthMethod::AuthRequest => {
+            AuthTokens::new(&device, &user, refresh_claims.sub, client_id)
+        }
         _ => err!("Invalid auth method, cannot refresh token"),
     };
 

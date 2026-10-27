@@ -7,6 +7,7 @@ mod events;
 mod folders;
 // Keykeeper
 mod keykeeper_cipher_history;
+mod keykeeper_device_approval;
 mod keykeeper_enrollment;
 mod keykeeper_event_streaming;
 mod keykeeper_joining;
