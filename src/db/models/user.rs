@@ -220,6 +220,9 @@ impl User {
 
     pub async fn reset_security_stamp(&mut self, conn: &DbConn) -> EmptyResult {
         self.security_stamp = get_uuid();
+        // Keykeeper: every web vault tab's reload key goes with the sessions
+        // this ends (keykeeper_reload_keys).
+        crate::api::core::forget_reload_keys(&self.uuid);
         Device::rotate_refresh_tokens_by_user(&self.uuid, conn).await?;
         Ok(())
     }

@@ -172,6 +172,9 @@ impl Device {
     }
 
     pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+        // Keykeeper: and with them, every web vault tab's reload key
+        // (keykeeper_reload_keys).
+        crate::api::core::forget_reload_keys(user_uuid);
         conn.run(move |conn| {
             diesel::delete(devices::table.filter(devices::user_uuid.eq(user_uuid)))
                 .execute(conn)

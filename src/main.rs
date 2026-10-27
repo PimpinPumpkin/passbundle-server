@@ -78,6 +78,9 @@ async fn main() -> Result<(), Error> {
     launch_info();
 
     let level = init_logging()?;
+    // Keykeeper: once the ENV_FILE is loaded (reading the config does), so it
+    // can set ALLOW_CORE_DUMPS too, and before anything secret is in memory.
+    no_core_dumps();
 
     check_data_folder().await;
     auth::initialize_keys().await.unwrap_or_else(|e| {
@@ -97,6 +100,26 @@ async fn main() -> Result<(), Error> {
 
     let extra_debug = matches!(level, log::LevelFilter::Trace | log::LevelFilter::Debug);
     launch_rocket(pool, extra_debug).await // Blocks until program termination.
+}
+
+/// Keykeeper: no core dumps, and on Linux no reading this process's memory
+/// through ptrace or /proc by other processes of the same user, since memory
+/// holds keys that must not reach a disk: web vault tabs' reload keys
+/// (keykeeper_reload_keys) and every session's JWT signing key. Set
+/// ALLOW_CORE_DUMPS=true to keep them for debugging. Swap is the other way to
+/// a disk; see DESIGN.md, "Staying unlocked across a reload".
+fn no_core_dumps() {
+    if std::env::var("ALLOW_CORE_DUMPS").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
+        return;
+    }
+    #[cfg(unix)]
+    if let Err(e) = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0) {
+        eprintln!("Couldn't turn off core dumps: {e}");
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(e) = nix::sys::prctl::set_dumpable(false) {
+        eprintln!("Couldn't mark the process as not dumpable: {e}");
+    }
 }
 
 const HELP: &str = "\
