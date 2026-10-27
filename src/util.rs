@@ -345,8 +345,12 @@ impl Fairing for BetterLogging {
         let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
         // Keykeeper: provisioning requests are logged without their query,
         // whose filters carry people's names and emails, and so are single
-        // sign-on's, whose queries carry codes and states.
-        if uri_subpath.starts_with("/scim") || crate::api::keykeeper_sso_redacts(uri_subpath) {
+        // sign-on's, whose queries carry codes and states, and a sign-in
+        // request's answer, read with its access code.
+        if uri_subpath.starts_with("/scim")
+            || crate::api::keykeeper_sso_redacts(uri_subpath)
+            || crate::api::core::keykeeper_device_approval::redacts(uri_subpath)
+        {
             info!(target: "request", "{method} {uri_path_str}");
             return;
         }

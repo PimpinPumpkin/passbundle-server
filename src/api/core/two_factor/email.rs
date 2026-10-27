@@ -91,6 +91,10 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
             if auth_request.device_type != client_headers.device_type
                 || auth_request.request_ip != client_headers.ip.ip.to_string()
                 || !auth_request.check_access_code(code)
+                // Keykeeper: an expired request is gone, and one for
+                // another account sends this account no code.
+                || auth_request.is_expired()
+                || auth_request.user_uuid != user.uuid
             {
                 err!("AuthRequest doesn't exist", "Invalid device, IP or code")
             }

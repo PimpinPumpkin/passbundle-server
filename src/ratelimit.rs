@@ -10,7 +10,10 @@ use std::{
 
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
 
-use crate::{CONFIG, Error};
+use crate::{
+    CONFIG, Error,
+    db::models::{DeviceId, UserId},
+};
 
 type Limiter<T = IpAddr> = RateLimiter<T, DashMapStateStore<T>, DefaultClock>;
 
@@ -54,6 +57,33 @@ static LIMITER_PRELOGIN: LazyLock<Limiter> = LazyLock::new(|| {
     let burst = NonZeroU32::new(CONFIG.login_ratelimit_max_burst()).expect("Non-zero login ratelimit burst");
     RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero login ratelimit seconds").allow_burst(burst))
 });
+
+// Keykeeper: sign-in requests from one device of one account, five an
+// hour, so "Resend" can't keep the account's other devices prompting
+// (DESIGN.md, "Approving a sign-in from another device"). Keyed by a hash of
+// the account and the device.
+static LIMITER_AUTH_REQUEST_DEVICE: LazyLock<Limiter<AccountKey>> =
+    LazyLock::new(|| RateLimiter::keyed(Quota::per_hour(NonZeroU32::new(5).expect("five"))));
+static AUTH_REQUEST_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+pub fn check_limit_auth_request_device(user: &UserId, device: &DeviceId) -> Result<(), Error> {
+    if AUTH_REQUEST_CHECKS.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {
+        LIMITER_AUTH_REQUEST_DEVICE.retain_recent();
+        LIMITER_AUTH_REQUEST_DEVICE.shrink_to_fit();
+    }
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(user.to_string().as_bytes());
+    ctx.update(&[0]);
+    ctx.update(device.to_string().as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(ctx.finish().as_ref());
+    match LIMITER_AUTH_REQUEST_DEVICE.check_key(&key) {
+        Ok(()) => Ok(()),
+        Err(_e) => {
+            err_code!("This device asked to sign in too many times. Wait a while, then try again.", 429);
+        }
+    }
+}
 
 static LIMITER_ADMIN: LazyLock<Limiter> = LazyLock::new(|| {
     let seconds = Duration::from_secs(CONFIG.admin_ratelimit_seconds());

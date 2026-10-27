@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
+    // Keykeeper: signing in with a device's approval.
+    api::core::keykeeper_device_approval,
     // Keykeeper: each organization's own single sign-on.
     api::core::keykeeper_sso,
     // Keykeeper: two-step login for admins.
@@ -479,13 +481,21 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             )
         };
 
-        let expiration_time = auth_request.creation_date + chrono::Duration::minutes(5);
-        let request_expired = Utc::now().naive_utc() >= expiration_time;
+        // Keykeeper: the request's own 15 minutes, as everywhere else, and
+        // only the device that asked, as the type it asked as (DESIGN.md,
+        // "Approving a sign-in from another device").
+        let request_expired = auth_request.is_expired();
+        let same_device = keykeeper_device_approval::is_requesting_device(
+            &auth_request,
+            data.device_identifier.as_ref(),
+            util::try_parse_string(data.device_type.as_ref()).unwrap_or(14),
+        );
 
         if auth_request.user_uuid != user.uuid
             || !auth_request.approved.unwrap_or(false)
             || auth_request.authentication_date.is_some()
             || request_expired
+            || !same_device
             || ip.ip.to_string() != auth_request.request_ip
             || !auth_request.check_access_code(password)
         {
@@ -590,6 +600,15 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
 
     let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
 
+    // Keykeeper: the organizations' rules for a sign-in with a device's
+    // approval, which proves no password: the hook for any rule that must
+    // hold for it as well as for a password (requiring single sign-on now;
+    // an admin two-step rule belongs there too). See
+    // keykeeper_device_approval::approved_sign_in_rules.
+    if data.auth_request.is_some() {
+        keykeeper_device_approval::approved_sign_in_rules(&user, &device, conn).await?;
+    }
+
     // Keykeeper: required to use single sign-on and not linked yet: their
     // password and two-step login checked out, so they get a linking session,
     // which can only link them to that organization's single sign-on, and no
@@ -629,7 +648,14 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
         )
     }
 
-    let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Password, data.client_id);
+    // Keykeeper: a session that came from a device's approval says so, and
+    // never approves another sign-in itself.
+    let method = if data.auth_request.is_some() {
+        AuthMethod::AuthRequest
+    } else {
+        AuthMethod::Password
+    };
+    let auth_tokens = auth::AuthTokens::new(&device, &user, method, data.client_id);
 
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }
