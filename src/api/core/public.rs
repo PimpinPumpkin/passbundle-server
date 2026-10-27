@@ -21,6 +21,9 @@ use crate::{
     mail,
 };
 
+// Keykeeper: removals and revokes from an import hold (DESIGN.md, "Offboarding").
+use super::keykeeper_offboarding as offboarding;
+
 pub fn routes() -> Vec<Route> {
     routes![ldap_import]
 }
@@ -64,6 +67,9 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
         if user_data.deleted {
             // If user is marked for deletion and it exists, revoke it
             if let Some(mut member) = Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await {
+                if member.atype != MembershipType::Owner && member.status > MembershipStatus::Revoked as i32 {
+                    offboarding::before_revoke(&member, offboarding::By::Directory, &conn).await?;
+                }
                 let revoked = member.atype != MembershipType::Owner && member.revoke();
                 let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
                 if revoked || ext_modified {
@@ -85,6 +91,9 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             }
             if restored || ext_modified {
                 member.save(&conn).await?;
+            }
+            if restored {
+                offboarding::after_restore(&member, offboarding::By::Directory, &conn).await?;
             }
             watch.settle(&conn).await?;
         } else {
@@ -181,6 +190,7 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 && !sync_members.contains(user_external_id)
                 && member.atype != MembershipType::Owner
             {
+                offboarding::before_removal(&member, offboarding::By::Directory, &conn).await?;
                 member.delete(&conn).await?;
             }
         }

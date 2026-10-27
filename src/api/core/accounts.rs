@@ -478,6 +478,12 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
         user.public_key = Some(keys.public_key);
     }
 
+    // Keykeeper: an invitation to an organization that enrolls everyone in
+    // account recovery isn't accepted here, without the recovery key: the
+    // app's enrollment request, which follows at once, accepts it with the key
+    // (organizations.rs, put_reset_password_enrollment). Until then the
+    // person waits, invited, and nobody can confirm them. Account recovery
+    // needs a server that sends email.
     if let Some(identifier) = data.org_identifier
         && identifier != crate::sso::FAKE_SSO_IDENTIFIER
         && identifier != crate::api::admin::FAKE_ADMIN_UUID
@@ -495,7 +501,12 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
             err!("Failed to retrieve the invitation")
         };
 
-        accept_org_invite(&user, membership, None, true, &conn).await?;
+        let waits_for_enrollment = CONFIG.mail_enabled()
+            && OrgPolicy::org_is_reset_password_auto_enroll(&org.uuid, &conn).await
+            && !crate::db::models::MspStaff::is_staff_anywhere(&user.uuid, &conn).await;
+        if !waits_for_enrollment {
+            accept_org_invite(&user, membership, None, true, &conn).await?;
+        }
     }
 
     if CONFIG.mail_enabled() {

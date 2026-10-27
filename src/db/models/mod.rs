@@ -15,6 +15,7 @@ mod keykeeper_event_streaming;
 pub mod keykeeper_folder_permissions;
 mod keykeeper_joining;
 mod keykeeper_msp;
+mod keykeeper_offboarding;
 mod keykeeper_orgs;
 pub mod keykeeper_roles;
 mod keykeeper_scim;
@@ -61,6 +62,7 @@ pub use self::keykeeper_msp::{
     MspPolicy, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,
     exempt_from_member_policies, exempt_from_two_step_policy, parse_enrollment_domains,
 };
+pub use self::keykeeper_offboarding::RemovedMember;
 pub use self::keykeeper_orgs::OrgSetup;
 pub use self::keykeeper_scim::{
     ScimGroup, ScimPerson, ScimToken, ScimUser, looks_like_scim_token, remove_group_member,

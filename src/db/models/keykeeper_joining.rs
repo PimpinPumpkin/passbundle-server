@@ -32,8 +32,12 @@ use super::{MspClient, MspId, OrganizationId};
 /// admin to let them in, unless they joined with a command limited to email
 /// domains: nothing an app can check vouches for the directory's choice. See
 /// DESIGN.md, "Provisioning from Entra ID".
+///
+/// Someone the organization removed, back with a command they kept, waits
+/// for an admin too, until the organization's own people invite them again
+/// (DESIGN.md, "Offboarding").
 pub async fn confirms_automatically(org_auto_confirm: bool, member: &super::Membership, conn: &DbConn) -> bool {
-    if !org_auto_confirm {
+    if !org_auto_confirm || super::RemovedMember::exists(&member.org_uuid, &member.user_uuid, conn).await {
         return false;
     }
     if super::MspEnrollmentJoin::exists_for(&member.uuid, conn).await {

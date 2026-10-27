@@ -14,6 +14,7 @@ mod keykeeper_joining;
 mod keykeeper_msp;
 mod keykeeper_msp_policies;
 mod keykeeper_msp_templates;
+mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_provisioning;
 mod keykeeper_reload_keys;
