@@ -299,6 +299,28 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for EtagC
 // Effectively ignores, any static file route, and the alive endpoint
 const LOGGED_ROUTES: [&str; 7] = ["/api", "/admin", "/identity", "/icons", "/attachments", "/events", "/notifications"];
 
+/// Keykeeper: a request's path as Rocket routes it, its non-empty segments,
+/// percent-decoded. What the request log decides on, so a path sent with an
+/// empty segment (`//identity/connect/...`) or an encoded letter
+/// (`/api/auth-%72equests/...`) is treated like the route it reaches.
+fn routed_path(uri: &rocket::http::uri::Origin<'_>) -> String {
+    let mut path = String::new();
+    for segment in uri.path().segments() {
+        path.push('/');
+        path.push_str(segment);
+    }
+    path
+}
+
+/// The routed path after the domain's own path, if it has one.
+fn routed_subpath(uri: &rocket::http::uri::Origin<'_>) -> String {
+    let path = routed_path(uri);
+    match path.strip_prefix(&CONFIG.domain_path()) {
+        Some(rest) => rest.to_owned(),
+        None => path,
+    }
+}
+
 // Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
 pub struct BetterLogging(pub bool);
 #[rocket::async_trait]
@@ -342,7 +364,8 @@ impl Fairing for BetterLogging {
         let uri = request.uri();
         let uri_path = uri.path();
         let uri_path_str = uri_path.url_decode_lossy();
-        let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
+        // Keykeeper: decided on the path as Rocket routes it (routed_path).
+        let uri_subpath = &routed_subpath(uri);
         // Keykeeper: provisioning requests are logged without their query,
         // whose filters carry people's names and emails, and so are single
         // sign-on's, whose queries carry codes and states, and a sign-in
@@ -366,9 +389,7 @@ impl Fairing for BetterLogging {
         if !self.0 && request.method() == Method::Options {
             return;
         }
-        let uri_path = request.uri().path();
-        let uri_path_str = uri_path.url_decode_lossy();
-        let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
+        let uri_subpath = &routed_subpath(request.uri());
         if self.0 || uri_subpath.starts_with("/scim") || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             let status = response.status();
             if let Some(route) = request.route() {
@@ -991,5 +1012,26 @@ mod tests {
                 });
             }
         });
+    }
+}
+
+// Keykeeper: outside the module above, which only builds with `unstable`.
+#[cfg(test)]
+mod keykeeper_tests {
+    use super::*;
+
+    #[test]
+    fn the_log_decides_on_the_path_as_rocket_routes_it() {
+        use rocket::http::uri::Origin;
+        let routed = |uri: &str| routed_path(&Origin::parse(uri).unwrap());
+        assert_eq!(routed("/api/auth-requests/a/response?code=x"), "/api/auth-requests/a/response");
+        assert_eq!(routed("/api//auth-requests/a/response/?code=x"), "/api/auth-requests/a/response");
+        assert_eq!(routed("//identity/connect/authorize?state=x"), "/identity/connect/authorize");
+        assert_eq!(routed("/api/auth-%72equests/a/%72esponse"), "/api/auth-requests/a/response");
+        for uri in ["/api//auth-requests/a/response?code=x", "/api/auth-%72equests/a/%72esponse?code=x"] {
+            assert!(crate::api::core::keykeeper_device_approval::redacts(&routed(uri)), "{uri}");
+        }
+        assert!(crate::api::keykeeper_sso_redacts(&routed("//identity//connect/authorize?state=x")));
+        assert!(crate::api::keykeeper_sso_redacts(&routed("/%69dentity/connect/authorize?state=x")));
     }
 }

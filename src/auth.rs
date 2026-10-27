@@ -740,7 +740,7 @@ impl<'r> FromRequest<'r> for Headers {
 
         // Keykeeper: an API key's token doesn't do admin work for someone
         // two-step login for admins covers (keykeeper_two_step::api_key_refused).
-        if crate::api::core::keykeeper_two_step::admin_path(request.uri().path().as_str())
+        if crate::api::core::keykeeper_two_step::admin_route(request)
             && crate::api::core::keykeeper_two_step::api_key_refused(request, &user.uuid).await
         {
             err_handler!(crate::api::core::keykeeper_two_step::API_KEY_REFUSED)

@@ -412,8 +412,18 @@ pub async fn api_key_refused(request: &Request<'_>, user_id: &UserId) -> bool {
     requirements(user_id, &conn).await.map_or(true, |r| !r.is_empty())
 }
 
+/// Whether the request's matched route is one of Keykeeper's own endpoints
+/// where admins act (admin_path). Decided on the route Rocket matched, never
+/// the address as sent: Rocket skips empty segments and decodes the rest, so
+/// `/api//keykeeper/msp/...` and `/api/keykeeper/%6Dsp/...` reach the same
+/// handlers.
+pub fn admin_route(request: &Request<'_>) -> bool {
+    request.route().is_some_and(|route| admin_path(route.uri.path()))
+}
+
 /// Keykeeper's own endpoints where admins act, under `/api`: the MSP console's
-/// (`/keykeeper/msp...`) and organizations' (`/keykeeper/organizations...`).
+/// (`/keykeeper/msp...`) and organizations' (`/keykeeper/organizations...`),
+/// by a route's path (admin_route).
 pub fn admin_path(path: &str) -> bool {
     path.split_once("/api/keykeeper/")
         .is_some_and(|(_, rest)| rest.starts_with("msp") || rest.starts_with("organizations"))
@@ -927,6 +937,9 @@ mod tests {
         assert!(admin_path("/api/keykeeper/msp/5d7f/two-step"));
         assert!(admin_path("/api/keykeeper/organizations/5d7f/admin-two-step"));
         assert!(admin_path("/vault/api/keykeeper/organizations/5d7f/sso"));
+        // Route paths, as admin_route reads them.
+        assert!(admin_path("/api/keykeeper/msp/<msp_id>/two-step"));
+        assert!(admin_path("/api/keykeeper/organizations/<org_id>/admin-two-step"));
         assert!(!admin_path("/api/keykeeper/ciphers/5d7f/history"));
         assert!(!admin_path("/api/keykeeper/settings"));
         assert!(!admin_path("/api/sync"));
