@@ -32,7 +32,7 @@ use crate::{
             CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, Membership, MembershipStatus, MembershipType,
             Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
             OrganizationId, RemovedMember, ScimUser, User, effective_joining, email_in_domains,
-            parse_enrollment_domains, valid_encrypted_secret, valid_seal,
+            parse_enrollment_domains, valid_encrypted_secret, valid_expiring_seal, valid_seal,
         },
     },
     mail,
@@ -123,6 +123,17 @@ async fn removed_since(
 pub(super) fn checked_seal(seal: Option<&String>) -> Result<Option<&str>, crate::error::Error> {
     match seal {
         Some(seal) if !valid_seal(seal) => err!("That seal isn't one"),
+        seal => Ok(seal.map(String::as_str)),
+    }
+}
+
+/// An invitation's or staff member's seal from an app, checked to look like
+/// one (version 2, which ends) and not to have ended. None when there isn't one.
+pub(super) fn checked_expiring_seal(seal: Option<&String>) -> Result<Option<&str>, crate::error::Error> {
+    match seal {
+        Some(seal) if !valid_expiring_seal(seal, chrono::Utc::now().timestamp()) => {
+            err!("That seal isn't one, or it has ended. Reload and try again.")
+        }
         seal => Ok(seal.map(String::as_str)),
     }
 }

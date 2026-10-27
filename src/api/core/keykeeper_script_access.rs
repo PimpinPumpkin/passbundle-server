@@ -692,12 +692,27 @@ async fn script_item(item_id: CipherId, caller: ScriptCaller, conn: DbConn) -> J
 #[get("/keykeeper/script/PassBundle.psm1")]
 fn script_module() -> (ContentType, String) {
     let module = include_str!("../../static/scripts/PassBundle.psm1");
-    (ContentType::Plain, module.replace("{{SERVER}}", &CONFIG.domain().replace('\'', "")))
+    (ContentType::Plain, module.replace("{{SERVER}}", &powershell_literal_text(&CONFIG.domain())))
+}
+
+/// Text to put inside the module's single-quoted string: PowerShell ends one
+/// at the apostrophe and at three curly quote characters, so none of them stay.
+fn powershell_literal_text(text: &str) -> String {
+    text.replace(['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'], "")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_address_never_ends_the_modules_string() {
+        assert_eq!(powershell_literal_text("https://vault.example.com"), "https://vault.example.com");
+        assert_eq!(
+            powershell_literal_text("https://x.example/'+(iwr evil)+'\u{2019}\u{2018}\u{201A}\u{201B}"),
+            "https://x.example/+(iwr evil)+"
+        );
+    }
 
     #[test]
     fn reads_the_vectors_authorization_header() {

@@ -32,6 +32,7 @@ table! {
         everyone_collection -> Nullable<Text>,
         templates_collection -> Nullable<Text>,
         enrollment_secret -> Nullable<Text>,
+        client_seal -> Nullable<Text>,
     }
 }
 
