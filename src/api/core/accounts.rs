@@ -1707,6 +1707,10 @@ async fn post_auth_request(
         _ => err!("AuthRequest doesn't exist", "Device verification failed"),
     };
 
+    // Keykeeper: a device asks a few times an hour at most, so "Resend"
+    // can't keep the account's devices prompting.
+    crate::ratelimit::check_limit_auth_request_device(&user.uuid, &device.uuid)?;
+
     // Keykeeper: a device's new request replaces the one it had waiting
     // ("resend"), and an account has a few waiting at most, so nobody can
     // fill its devices' lists. See DESIGN.md, "Approving a sign-in from
@@ -1755,6 +1759,9 @@ async fn post_auth_request(
 
 #[get("/auth-requests/<auth_request_id>")]
 async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn: DbConn) -> JsonResult {
+    // Keykeeper: with the requesting device's identifier, as upstream's
+    // answer has it, so the apps prompt once per device (a "Resend" replaces
+    // the request in place).
     let Some(auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
         err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
@@ -1770,9 +1777,11 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
         "id": &auth_request_id,
         "publicKey": auth_request.public_key,
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
+        "requestDeviceIdentifier": auth_request.request_device_identifier,
         "requestIpAddress": auth_request.request_ip,
         "key": auth_request.enc_key,
-        "masterPasswordHash": auth_request.master_password_hash,
+        // Keykeeper: never a master password hash.
+        "masterPasswordHash": null,
         "creationDate": format_date(&auth_request.creation_date),
         "responseDate": response_date_utc,
         "requestApproved": auth_request.approved,
@@ -1786,8 +1795,8 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
 struct AuthResponseRequest {
     device_identifier: DeviceId,
     // Keykeeper: only an approval needs the key; a denial needn't send one.
+    // A master password hash, which upstream's clients may send, is ignored.
     key: Option<String>,
-    master_password_hash: Option<String>,
     request_approved: bool,
 }
 
@@ -1829,7 +1838,7 @@ async fn put_auth_request(
         err!("A device can't answer its own sign-in request")
     }
     if data.request_approved {
-        if !signed_in.may_approve() {
+        if !signed_in.is_master_password() {
             err!("Approve sign-ins from a device where you signed in with your master password")
         }
         if !data.key.as_deref().is_some_and(valid_approval_key) {
@@ -1843,7 +1852,9 @@ async fn put_auth_request(
     if data.request_approved {
         auth_request.approved = Some(data.request_approved);
         auth_request.enc_key = data.key;
-        auth_request.master_password_hash = data.master_password_hash;
+        // Keykeeper: an approval carries the user key and nothing else: no
+        // master password hash is kept, whatever a client sends.
+        auth_request.master_password_hash = None;
         auth_request.response_device_id = Some(data.device_identifier.clone());
         auth_request.response_date = Some(response_date);
         auth_request.save(&conn).await?;
@@ -1878,7 +1889,8 @@ async fn put_auth_request(
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestIpAddress": auth_request.request_ip,
         "key": auth_request.enc_key,
-        "masterPasswordHash": auth_request.master_password_hash,
+        // Keykeeper: never a master password hash.
+        "masterPasswordHash": null,
         "creationDate": format_date(&auth_request.creation_date),
         "responseDate": response_date_utc,
         "requestApproved": auth_request.approved,
@@ -1917,7 +1929,8 @@ async fn get_auth_request_response(
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestIpAddress": auth_request.request_ip,
         "key": auth_request.enc_key,
-        "masterPasswordHash": auth_request.master_password_hash,
+        // Keykeeper: never a master password hash.
+        "masterPasswordHash": null,
         "creationDate": format_date(&auth_request.creation_date),
         "responseDate": response_date_utc,
         "requestApproved": auth_request.approved,
@@ -1950,9 +1963,10 @@ async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult
                 "id": request.uuid,
                 "publicKey": request.public_key,
                 "requestDeviceType": DeviceType::from_i32(request.device_type).to_string(),
+                "requestDeviceIdentifier": request.request_device_identifier,
                 "requestIpAddress": request.request_ip,
                 "key": request.enc_key,
-                "masterPasswordHash": request.master_password_hash,
+                "masterPasswordHash": null,
                 "creationDate": format_date(&request.creation_date),
                 "responseDate": response_date_utc,
                 "requestApproved": request.approved,
