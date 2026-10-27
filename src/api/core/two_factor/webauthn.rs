@@ -18,7 +18,11 @@ use crate::{
     CONFIG,
     api::{
         EmptyResult, JsonResult, PasswordOrOtpData,
-        core::{log_user_event, two_factor::generate_recover_code},
+        core::{
+            keykeeper_two_step::{self, SetupHeaders, finish_setup},
+            log_user_event,
+            two_factor::generate_recover_code,
+        },
     },
     auth::Headers,
     crypto::ct_eq,
@@ -107,8 +111,11 @@ impl WebauthnRegistration {
     }
 }
 
+// Keykeeper: the setup endpoints also take a setup session (SetupHeaders),
+// which a sign-in gets when the person's role requires two-step login and
+// they haven't set it up (DESIGN.md, "Two-step login for admins").
 #[post("/two-factor/get-webauthn", data = "<data>")]
-async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     if !CONFIG.is_webauthn_2fa_supported() {
         err!("Configured `DOMAIN` is not compatible with Webauthn")
     }
@@ -129,7 +136,7 @@ async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbC
 }
 
 #[post("/two-factor/get-webauthn-challenge", data = "<data>")]
-async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
@@ -253,7 +260,7 @@ impl From<PublicKeyCredentialCopy> for PublicKeyCredential {
 }
 
 #[post("/two-factor/webauthn", data = "<data>")]
-async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     let data: EnableWebauthnData = data.into_inner();
     let mut user = headers.user;
 
@@ -293,18 +300,21 @@ async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, con
         .await?;
     generate_recover_code(&mut user, &conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device_type, &headers.ip.ip, &conn).await;
 
     let keys_json: Vec<Value> = registrations.iter().map(WebauthnRegistration::to_json).collect();
-    Ok(Json(json!({
+    let mut answer = json!({
         "enabled": true,
         "keys": keys_json,
         "object": "twoFactorU2f"
-    })))
+    });
+    // Keykeeper: a setup session ends here.
+    finish_setup(headers.session.as_ref(), &mut user, &mut answer, &conn).await?;
+    Ok(Json(answer))
 }
 
 #[put("/two-factor/webauthn", data = "<data>")]
-async fn activate_webauthn_put(data: Json<EnableWebauthnData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_webauthn_put(data: Json<EnableWebauthnData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     activate_webauthn(data, headers, conn).await
 }
 
@@ -321,6 +331,9 @@ async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, conn: DbCo
     if !headers.user.check_valid_password(&data.master_password_hash) {
         err!("Invalid password");
     }
+    // Keykeeper: their last method that counts for two-step login for admins
+    // may go, which ends their sessions.
+    let watch = keykeeper_two_step::Watch::user(&headers.user.uuid, &conn).await?;
 
     let Some(mut tf) =
         TwoFactor::find_by_user_and_type(&headers.user.uuid, TwoFactorType::Webauthn as i32, &conn).await
@@ -335,9 +348,15 @@ async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, conn: DbCo
     };
 
     let removed_item = data.remove(item_pos);
-    tf.data = serde_json::to_string(&data)?;
-    tf.save(&conn).await?;
-    drop(tf);
+    // Keykeeper: with its last key gone, the method goes too, rather than
+    // staying on with no keys.
+    let last_key = data.is_empty();
+    if last_key {
+        tf.delete(&conn).await?;
+    } else {
+        tf.data = serde_json::to_string(&data)?;
+        tf.save(&conn).await?;
+    }
     Device::clear_twofactor_remember_by_user(&headers.user.uuid, &conn).await?;
 
     // If entry is migrated from u2f, delete the u2f entry as well
@@ -356,10 +375,26 @@ async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, conn: DbCo
         u2f.save(&conn).await?;
     }
 
+    if last_key {
+        log_user_event(
+            EventType::UserDisabled2fa as i32,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &conn,
+        )
+        .await;
+        if TwoFactor::find_by_user(&headers.user.uuid, &conn).await.is_empty() {
+            super::enforce_2fa_policy(&headers.user, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn)
+                .await?;
+        }
+    }
+    watch.settle(&conn).await?;
+
     let keys_json: Vec<Value> = data.iter().map(WebauthnRegistration::to_json).collect();
 
     Ok(Json(json!({
-        "enabled": true,
+        "enabled": !last_key,
         "keys": keys_json,
         "object": "twoFactorU2f"
     })))
