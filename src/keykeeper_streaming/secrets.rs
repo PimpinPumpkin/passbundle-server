@@ -92,9 +92,16 @@ pub fn seal_with(
     binding: &Binding<'_>,
     plaintext: &str,
 ) -> Result<String, String> {
+    seal_aad_with(key, nonce, &binding.aad(), plaintext)
+}
+
+/// `seal_with` over associated data of the caller's own, for another
+/// feature's secrets under its own key (`derive_key_for`): single sign-on's
+/// client secrets (keykeeper_sso::secret).
+pub fn seal_aad_with(key: &[u8; 32], nonce: [u8; NONCE_LEN], aad: &[u8], plaintext: &str) -> Result<String, String> {
     let key = aead_key(key)?;
     let mut data = Zeroizing::new(plaintext.as_bytes().to_vec());
-    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(binding.aad()), &mut *data)
+    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut *data)
         .map_err(|_| "Couldn't encrypt")?;
     let mut out = nonce.to_vec();
     out.extend_from_slice(&data);
@@ -109,21 +116,26 @@ pub fn open(binding: &Binding<'_>, sealed: &str) -> Result<Zeroizing<String>, St
 /// `open` with a given key.
 pub fn open_with(key: &[u8; 32], binding: &Binding<'_>, sealed: &str) -> Result<Zeroizing<String>, String> {
     const CANT: &str = "This server can't read the destination's secrets anymore (its keys changed). Enter them again.";
-    let key = aead_key(key)?;
-    let bytes =
-        sealed.strip_prefix(PREFIX).and_then(|b| data_encoding::BASE64.decode(b.as_bytes()).ok()).ok_or(CANT)?;
+    open_aad_with(key, &binding.aad(), sealed).ok_or_else(|| CANT.to_owned())
+}
+
+/// `open_with` over associated data of the caller's own (`seal_aad_with`):
+/// nothing if it doesn't open.
+pub fn open_aad_with(key: &[u8; 32], aad: &[u8], sealed: &str) -> Option<Zeroizing<String>> {
+    let key = aead_key(key).ok()?;
+    let bytes = sealed.strip_prefix(PREFIX).and_then(|b| data_encoding::BASE64.decode(b.as_bytes()).ok())?;
     if bytes.len() < NONCE_LEN {
-        return Err(CANT.into());
+        return None;
     }
     let (nonce, data) = bytes.split_at(NONCE_LEN);
-    let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| CANT)?;
+    let nonce = Nonce::try_assume_unique_for_key(nonce).ok()?;
     let mut data = Zeroizing::new(data.to_vec());
-    let plain = key.open_in_place(nonce, Aad::from(binding.aad()), &mut data).map_err(|_| CANT)?;
+    let plain = key.open_in_place(nonce, Aad::from(aad), &mut data).ok()?;
     match String::from_utf8(plain.to_vec()) {
-        Ok(text) => Ok(Zeroizing::new(text)),
+        Ok(text) => Some(Zeroizing::new(text)),
         Err(e) => {
             e.into_bytes().zeroize();
-            Err(CANT.into())
+            None
         }
     }
 }

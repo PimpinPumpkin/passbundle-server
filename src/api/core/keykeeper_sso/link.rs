@@ -116,11 +116,28 @@ impl Refusal {
                 "{email} is already linked to a different Microsoft account in {org}. Ask your administrator to unlink it."
             ),
             Self::SignInToLink(email) => format!(
-                "{email} already has a PassBundle account. Sign in with your master password once, open {org}'s menu in your vault, and choose Link SSO. After that, single sign-on works."
+                "{email} already has a PassBundle account. Sign in with your email and master password, then link your Microsoft account: PassBundle asks you to if {org} requires single sign-on, or open {org}'s menu in your vault and choose Link SSO. After that, single sign-on works."
             ),
             Self::MicrosoftAccountTaken => format!(
                 "That Microsoft account is already linked to another PassBundle account in {org}. Ask your administrator to unlink it."
             ),
+        }
+    }
+
+    /// A fixed code for the reason, for security tools: refusals for
+    /// different reasons are never merged into one event.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoEmail => "no_email",
+            Self::EmailNotVouched(_) => "email_not_vouched",
+            Self::NoAccount(_) => "no_account",
+            Self::NotMember(_) => "not_member",
+            Self::TurnedOff(_) => "turned_off",
+            Self::Disabled(_) => "disabled",
+            Self::MspStaff(_) => "msp_staff",
+            Self::LinkedToAnother(_) => "linked_to_another",
+            Self::SignInToLink(_) => "link_from_session",
+            Self::MicrosoftAccountTaken => "microsoft_account_taken",
         }
     }
 
@@ -499,10 +516,12 @@ mod tests {
             Refusal::SignInToLink("a@b.test".into()),
             Refusal::MicrosoftAccountTaken,
         ];
+        let mut codes = std::collections::HashSet::new();
         for r in all {
             assert!(!r.message("Acme").is_empty());
             assert!(!r.detail().is_empty());
             assert!(!r.message("Acme").contains('\u{2014}'), "no em dashes");
+            assert!(codes.insert(r.code()), "{} is one reason's code", r.code());
         }
     }
 }

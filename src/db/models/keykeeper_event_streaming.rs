@@ -1374,17 +1374,19 @@ pub async fn stream(event: &Event, conn: &DbConn) {
     };
     let mut own = event_json(event, &org, None, conn).await;
     // What the code that logged it added for destinations (which destination
-    // changed, and how).
+    // changed, and how, or why single sign-on refused someone).
+    let mut reason = None;
     if let Some((_, extra)) = EVENT_EXTRAS.remove(event.uuid.as_str())
         && let Some(extra) = extra.as_object()
     {
+        reason = extra.get("reason").and_then(Value::as_str).map(str::to_owned);
         for (k, v) in extra {
             own[k] = v.clone();
         }
     }
     let own = own.to_string();
     let rank = priority(event.event_type, describe(event.event_type).2);
-    let merge_key = merge_key(event, Utc::now().timestamp() / 60);
+    let merge_key = merge_key(event, Utc::now().timestamp() / 60, reason.as_deref());
     let for_msp = msp.as_ref().map(|m| {
         let mut v: Value = serde_json::from_str(&own).unwrap_or_default();
         v["msp"] = json!({ "id": m.uuid, "name": m.name });
@@ -1416,14 +1418,16 @@ pub async fn stream(event: &Event, conn: &DbConn) {
 /// the same kind, organization, and person (or account, for failed logins),
 /// in the same minute of the server's clock (an app says when its events
 /// happened, so not theirs). The organization keeps a person in several of
-/// an MSP's clients from merging across them in the MSP's feed.
-fn merge_key(event: &Event, minute: i64) -> Option<String> {
+/// an MSP's clients from merging across them in the MSP's feed. A reason
+/// code (single sign-on's refusals) keeps different reasons apart.
+fn merge_key(event: &Event, minute: i64, reason: Option<&str>) -> Option<String> {
     if !merges(event.event_type) {
         return None;
     }
     let org = event.org_uuid.as_ref().map(ToString::to_string).unwrap_or_default();
     let who = event.act_user_uuid.as_ref().or(event.user_uuid.as_ref()).map(ToString::to_string).unwrap_or_default();
-    Some(format!("{}:{org}:{who}:{minute}", event.event_type))
+    let reason = reason.unwrap_or_default();
+    Some(format!("{}:{org}:{who}:{minute}:{reason}", event.event_type))
 }
 
 /// Fields that the code logging an event adds to what destinations get, by
@@ -1675,15 +1679,19 @@ mod tests {
             e.act_user_uuid = Some(user.to_owned().into());
             e
         };
-        let a = merge_key(&event("org-a", "x", 1005), 100).unwrap();
+        let a = merge_key(&event("org-a", "x", 1005), 100, None).unwrap();
         // The same person failing to log in to two of an MSP's clients: two
         // events in the MSP's feed, one per client.
-        assert_ne!(a, merge_key(&event("org-b", "x", 1005), 100).unwrap());
-        assert_ne!(a, merge_key(&event("org-a", "y", 1005), 100).unwrap());
-        assert_ne!(a, merge_key(&event("org-a", "x", 1006), 100).unwrap());
-        assert_ne!(a, merge_key(&event("org-a", "x", 1005), 101).unwrap());
-        assert_eq!(a, merge_key(&event("org-a", "x", 1005), 100).unwrap());
-        assert!(merge_key(&event("org-a", "x", 1502), 100).is_none());
+        assert_ne!(a, merge_key(&event("org-b", "x", 1005), 100, None).unwrap());
+        assert_ne!(a, merge_key(&event("org-a", "y", 1005), 100, None).unwrap());
+        assert_ne!(a, merge_key(&event("org-a", "x", 1006), 100, None).unwrap());
+        assert_ne!(a, merge_key(&event("org-a", "x", 1005), 101, None).unwrap());
+        assert_eq!(a, merge_key(&event("org-a", "x", 1005), 100, None).unwrap());
+        assert!(merge_key(&event("org-a", "x", 1502), 100, None).is_none());
+        // Single sign-on's refusals merge only with refusals for the same reason.
+        let refused = merge_key(&event("org-a", "x", 1591), 100, Some("not_member")).unwrap();
+        assert_eq!(refused, merge_key(&event("org-a", "x", 1591), 100, Some("not_member")).unwrap());
+        assert_ne!(refused, merge_key(&event("org-a", "x", 1591), 100, Some("microsoft_refused")).unwrap());
     }
 
     #[test]

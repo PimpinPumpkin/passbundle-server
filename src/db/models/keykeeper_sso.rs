@@ -17,7 +17,8 @@ use crate::{
     db::{
         DbConn,
         keykeeper_schema::{
-            keykeeper_sso, keykeeper_sso_auth, keykeeper_sso_domains, keykeeper_sso_link_tickets, keykeeper_sso_links,
+            keykeeper_sso, keykeeper_sso_auth, keykeeper_sso_domains, keykeeper_sso_link_sessions,
+            keykeeper_sso_link_tickets, keykeeper_sso_links,
         },
     },
     error::MapResult,
@@ -419,31 +420,53 @@ impl SsoLink {
     }
 }
 
-/// How long a signed-in session's ticket to link single sign-on lasts.
+/// How long a session's ticket to link single sign-on lasts.
 pub const SSO_LINK_TICKET_MINUTES: i64 = 5;
 
-/// A signed-in session's ticket to link its own account to an organization's
-/// single sign-on (upstream's Link SSO): made by an authenticated request,
-/// used once at /identity/connect/authorize, kept only as a hash.
+/// A session's ticket to link its own account to an organization's single
+/// sign-on (upstream's Link SSO): made by a verified request, used once at
+/// /identity/connect/authorize from the browser it was issued to, kept only
+/// as a hash.
 #[derive(Identifiable, Queryable, Insertable, Clone)]
 #[diesel(table_name = keykeeper_sso_link_tickets)]
 #[diesel(primary_key(ticket_hash))]
 pub struct SsoLinkTicket {
     pub ticket_hash: String,
     pub user_uuid: UserId,
+    /// A linking session's ticket works only for its organization.
+    pub org_uuid: Option<OrganizationId>,
+    /// The hash of the cookie it was issued with.
+    pub binding_hash: String,
+    /// Which session asked: "device:<id>" or "link:<hash>".
+    pub session_ref: String,
     pub created_at: NaiveDateTime,
 }
 
+/// What a ticket was for, once it's used.
+pub struct LinkTicketUse {
+    pub user_uuid: UserId,
+    pub org_uuid: Option<OrganizationId>,
+    pub session_ref: String,
+}
+
 impl SsoLinkTicket {
-    /// A new ticket for this account: the ticket itself, and its row.
-    pub fn generate(user_uuid: UserId) -> (String, Self) {
-        let ticket = sso_random();
+    /// A new ticket for this account and session: the ticket, the cookie value
+    /// that must come back with it, and its row.
+    pub fn generate(
+        user_uuid: UserId,
+        org_uuid: Option<OrganizationId>,
+        session_ref: String,
+    ) -> (String, String, Self) {
+        let (ticket, binding) = (sso_random(), sso_random());
         let row = Self {
             ticket_hash: sso_hash(&ticket),
             user_uuid,
+            org_uuid,
+            binding_hash: sso_hash(&binding),
+            session_ref,
             created_at: Utc::now().naive_utc(),
         };
-        (ticket, row)
+        (ticket, binding, row)
     }
 
     pub async fn insert(&self, conn: &DbConn) -> EmptyResult {
@@ -467,9 +490,12 @@ impl SsoLinkTicket {
         .await
     }
 
-    /// Uses a ticket: the account it's for, once, within its five minutes.
-    pub async fn take(ticket: &str, conn: &DbConn) -> Option<UserId> {
+    /// Uses a ticket, once, within its five minutes, and only with the cookie
+    /// it was issued with: taken whatever happens, so a ticket tried from
+    /// another browser is gone.
+    pub async fn take(ticket: &str, binding: Option<&str>, conn: &DbConn) -> Option<LinkTicketUse> {
         let hash = sso_hash(ticket);
+        let binding = binding.map(sso_hash);
         let oldest = Utc::now().naive_utc() - TimeDelta::minutes(SSO_LINK_TICKET_MINUTES);
         conn.run(move |conn| {
             let row = keykeeper_sso_link_tickets::table
@@ -481,7 +507,96 @@ impl SsoLinkTicket {
             )
             .execute(conn)
             .ok()?;
-            (deleted == 1 && row.created_at >= oldest).then_some(row.user_uuid)
+            let same_browser = binding.is_some_and(|b| crate::crypto::ct_eq(b, &row.binding_hash));
+            (deleted == 1 && row.created_at >= oldest && same_browser).then_some(LinkTicketUse {
+                user_uuid: row.user_uuid,
+                org_uuid: row.org_uuid,
+                session_ref: row.session_ref,
+            })
+        })
+        .await
+    }
+}
+
+/// How long a linking session lasts.
+pub const SSO_LINK_SESSION_MINUTES: i64 = 15;
+
+/// A linking session: what a password sign-in gets, after two-step login,
+/// when an organization requires single sign-on of someone who isn't linked
+/// to it yet. It's accepted only by the link endpoints (it isn't a login
+/// token, so nothing else takes it), for that organization, and ends when the
+/// link is made. Kept only as a hash.
+#[derive(Identifiable, Queryable, Insertable, Clone)]
+#[diesel(table_name = keykeeper_sso_link_sessions)]
+#[diesel(primary_key(session_hash))]
+pub struct SsoLinkSession {
+    pub session_hash: String,
+    pub user_uuid: UserId,
+    pub org_uuid: OrganizationId,
+    pub created_at: NaiveDateTime,
+}
+
+impl SsoLinkSession {
+    /// A new linking session: its token, and its row.
+    pub fn generate(user_uuid: UserId, org_uuid: OrganizationId) -> (String, Self) {
+        let token = sso_random();
+        let row = Self {
+            session_hash: sso_hash(&token),
+            user_uuid,
+            org_uuid,
+            created_at: Utc::now().naive_utc(),
+        };
+        (token, row)
+    }
+
+    fn oldest() -> NaiveDateTime {
+        Utc::now().naive_utc() - TimeDelta::minutes(SSO_LINK_SESSION_MINUTES)
+    }
+
+    pub async fn insert(&self, conn: &DbConn) -> EmptyResult {
+        let oldest = Self::oldest();
+        conn.run(move |conn| {
+            // An account's older linking sessions, and everyone's expired
+            // ones, go: one at a time.
+            diesel::delete(
+                keykeeper_sso_link_sessions::table.filter(
+                    keykeeper_sso_link_sessions::user_uuid
+                        .eq(&self.user_uuid)
+                        .or(keykeeper_sso_link_sessions::created_at.lt(oldest)),
+                ),
+            )
+            .execute(conn)
+            .ok();
+            diesel::insert_into(keykeeper_sso_link_sessions::table)
+                .values(self)
+                .execute(conn)
+                .map_res("Error starting a linking session")
+        })
+        .await
+    }
+
+    /// A live linking session, by its token.
+    pub async fn find(token: &str, conn: &DbConn) -> Option<Self> {
+        let (hash, oldest) = (sso_hash(token), Self::oldest());
+        conn.run(move |conn| {
+            keykeeper_sso_link_sessions::table
+                .filter(keykeeper_sso_link_sessions::session_hash.eq(hash))
+                .filter(keykeeper_sso_link_sessions::created_at.ge(oldest))
+                .first::<Self>(conn)
+                .ok()
+        })
+        .await
+    }
+
+    /// Ends it: the link was made.
+    pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
+        let hash = self.session_hash.clone();
+        conn.run(move |conn| {
+            diesel::delete(
+                keykeeper_sso_link_sessions::table.filter(keykeeper_sso_link_sessions::session_hash.eq(hash)),
+            )
+            .execute(conn)
+            .map_res("Error ending a linking session")
         })
         .await
     }
@@ -503,8 +618,10 @@ pub struct SsoAuthRow {
     pub code_verifier: String,
     pub binding_hash: String,
     pub code_hash: Option<String>,
-    /// Linking from a signed-in session: the account that asked.
+    /// Linking: the account, and the session that asked ("device:<id>" or
+    /// "link:<hash>"), which must confirm the link.
     pub link_user_uuid: Option<UserId>,
+    pub link_session: Option<String>,
     pub identity: Option<String>,
     pub error: Option<String>,
     pub created_at: NaiveDateTime,
@@ -591,6 +708,26 @@ impl SsoAuthRow {
                 .filter(keykeeper_sso_auth::returned_at.is_not_null())
                 .first::<Self>(conn)
                 .ok()
+        })
+        .await
+    }
+
+    /// A link waiting to be confirmed, by its code, taken once: the next
+    /// request with the same code finds nothing.
+    pub async fn take_by_code(code: &str, conn: &DbConn) -> Option<Self> {
+        let (hash, oldest) = (sso_hash(code), oldest());
+        conn.run(move |conn| {
+            let row = keykeeper_sso_auth::table
+                .filter(keykeeper_sso_auth::code_hash.eq(&hash))
+                .filter(keykeeper_sso_auth::created_at.ge(oldest))
+                .filter(keykeeper_sso_auth::returned_at.is_not_null())
+                .first::<Self>(conn)
+                .ok()?;
+            let deleted =
+                diesel::delete(keykeeper_sso_auth::table.filter(keykeeper_sso_auth::state_hash.eq(&row.state_hash)))
+                    .execute(conn)
+                    .ok()?;
+            (deleted == 1).then_some(row)
         })
         .await
     }

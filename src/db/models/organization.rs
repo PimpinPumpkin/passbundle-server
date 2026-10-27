@@ -738,6 +738,10 @@ impl Membership {
 
         CollectionUser::delete_all_by_user_and_org(&self.user_uuid, &self.org_uuid, conn).await?;
         GroupUser::delete_all_by_member(&self.uuid, conn).await?;
+        // Keykeeper: and their link to the organization's single sign-on, so
+        // sessions it started stop refreshing (keykeeper_sso::sso_session_live)
+        // and someone who comes back links again.
+        super::SsoLink::delete(&self.org_uuid, &self.user_uuid, conn).await?;
 
         conn.run(move |conn| {
             diesel::delete(users_organizations::table.filter(users_organizations::uuid.eq(self.uuid)))

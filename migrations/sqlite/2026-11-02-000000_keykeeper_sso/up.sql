@@ -66,9 +66,11 @@ CREATE TABLE keykeeper_sso_auth (
     binding_hash     TEXT      NOT NULL,
     -- The one-time code this server gave the app, once Entra answered.
     code_hash        TEXT      UNIQUE,
-    -- For linking single sign-on from a signed-in session (upstream's Link
-    -- SSO): the account whose session asked, from its link ticket.
+    -- For linking an account to single sign-on (upstream's Link SSO): the
+    -- account and the session that asked, from its link ticket. The link
+    -- waits for that session to confirm it.
     link_user_uuid   TEXT      REFERENCES users (uuid) ON DELETE CASCADE,
+    link_session     TEXT,
     -- Who Entra said it was (JSON), or why it didn't work.
     identity         TEXT,
     error            TEXT,
@@ -76,12 +78,28 @@ CREATE TABLE keykeeper_sso_auth (
     returned_at      TIMESTAMP
 );
 CREATE INDEX keykeeper_sso_auth_created ON keykeeper_sso_auth (created_at);
--- A signed-in session's ticket to link its own account to single sign-on:
--- five minutes, once, kept only as a SHA-256 hash.
+-- A session's ticket to link its own account to single sign-on: five
+-- minutes, once, from the browser it was issued to (a cookie's hash), kept
+-- only as a SHA-256 hash.
 CREATE TABLE keykeeper_sso_link_tickets (
-    ticket_hash TEXT      NOT NULL PRIMARY KEY,
-    user_uuid   TEXT      NOT NULL REFERENCES users (uuid) ON DELETE CASCADE,
-    created_at  TIMESTAMP NOT NULL
+    ticket_hash  TEXT      NOT NULL PRIMARY KEY,
+    user_uuid    TEXT      NOT NULL REFERENCES users (uuid) ON DELETE CASCADE,
+    -- Only this organization's single sign-on, for a linking session.
+    org_uuid     TEXT      REFERENCES organizations (uuid) ON DELETE CASCADE,
+    binding_hash TEXT      NOT NULL,
+    -- Which session asked: "device:<id>" or "link:<hash>".
+    session_ref  TEXT      NOT NULL,
+    created_at   TIMESTAMP NOT NULL
+);
+-- A linking session: what a password sign-in gets, after two-step login, when
+-- an organization requires single sign-on of someone who isn't linked yet. It
+-- can only link them to that organization's single sign-on, for fifteen
+-- minutes, and ends when the link is made. Kept only as a SHA-256 hash.
+CREATE TABLE keykeeper_sso_link_sessions (
+    session_hash TEXT      NOT NULL PRIMARY KEY,
+    user_uuid    TEXT      NOT NULL REFERENCES users (uuid) ON DELETE CASCADE,
+    org_uuid     TEXT      NOT NULL REFERENCES organizations (uuid) ON DELETE CASCADE,
+    created_at   TIMESTAMP NOT NULL
 );
 -- An event's subject in words, where it has one: a domain for domain events
 -- (upstream's domainName), or why a single sign-on was refused.

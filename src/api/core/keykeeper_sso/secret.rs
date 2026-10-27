@@ -6,8 +6,8 @@
 // database), so a copy of the database, such as a backup kept at another
 // company, doesn't reveal it. The key is single sign-on's own, derived over
 // another label, so neither feature's ciphertexts open as the other's, and
-// each secret is bound to its organization, so it can't be moved to another
-// one. The key opens these secrets only: the server holds no key that can
+// each secret is bound (as associated data) to its organization, so it can't
+// be moved to another one. The key opens these secrets only: the server holds no key that can
 // decrypt a vault. If the RSA key changes, the secret can't be read and
 // sign-ins are refused until an admin enters it again.
 // Test vectors: docs/vectors/sso-client-secret-v1.json in the meta repo (a
@@ -19,18 +19,13 @@ use std::sync::OnceLock;
 use ring::aead::NONCE_LEN;
 use zeroize::Zeroizing;
 
-use crate::{
-    db::models::OrganizationId,
-    keykeeper_streaming::secrets::{self, Binding},
-};
+use crate::{db::models::OrganizationId, keykeeper_streaming::secrets};
 
 static KEY: OnceLock<Zeroizing<[u8; 32]>> = OnceLock::new();
 
 /// The label single sign-on's key is derived over (event streaming's is
 /// another).
 const LABEL: &[u8] = b"passbundle sso client secrets v1";
-/// The kind in each secret's binding.
-const KIND: &str = "entra-sso-client-secret";
 
 const CANT: &str = "This server can't read the organization's single sign-on client secret anymore (its keys \
                     changed). An admin needs to enter it again on the Single sign-on page.";
@@ -45,13 +40,9 @@ fn key() -> Result<&'static [u8; 32], String> {
     KEY.get().map(|k| &**k).ok_or_else(|| "The server's keys aren't loaded yet".to_owned())
 }
 
-/// What a secret is bound to: its organization, as both the id and the owner.
-fn binding(org: &str) -> Binding<'_> {
-    Binding {
-        id: org,
-        owner: org,
-        kind: KIND,
-    }
+/// What a secret is bound to: its organization.
+fn aad(org: &str) -> Vec<u8> {
+    format!("sso client secret\u{0}organization {org}").into_bytes()
 }
 
 /// Seals an organization's client secret for the database.
@@ -62,7 +53,7 @@ pub fn seal(org: &OrganizationId, secret: &str) -> Result<String, String> {
 /// `seal` with a given key and nonce. The nonce must never repeat under one
 /// key; only `seal` (random nonces) and the test vectors call this.
 fn seal_with(key: &[u8; 32], nonce: [u8; NONCE_LEN], org: &str, secret: &str) -> Result<String, String> {
-    secrets::seal_with(key, nonce, &binding(org), secret)
+    secrets::seal_aad_with(key, nonce, &aad(org), secret)
 }
 
 /// Opens what `seal` made for this organization, or says why it can't.
@@ -71,7 +62,7 @@ pub fn open(org: &OrganizationId, sealed: &str) -> Result<Zeroizing<String>, Str
 }
 
 fn open_with(key: &[u8; 32], org: &str, sealed: &str) -> Result<Zeroizing<String>, String> {
-    secrets::open_with(key, &binding(org), sealed).map_err(|_| CANT.to_owned())
+    secrets::open_aad_with(key, &aad(org), sealed).ok_or_else(|| CANT.to_owned())
 }
 
 #[cfg(test)]
@@ -88,7 +79,6 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(include_str!("vectors/sso-client-secret-v1.json")).unwrap();
         let s = |key: &str| v[key].as_str().unwrap().to_owned();
         assert_eq!(s("label").as_bytes(), LABEL);
-        assert_eq!(s("kind"), KIND);
         let der = data_encoding::BASE64.decode(s("rsaPkcs1Der").as_bytes()).unwrap();
         let key = hex32(&s("key"));
         let streaming_key = hex32(&s("streamingKey"));
@@ -100,6 +90,7 @@ mod tests {
         let cases = v["cases"].as_array().unwrap();
         for case in cases {
             let org = case["organization"].as_str().unwrap();
+            assert_eq!(aad(org), case["aad"].as_str().unwrap().as_bytes());
             let nonce: [u8; NONCE_LEN] =
                 data_encoding::HEXLOWER.decode(case["nonce"].as_str().unwrap().as_bytes()).unwrap().try_into().unwrap();
             let plaintext = case["plaintext"].as_str().unwrap();
@@ -115,16 +106,23 @@ mod tests {
         for other in v["wrongOrganizations"].as_array().unwrap() {
             assert!(open_with(&key, other.as_str().unwrap(), sealed).is_err());
         }
-        // An event-streaming ciphertext, even one with this organization's
-        // binding, isn't a client secret...
+        // Sealed with event streaming's key, even over this organization's
+        // associated data, it isn't a client secret...
         let streamed = s("streamingSealed");
         assert_eq!(
-            secrets::open_with(&streaming_key, &binding(org), &streamed).unwrap().as_str(),
+            secrets::open_aad_with(&streaming_key, &aad(org), &streamed).unwrap().as_str(),
             first["plaintext"].as_str().unwrap()
         );
         assert_eq!(open_with(&key, org, &streamed).unwrap_err(), CANT);
-        // ...and a client secret doesn't open as an event destination's secrets.
-        assert!(secrets::open_with(&streaming_key, &binding(org), sealed).is_err());
+        // ...and a client secret doesn't open with event streaming's key, as
+        // a client secret or as a destination's secrets.
+        assert!(secrets::open_aad_with(&streaming_key, &aad(org), sealed).is_none());
+        let as_destination = secrets::Binding {
+            id: org,
+            owner: org,
+            kind: "webhook",
+        };
+        assert!(secrets::open_with(&streaming_key, &as_destination, sealed).is_err());
     }
 
     #[test]

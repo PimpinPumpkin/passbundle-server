@@ -495,6 +495,7 @@ table! {
         binding_hash -> Text,
         code_hash -> Nullable<Text>,
         link_user_uuid -> Nullable<Text>,
+        link_session -> Nullable<Text>,
         identity -> Nullable<Text>,
         error -> Nullable<Text>,
         created_at -> Timestamp,
@@ -506,6 +507,18 @@ table! {
     keykeeper_sso_link_tickets (ticket_hash) {
         ticket_hash -> Text,
         user_uuid -> Text,
+        org_uuid -> Nullable<Text>,
+        binding_hash -> Text,
+        session_ref -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
+    keykeeper_sso_link_sessions (session_hash) {
+        session_hash -> Text,
+        user_uuid -> Text,
+        org_uuid -> Text,
         created_at -> Timestamp,
     }
 }

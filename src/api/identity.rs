@@ -511,8 +511,20 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     // Keykeeper: someone an organization requires to sign in with its single
     // sign-on is sent there, once their password checked out, so the answer
     // says nothing to anyone without it. Owners and an MSP's staff are never
-    // required (keykeeper_sso::required_identifier).
-    if let Some(identifier) = keykeeper_sso::required_identifier(&user.uuid, conn).await {
+    // required. Someone not linked to it yet goes on to two-step login, and
+    // then gets a linking session instead of a login (below). See
+    // keykeeper_sso::password_requirement.
+    let requirement = keykeeper_sso::password_requirement(&user.uuid, conn).await;
+    let use_sso = match &requirement {
+        Some(keykeeper_sso::PasswordRequirement::UseSso(identifier)) => Some(identifier.clone()),
+        // Signing in with a device's approval proves no password: it can't
+        // start linking.
+        Some(keykeeper_sso::PasswordRequirement::LinkFirst(_, identifier)) if data.auth_request.is_some() => {
+            Some(identifier.clone())
+        }
+        _ => None,
+    };
+    if let Some(identifier) = use_sso {
         let message = "Your organization requires you to sign in with single sign-on.";
         err_json!(
             json!({
@@ -567,6 +579,25 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     let mut device = get_device(&data, conn, &user).await?;
 
     let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
+
+    // Keykeeper: required to use single sign-on and not linked yet: their
+    // password and two-step login checked out, so they get a linking session,
+    // which can only link them to that organization's single sign-on, and no
+    // login. The web vault takes them through linking, then single sign-on.
+    if let Some(keykeeper_sso::PasswordRequirement::LinkFirst(org_id, identifier)) = requirement {
+        let session = keykeeper_sso::start_linking(&user.uuid, &org_id, conn).await?;
+        let message = "Your organization requires single sign-on. Link your Microsoft account to continue.";
+        err_json!(
+            json!({
+                "error": "invalid_grant",
+                "error_description": message,
+                "SsoOrganizationIdentifier": identifier,
+                "KeykeeperSsoLinkSession": session,
+                "ErrorModel": { "Message": message, "Object": "error" },
+            }),
+            format!("IP: {}. Username: {log_username}. Single sign-on required; linking first.", ip.ip)
+        )
+    }
 
     // Like upstream, an auth request can be used for one login only. Marked after 2FA so a 2FA prompt doesn't use it up.
     if let Some(ref auth_request_id) = data.auth_request
