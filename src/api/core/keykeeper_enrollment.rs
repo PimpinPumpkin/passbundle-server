@@ -64,7 +64,7 @@ async fn msp_client(msp_id: &MspId, org_id: &OrganizationId, conn: &DbConn) -> R
 async fn enrollment_json(client: &MspClient, conn: &DbConn) -> serde_json::Value {
     install_json(
         &client.org_uuid,
-        client.enrollment_token.as_ref(),
+        client.enrollment_token(),
         client.enrollment_token_created_at.as_ref(),
         client.enrollment_secret.as_ref(),
         conn,
@@ -75,7 +75,7 @@ async fn enrollment_json(client: &MspClient, conn: &DbConn) -> serde_json::Value
 async fn setup_json(setup: &OrgSetup, conn: &DbConn) -> serde_json::Value {
     install_json(
         &setup.org_uuid,
-        setup.enrollment_token.as_ref(),
+        setup.enrollment_token(),
         setup.enrollment_token_created_at.as_ref(),
         setup.enrollment_secret.as_ref(),
         conn,
@@ -87,21 +87,24 @@ async fn setup_json(setup: &OrgSetup, conn: &DbConn) -> serde_json::Value {
 /// organization's key, for the browser to show in the command), the email
 /// domains, how many joined with it, and how many people the organization
 /// removed since the token was made: each may still have the command, so the
-/// apps offer to replace it (DESIGN.md, "Offboarding").
+/// apps offer to replace it (DESIGN.md, "Offboarding"). The token is kept
+/// sealed and opened here; one that can't be opened (the server's keys
+/// changed) shows as none, and admins make a new command.
 async fn install_json(
     org_id: &OrganizationId,
-    token: Option<&String>,
+    token: Option<String>,
     created_at: Option<&chrono::NaiveDateTime>,
     secret: Option<&String>,
     conn: &DbConn,
 ) -> serde_json::Value {
+    let removed = removed_since(org_id, token.as_ref(), created_at, conn).await;
     json!({
         "token": token,
         "secret": secret,
         "createdAt": created_at.map(crate::util::format_date),
         "joins": MspEnrollmentJoin::count_by_org(org_id, conn).await,
         "domains": EnrollmentDomains::for_org(org_id, conn).await,
-        "removedSinceToken": removed_since(org_id, token, created_at, conn).await,
+        "removedSinceToken": removed,
     })
 }
 
@@ -263,7 +266,7 @@ async fn own_org_admin(
     }
     Ok(match OrgSetup::find_by_org(org_id, conn).await {
         Some(setup) => OrgSetupOrNew::Saved(setup),
-        None => OrgSetupOrNew::New(OrgSetup::new(org_id.clone(), None, None, false)),
+        None => OrgSetupOrNew::New(OrgSetup::new(org_id.clone(), None, None, false)?),
     })
 }
 
@@ -310,7 +313,7 @@ async fn get_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbCo
     Ok(Json(
         install_json(
             &org_id,
-            setup.and_then(|s| s.enrollment_token.as_ref()),
+            setup.and_then(OrgSetup::enrollment_token),
             setup.and_then(|s| s.enrollment_token_created_at.as_ref()),
             setup.and_then(|s| s.enrollment_secret.as_ref()),
             &conn,
@@ -335,7 +338,7 @@ async fn replace_org_enrollment(
             setup
         }
         OrgSetupOrNew::New(_) => {
-            let mut setup = OrgSetup::new(org_id.clone(), None, None, true);
+            let mut setup = OrgSetup::new(org_id.clone(), None, None, true)?;
             setup.enrollment_secret = secret;
             setup.insert(&conn).await?;
             setup

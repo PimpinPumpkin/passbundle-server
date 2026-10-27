@@ -669,7 +669,7 @@ fn leaving(body: String, ip: ClientIp, jar: &CookieJar<'_>) -> EmptyResult {
         }
         _ => false,
     };
-    if !found && LIMITER_LEAVING.check_key(&ip).is_err() {
+    if !found && LIMITER_LEAVING.check_key(&crate::ratelimit::ip_key(&ip)).is_err() {
         return Err(Error::new_msg("Too many requests").with_code(429));
     }
     Ok(())

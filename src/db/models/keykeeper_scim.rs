@@ -209,6 +209,22 @@ impl ScimUser {
         .await
     }
 
+    /// An owner or admin revoked or restored this member in PassBundle. The
+    /// directory may turn back on only someone it turned off itself, and
+    /// that's no longer the last word: from now on, only an owner or admin
+    /// turns them back on.
+    pub async fn admin_decided(membership_uuid: &MembershipId, conn: &DbConn) -> EmptyResult {
+        let membership_uuid = membership_uuid.clone();
+        conn.run(move |conn| {
+            diesel::update(scim_users::table.filter(scim_users::membership_uuid.eq(membership_uuid)))
+                .set(scim_users::turned_off.eq(false))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error saving that an admin decided about a member")
+        })
+        .await
+    }
+
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
         let row = self.clone();

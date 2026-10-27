@@ -615,7 +615,7 @@ async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientD
         msp_id.clone(),
         business.then(|| BUSINESS_PRESET.to_owned()),
         business.then(|| collection.uuid.clone()),
-    )
+    )?
     .insert(&conn)
     .await?;
     MspMembership::new(owner.uuid.clone(), msp_id.clone()).insert(&conn).await?;
@@ -860,9 +860,9 @@ async fn add_staff(msp_id: MspId, headers: Headers, data: Json<AddStaffData>, co
     let Some(msp) = Msp::find_by_uuid(&msp_id, &conn).await else {
         err_code!("MSP not found", rocket::http::Status::NotFound.code)
     };
-    let invite = MspInvite::new(msp_id.clone(), &email, role, access.as_ref(), &headers.user.email);
+    let (invite, token) = MspInvite::new(msp_id.clone(), &email, role, access.as_ref(), &headers.user.email);
     invite.insert(&conn).await?;
-    let url = invite_url(&invite.token);
+    let url = invite_url(&token);
     let emailed = CONFIG.mail_enabled();
     if emailed {
         let role_name = if role == MspRole::Admin {
@@ -1302,7 +1302,7 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
     // get, as a company's own. Not the install command: its token was the
     // MSP's, so the owners make a new one in the admin console.
     if OrgSetup::find_by_org(&org_id, &conn).await.is_none() {
-        OrgSetup::new(org_id.clone(), client.preset.clone(), client.everyone_collection.clone(), false)
+        OrgSetup::new(org_id.clone(), client.preset.clone(), client.everyone_collection.clone(), false)?
             .insert(&conn)
             .await?;
     }

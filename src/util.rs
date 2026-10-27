@@ -367,8 +367,11 @@ impl Fairing for BetterLogging {
             return;
         }
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
+            // Keykeeper: a query's names only, never its values, which can be
+            // codes, tokens, emails, or the websites in people's vaults
+            // (`?code=`, `?uri=`, `?username=`).
             match uri.query() {
-                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", &q[..q.len().min(30)]),
+                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", query_names(q.as_str())),
                 None => info!(target: "request", "{method} {uri_path_str}"),
             }
         }
@@ -390,6 +393,21 @@ impl Fairing for BetterLogging {
             }
         }
     }
+}
+
+/// Keykeeper: a request's query for the log, with its values hidden: at most
+/// the first 8 names, each cut to 30 characters.
+fn query_names(query: &str) -> String {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .take(8)
+        .map(|pair| {
+            let name: String = pair.split_once('=').map_or(pair, |(name, _)| name).chars().take(30).collect();
+            format!("{name}=[hidden]")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 pub fn get_display_size(size: i64) -> String {
@@ -1003,5 +1021,23 @@ mod tests {
                 });
             }
         });
+    }
+}
+
+// Keykeeper: what the request log keeps of a query.
+#[cfg(test)]
+mod keykeeper_tests {
+    use super::query_names;
+
+    #[test]
+    fn the_request_log_keeps_a_querys_names_but_never_its_values() {
+        assert_eq!(query_names("uri=https%3A%2F%2Fbank.example%2Flogin"), "uri=[hidden]");
+        assert_eq!(query_names("username=ana%40example.test"), "username=[hidden]");
+        assert_eq!(query_names("code=abc&x"), "code=[hidden]&x=[hidden]");
+        assert_eq!(query_names("&&"), "");
+        let many = (0..20).map(|n| format!("k{n}=v")).collect::<Vec<_>>().join("&");
+        assert_eq!(query_names(&many).matches("[hidden]").count(), 8);
+        assert!(!query_names(&format!("{}=v", "n".repeat(100))).contains(&"n".repeat(31)));
+        assert_eq!(query_names("€€€=v"), "€€€=[hidden]");
     }
 }

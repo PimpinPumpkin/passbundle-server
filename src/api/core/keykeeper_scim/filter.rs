@@ -35,12 +35,19 @@ impl AttrPath {
     }
 }
 
+/// Whether text starts with "urn:" in any case and has more after it.
+/// Compares bytes: a text that starts with a character of several bytes has
+/// no character boundary where slicing at 4 would need one.
+pub fn names_urn(text: &str) -> bool {
+    text.len() > 4 && text.as_bytes()[..4].eq_ignore_ascii_case(b"urn:")
+}
+
 /// Parses `[schema:]attr[.sub]`. A core schema's URN names a top-level
 /// attribute. Attribute names are ALPHA *(ALPHA / DIGIT / "-" / "_"), or
 /// "$ref".
 pub fn parse_attr_path(text: &str) -> Result<AttrPath, String> {
     let text = text.trim();
-    let (schema, rest) = if text.len() > 4 && text[..4].eq_ignore_ascii_case("urn:") {
+    let (schema, rest) = if names_urn(text) {
         match text.rfind(':') {
             Some(i) if i + 1 < text.len() => (Some(&text[..i]), &text[i + 1..]),
             _ => return Err(format!("{text} names a schema but no attribute")),
@@ -552,6 +559,20 @@ mod tests {
 
     fn check(filter: &str) -> bool {
         matches(&parse(filter).unwrap_or_else(|e| panic!("{filter}: {e}")), &user())
+    }
+
+    #[test]
+    fn text_of_several_bytes_is_refused_rather_than_crashing() {
+        // Each of these once sliced a string at byte 4, which panics where
+        // that isn't a character boundary.
+        for text in ["€€x", "é€", "urn€:x", "€urn:x"] {
+            assert!(!names_urn(text), "{text}");
+            assert!(parse_attr_path(text).is_err(), "{text}");
+            assert!(parse(&format!(r#"{text} eq "1""#)).is_err(), "{text}");
+        }
+        assert!(names_urn("URN:ietf:params:scim:schemas:core:2.0:User:userName"));
+        assert!(!names_urn("urn:"));
+        assert!(parse(r#"emails[value eq "€€@example.test"]"#).is_ok());
     }
 
     #[test]

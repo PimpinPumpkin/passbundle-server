@@ -12,6 +12,7 @@ use rocket::{Route, serde::json::Json};
 use serde_json::{Value, json};
 
 use crate::{
+    CONFIG,
     api::{EmptyResult, JsonResult},
     auth::Headers,
     db::{
@@ -255,6 +256,16 @@ async fn set_msp_joining(msp_id: MspId, data: Json<JoiningData>, headers: Header
     get_msp_joining(msp_id, headers, conn).await
 }
 
+/// Whether an invitation's seal may vouch for the person invited. Not on a
+/// server that sends no email: there, whoever signs up with an invited address
+/// first could take it, since nothing proves they own it (upstream lets an
+/// invited address register without a link), so an owner or admin approves
+/// those joins, unless the server's operator says nobody else can reach it
+/// (INVITE_JOINS_WITHOUT_EMAIL). See DESIGN.md, "Joining".
+fn invitations_vouch() -> bool {
+    CONFIG.mail_enabled() || CONFIG.invite_joins_without_email()
+}
+
 /// What an app needs to decide on its own whether to let someone waiting in,
 /// without trusting the server: the organization's joining setting with its
 /// seal, and whatever vouches for the person (an invitation's seal, an MSP
@@ -283,7 +294,11 @@ pub(super) async fn vouching(
             "domains": EnrollmentDomains::for_org(org_id, conn).await,
             "seal": JoiningSeal::find(org_id, conn).await,
         },
-        "inviteSeal": JoinSeal::find(org_id, email, SealKind::Invite, conn).await,
+        "inviteSeal": if invitations_vouch() {
+            JoinSeal::find(org_id, email, SealKind::Invite, conn).await
+        } else {
+            None
+        },
         "staffSeal": if from_msp { JoinSeal::find(org_id, email, SealKind::Staff, conn).await } else { None },
         "joinProof": proof,
         "enrollmentSecret": secret,

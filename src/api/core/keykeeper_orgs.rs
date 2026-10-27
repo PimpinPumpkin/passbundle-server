@@ -97,7 +97,7 @@ async fn create_organization(headers: Headers, data: Json<CreateOrgData>, conn: 
             Collection::new(org.uuid.clone(), admins, None).save(&conn).await?;
         }
         keykeeper_msp_policies::apply_business_preset(&org.uuid, &headers, &conn).await?;
-        OrgSetup::new(org.uuid.clone(), Some(BUSINESS_PRESET.to_owned()), Some(collection.uuid.clone()), true)
+        OrgSetup::new(org.uuid.clone(), Some(BUSINESS_PRESET.to_owned()), Some(collection.uuid.clone()), true)?
             .insert(&conn)
             .await?;
     }

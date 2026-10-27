@@ -32,6 +32,7 @@ table! {
         everyone_collection -> Nullable<Text>,
         templates_collection -> Nullable<Text>,
         enrollment_secret -> Nullable<Text>,
+        enrollment_token_hash -> Nullable<Text>,
     }
 }
 
@@ -172,6 +173,7 @@ table! {
         enrollment_token_created_at -> Nullable<Timestamp>,
         everyone_collection -> Nullable<Text>,
         enrollment_secret -> Nullable<Text>,
+        enrollment_token_hash -> Nullable<Text>,
     }
 }
 
@@ -202,6 +204,7 @@ table! {
         reporters -> Integer,
         first_seen -> Timestamp,
         last_seen -> Timestamp,
+        approved_at -> Nullable<Timestamp>,
     }
 }
 

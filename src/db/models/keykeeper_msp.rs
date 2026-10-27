@@ -221,7 +221,9 @@ pub struct MspClient {
     /// The defaults the client started with, such as "business".
     pub preset: Option<String>,
     /// Lets an account ask to join this client as a regular member, through
-    /// the RMM install command. Never grants the org key.
+    /// the RMM install command. Never grants the org key. Sealed with a key
+    /// the database doesn't have (keykeeper_install_tokens), for admins to
+    /// see the command again; found by its hash.
     pub enrollment_token: Option<String>,
     pub enrollment_token_created_at: Option<NaiveDateTime>,
     /// The collection people who join get, such as "Everyone".
@@ -231,6 +233,8 @@ pub struct MspClient {
     /// The install command's join secret, encrypted with the client's key by
     /// the MSP admin's browser. See DESIGN.md, "Joins a hacked server can't forge".
     pub enrollment_secret: Option<String>,
+    /// The enrollment token's SHA-256, to find it by.
+    pub enrollment_token_hash: Option<String>,
 }
 
 /// Someone who joined a client through its enrollment token, and when.
@@ -553,23 +557,25 @@ impl MspClient {
         msp_uuid: MspId,
         preset: Option<String>,
         everyone_collection: Option<CollectionId>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::error::Error> {
+        let token = super::StoredToken::new(&org_uuid)?;
+        Ok(Self {
             org_uuid,
             msp_uuid,
             created_at: Utc::now().naive_utc(),
             preset,
-            enrollment_token: Some(Self::new_enrollment_token()),
+            enrollment_token: Some(token.sealed),
             enrollment_token_created_at: Some(Utc::now().naive_utc()),
             everyone_collection,
             templates_collection: None,
             enrollment_secret: None,
-        }
+            enrollment_token_hash: Some(token.hash),
+        })
     }
 
-    /// A new random enrollment token: 256 bits, URL-safe.
-    pub fn new_enrollment_token() -> String {
-        crate::crypto::encode_random_bytes::<32>(&data_encoding::BASE64URL_NOPAD)
+    /// The enrollment token, for the install command admins see.
+    pub fn enrollment_token(&self) -> Option<String> {
+        super::open_install_token(&self.org_uuid, self.enrollment_token.as_deref()?)
     }
 
     /// Sets the install command's join secret, encrypted by the browser,
@@ -593,16 +599,17 @@ impl MspClient {
     /// (encrypted, from the browser that made it; none from an older app).
     /// Install commands with the old one stop letting new people join.
     pub async fn replace_enrollment_token(&mut self, secret: Option<String>, conn: &DbConn) -> EmptyResult {
-        let token = Self::new_enrollment_token();
+        let token = super::StoredToken::new(&self.org_uuid)?;
         let now = Utc::now().naive_utc();
         let org = self.org_uuid.clone();
-        let saved = token.clone();
+        let (saved, saved_hash) = (token.sealed.clone(), token.hash.clone());
         let saved_secret = secret.clone();
         let updated: EmptyResult = conn
             .run(move |conn| {
                 diesel::update(msp_clients::table.filter(msp_clients::org_uuid.eq(org)))
                     .set((
                         msp_clients::enrollment_token.eq(saved),
+                        msp_clients::enrollment_token_hash.eq(saved_hash),
                         msp_clients::enrollment_token_created_at.eq(now),
                         msp_clients::enrollment_secret.eq(saved_secret),
                     ))
@@ -611,16 +618,17 @@ impl MspClient {
             })
             .await;
         updated?;
-        self.enrollment_token = Some(token);
+        self.enrollment_token = Some(token.sealed);
+        self.enrollment_token_hash = Some(token.hash);
         self.enrollment_token_created_at = Some(now);
         self.enrollment_secret = secret;
         Ok(())
     }
 
     pub async fn find_by_enrollment_token(token: &str, conn: &DbConn) -> Option<Self> {
-        let token = token.to_owned();
+        let hash = super::token_hash(token);
         conn.run(move |conn| {
-            msp_clients::table.filter(msp_clients::enrollment_token.eq(token)).first::<Self>(conn).ok()
+            msp_clients::table.filter(msp_clients::enrollment_token_hash.eq(hash)).first::<Self>(conn).ok()
         })
         .await
     }
@@ -1031,7 +1039,9 @@ impl MspEvent {
 }
 
 /// An invitation to an MSP's staff. Accepting needs the token, which goes only
-/// to the invited address, and an account with that address.
+/// to the invited address, and an account with that address. The database
+/// keeps only the token's SHA-256 (`token`), as it does SCIM and script
+/// tokens: the link that carries the token is made once, when inviting.
 #[derive(Identifiable, Queryable, Insertable)]
 #[diesel(table_name = msp_invites)]
 #[diesel(primary_key(uuid))]
@@ -1040,6 +1050,7 @@ pub struct MspInvite {
     pub msp_uuid: MspId,
     pub email: String,
     pub role: i32,
+    /// The token's SHA-256, never the token.
     pub token: String,
     pub invited_by_email: String,
     pub created_at: NaiveDateTime,
@@ -1048,23 +1059,27 @@ pub struct MspInvite {
 }
 
 impl MspInvite {
+    /// A new invitation, and its token, for the link: the only place the
+    /// token ever is.
     pub fn new(
         msp_uuid: MspId,
         email: &str,
         role: MspRole,
         access: Option<&TechnicianAccess>,
         invited_by_email: &str,
-    ) -> Self {
-        Self {
+    ) -> (Self, String) {
+        let token = crate::crypto::encode_random_bytes::<32>(&data_encoding::BASE64URL_NOPAD);
+        let invite = Self {
             uuid: crate::util::get_uuid(),
             msp_uuid,
             email: email.trim().to_lowercase(),
             role: role as i32,
-            token: crate::crypto::encode_random_bytes::<32>(&data_encoding::BASE64URL_NOPAD),
+            token: super::token_hash(&token),
             invited_by_email: invited_by_email.to_owned(),
             created_at: Utc::now().naive_utc(),
             access: access.map(|a| serde_json::to_string(a).unwrap_or_default()),
-        }
+        };
+        (invite, token)
     }
 
     pub fn role(&self) -> Option<MspRole> {
@@ -1101,8 +1116,8 @@ impl MspInvite {
     }
 
     pub async fn find_by_token(token: &str, conn: &DbConn) -> Option<Self> {
-        let token = token.to_owned();
-        conn.run(move |conn| msp_invites::table.filter(msp_invites::token.eq(token)).first::<Self>(conn).ok()).await
+        let hash = super::token_hash(token);
+        conn.run(move |conn| msp_invites::table.filter(msp_invites::token.eq(hash)).first::<Self>(conn).ok()).await
     }
 
     /// Whether the invitation is older than the server's invitation lifetime.

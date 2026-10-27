@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     CONFIG,
-    api::{EmptyResult, JsonResult},
+    api::{EmptyResult, JsonResult, PasswordOrOtpData},
     auth::Headers,
     db::{
         DbConn,
@@ -170,10 +170,18 @@ async fn get_provisioning(org_id: OrganizationId, headers: Headers, conn: DbConn
 }
 
 /// Makes the organization's token, or replaces it: the old one stops working
-/// at once. The answer carries the token; nothing else ever will.
-#[post("/keykeeper/organizations/<org_id>/provisioning/token")]
-async fn make_token(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+/// at once. The answer carries the token; nothing else ever will. The caller
+/// confirms it with their master password or a one-time code.
+#[post("/keykeeper/organizations/<org_id>/provisioning/token", data = "<data>")]
+async fn make_token(
+    org_id: OrganizationId,
+    data: Option<Json<PasswordOrOtpData>>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    // Who may, first: anyone else gets "not found", with or without a body.
     require_admin(&org_id, &headers, &conn).await?;
+    data.map(Json::into_inner).unwrap_or_default().confirm_change(&headers.user, &conn).await?;
     let replaced = ScimToken::find(&org_id, &conn).await.is_some();
     let (token, mut row) = ScimToken::generate(org_id.clone(), &headers.user.email);
     row.created_by_user = Some(headers.user.uuid.clone());

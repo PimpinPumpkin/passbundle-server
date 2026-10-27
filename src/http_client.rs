@@ -71,6 +71,15 @@ fn dns_prefer_ipv6() -> bool {
 }
 
 fn should_block_ip(ip: IpAddr) -> bool {
+    // Keykeeper: what event streaming never reaches, icons and the
+    // change-password lookup never reach either, whatever the settings say:
+    // cloud metadata and platform services (Azure's 168.63.129.16 is a global
+    // address), link-local, multicast, reserved, and IPv4 written as IPv6
+    // (NAT64, 6to4, Teredo, IPv4-compatible), which could wrap an address
+    // the checks below refuse. One guard for both: keykeeper_streaming::guard.
+    if crate::keykeeper_streaming::guard::reach(ip) == crate::keykeeper_streaming::guard::Reach::Never {
+        return true;
+    }
     if !CONFIG.http_request_block_non_global_ips() {
         return false;
     }
@@ -474,6 +483,37 @@ mod tests {
 
         sort_addresses(&mut addresses, true);
         assert_eq!(addresses, [ipv6, ipv4]);
+    }
+
+    #[test]
+    fn metadata_services_and_wrapped_ipv4_are_never_fetched() {
+        // Keykeeper: refused like event streaming refuses them (keykeeper_streaming::guard).
+        for blocked in [
+            "168.63.129.16",
+            "169.254.169.254",
+            "100.100.100.200",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "::7f00:1",
+            "::a9fe:a9fe",
+            "2002:7f00:1::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "fd00:ec2::254",
+            "fe80::1",
+            "224.0.0.1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(should_block_ip(ip), "{blocked}");
+            // Named in a URL as a literal address, too.
+            let host = if ip.is_ipv6() {
+                format!("[{blocked}]")
+            } else {
+                blocked.to_owned()
+            };
+            assert!(should_block_host(&Host::parse(&host).unwrap()).is_err(), "{blocked}");
+        }
+        assert!(!should_block_ip("8.8.8.8".parse().unwrap()));
+        assert!(!should_block_ip("2606:4700:4700::1111".parse().unwrap()));
     }
 
     #[test]

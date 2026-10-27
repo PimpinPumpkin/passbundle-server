@@ -283,14 +283,20 @@ struct SsoSettings {
     client_id: String,
     /// A new secret, or nothing to keep the saved one.
     client_secret: Option<String>,
+    /// The caller's master password or a one-time code.
+    #[serde(flatten)]
+    verification: PasswordOrOtpData,
 }
 
 /// Saves the organization's single sign-on settings. Turning it on checks
-/// that Microsoft knows the tenant. The secret is never sent back.
+/// that Microsoft knows the tenant. The secret is never sent back. The caller
+/// confirms it with their master password or a one-time code, so a session
+/// single sign-on started can't change single sign-on on its own.
 #[put("/keykeeper/organizations/<org_id>/sso", data = "<data>")]
 async fn put_sso(org_id: OrganizationId, data: Json<SsoSettings>, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&org_id, &headers, &conn).await?;
     let data = data.into_inner();
+    data.verification.confirm_change(&headers.user, &conn).await?;
     let Some(identifier) = normalize_identifier(&data.identifier) else {
         err!("The SSO identifier is 3 to 40 lowercase letters, digits, and hyphens, such as acme-dental.")
     };

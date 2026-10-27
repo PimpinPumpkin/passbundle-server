@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 
 use crate::{
     CONFIG,
-    api::{EmptyResult, JsonResult},
+    api::{EmptyResult, JsonResult, PasswordOrOtpData},
     auth::{ClientIp, Headers},
     crypto::ct_eq,
     db::{
@@ -293,6 +293,10 @@ struct NewTokenData {
     auth_hash: String,
     sealed_key: String,
     grants: Vec<GrantData>,
+    /// The caller's master password or a one-time code (DESIGN.md,
+    /// "Confirming sensitive changes").
+    #[serde(flatten)]
+    verification: PasswordOrOtpData,
 }
 
 /// When a token expires: in the future, and at most a year away.
@@ -311,6 +315,7 @@ fn checked_expiry(text: &str, now: NaiveDateTime) -> Result<NaiveDateTime, Strin
 async fn create_token(org_id: OrganizationId, data: Json<NewTokenData>, headers: Headers, conn: DbConn) -> JsonResult {
     require_token_admin(&org_id, &headers, &conn).await?;
     let data = data.into_inner();
+    data.verification.confirm_change(&headers.user, &conn).await?;
     let now = Utc::now().naive_utc();
 
     let Ok(id) = uuid::Uuid::parse_str(&data.id).map(|id| id.hyphenated().to_string()) else {
@@ -427,10 +432,16 @@ struct CopyData {
     copy: String,
     revision: String,
     sealed_spec: String,
+    /// Adding an item to a token, or changing which of its fields it gets,
+    /// needs a token admin's master password or a one-time code; refreshing
+    /// a copy doesn't.
+    #[serde(flatten)]
+    verification: PasswordOrOtpData,
 }
 
-/// Adds a grant (token admins), or refreshes an existing one's copy (anyone
-/// who can edit the item, for the item's current revision).
+/// Adds a grant (token admins, who confirm it with their master password or
+/// a one-time code), or refreshes an existing one's copy (anyone who can edit
+/// the item, for the item's current revision, which apps do on their own).
 #[put("/keykeeper/organizations/<org_id>/script-tokens/<token_id>/grants/<item_id>", data = "<data>")]
 async fn set_grant(
     org_id: OrganizationId,
@@ -459,6 +470,11 @@ async fn set_grant(
     if admin {
         if existing.is_none() && ScriptGrant::find_for_token(&token.uuid, &conn).await.len() >= MAX_GRANTS {
             err!(format!("A token has at most {MAX_GRANTS} items"))
+        }
+        // Adding an item, or changing which of its fields a token gets, needs
+        // the admin's confirmation; refreshing a copy as it was doesn't.
+        if existing.as_ref().is_none_or(|e| e.sealed_spec != grant.sealed_spec) {
+            data.verification.confirm_change(&headers.user, &conn).await?;
         }
     } else {
         // Someone else may only refresh an existing grant, on an item of this

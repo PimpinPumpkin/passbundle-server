@@ -119,14 +119,29 @@ pub async fn approved_sign_in_rules(user: &User, _device: &Device, conn: &DbConn
 }
 
 /// For the server's request log: a request's answer is read with its access
-/// code in the address (`?code=`), so that path is logged without it.
+/// code in the address (`?code=`), so that path is logged without it, with or
+/// without a slash at the end.
 pub fn redacts(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
     path.starts_with("/api/auth-requests/") && path.ends_with("/response")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_requests_answer_is_logged_without_its_access_code() {
+        for path in [
+            "/api/auth-requests/0b1c/response",
+            "/api/auth-requests/0b1c/response/",
+            "/api/auth-requests/0b1c/response//",
+        ] {
+            assert!(redacts(path), "{path}");
+        }
+        assert!(!redacts("/api/auth-requests/0b1c"));
+        assert!(!redacts("/api/accounts/profile"));
+    }
 
     #[test]
     fn a_password_or_sso_session_uses_emergency_access() {

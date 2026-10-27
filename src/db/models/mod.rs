@@ -13,6 +13,7 @@ mod group;
 mod keykeeper_cipher_versions;
 mod keykeeper_event_streaming;
 pub mod keykeeper_folder_permissions;
+mod keykeeper_install_tokens;
 mod keykeeper_joining;
 mod keykeeper_msp;
 mod keykeeper_offboarding;
@@ -52,6 +53,9 @@ pub use self::keykeeper_event_streaming::{
     MAX_SCOPES_PER_PERSON, Secrets as EventSecrets, Settings as EventSettings, WAKE, describe as describe_event,
     destination_target, save_with_extras,
 };
+pub use self::keykeeper_install_tokens::{
+    StoredToken, init_install_token_key, open_install_token, token_hash, upgrade_install_tokens,
+};
 pub use self::keykeeper_joining::{
     INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, confirms_automatically, effective_joining,
     invite_hours, msp_default,
@@ -69,7 +73,7 @@ pub use self::keykeeper_scim::{
 pub use self::keykeeper_script_access::{ScriptGrant, ScriptRead, ScriptToken, parse_networks};
 pub use self::keykeeper_seals::{JoinSeal, JoiningSeal, SealKind, valid_encrypted_secret, valid_seal};
 pub use self::keykeeper_site_fixes::{
-    Fix, FixField, MspSiteFixReport, MspSiteRule, ProblemField, SiteFix, SiteProblem,
+    Fix, FixField, MspSiteFixReport, MspSiteRule, ProblemField, SiteFix, SiteProblem, init_reporter_key,
 };
 pub use self::keykeeper_sso::{
     CONSUMER_TENANT, SSO_AUTH_MINUTES, SSO_LINK_TICKET_MINUTES, SsoAuthRow, SsoConfig, SsoDomain, SsoLink,

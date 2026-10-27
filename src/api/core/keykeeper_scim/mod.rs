@@ -289,7 +289,7 @@ impl<'r> FromRequest<'r> for ScimCaller {
         };
         prune_now_and_then(&CHECKS, PRUNE_EVERY, &[&*FAILURES, &*REQUESTS, &*CREATES, &*CREATES_TODAY]);
         let refused = || {
-            if FAILURES.check_key(&ip.to_string()).is_err() {
+            if FAILURES.check_key(&crate::ratelimit::ip_key(&ip).to_string()).is_err() {
                 Outcome::Error((Status::TooManyRequests, "Too many refused tokens"))
             } else {
                 Outcome::Error((Status::Unauthorized, "That token doesn't work here"))
@@ -599,6 +599,14 @@ fn date(at: &chrono::NaiveDateTime) -> String {
     format_date(at)
 }
 
+/// A User's schemas: the core one, and each extension the directory sent
+/// attributes of (keys that are URNs).
+fn user_schemas(attributes: &Map<String, Value>) -> Vec<Value> {
+    let mut schemas = vec![json!(USER_SCHEMA)];
+    schemas.extend(attributes.keys().filter(|key| filter::names_urn(key)).map(|key| json!(key)));
+    schemas
+}
+
 /// A member as a SCIM User: what the directory sent, as it sent it, with the
 /// account's email where it sent none, and whether their membership is on.
 fn user_json(person: &ScimPerson, base: &str) -> Value {
@@ -606,12 +614,7 @@ fn user_json(person: &ScimPerson, base: &str) -> Value {
         Some(scim) => serde_json::from_str::<Map<String, Value>>(&scim.attributes).unwrap_or_default(),
         None => Map::new(),
     };
-    let mut schemas = vec![json!(USER_SCHEMA)];
-    for key in out.keys() {
-        if key.len() > 4 && key[..4].eq_ignore_ascii_case("urn:") {
-            schemas.push(json!(key));
-        }
-    }
+    let schemas = user_schemas(&out);
     out.insert("schemas".into(), Value::Array(schemas));
     out.insert("id".into(), json!(person.member.uuid));
     match &person.scim {
@@ -1516,6 +1519,17 @@ mod tests {
 
     fn attrs(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn attribute_names_of_several_bytes_are_kept_without_a_crash() {
+        // A directory once sent a key starting with characters of several
+        // bytes, which slicing at byte 4 couldn't handle: every later list of
+        // users failed, and with panic = abort the whole server stopped.
+        let a = attrs(json!({ "€€x": "1", "é": "2", "urn€:x": "3", ENTERPRISE_USER_SCHEMA: { "department": "IT" } }));
+        assert_eq!(user_schemas(&a), vec![json!(USER_SCHEMA), json!(ENTERPRISE_USER_SCHEMA)]);
+        let fields = user_fields(attrs(json!({ "userName": "ana@contoso.test", "€€x": "kept" }))).unwrap();
+        assert_eq!(fields.attributes.get("€€x"), Some(&json!("kept")));
     }
 
     #[test]

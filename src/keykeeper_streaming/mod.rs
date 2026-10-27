@@ -156,9 +156,10 @@ impl Failure {
 /// The one thing anyone is told about trouble before a connection is fully
 /// made (looking up the name, a refused address, connecting, TLS): the
 /// details go to the server's log, so a destination can't be used to tell
-/// which hosts and ports exist inside a network.
-fn unreachable(host: &str, detail: &str, id: &str) -> Failure {
-    info!("Event destination {id} couldn't reach {host}: {detail}");
+/// which hosts and ports exist inside a network. Without the destination's
+/// secrets: a webhook's URL often has a token in its path or query.
+fn unreachable(host: &str, detail: &str, target: &Target) -> Failure {
+    info!("Event destination {} couldn't reach {host}: {}", target.id, target.scrub(detail));
     Failure {
         before_tls: true,
         ..Failure::retry(format!(
@@ -233,6 +234,16 @@ impl Target {
         hidden.sort_by_key(|h| std::cmp::Reverse(h.len()));
         hidden.dedup();
         hidden
+    }
+
+    /// Text for the server's log with this destination's secrets taken out,
+    /// uncut.
+    pub fn scrub(&self, text: &str) -> String {
+        let mut out = text.to_owned();
+        for h in &self.hidden() {
+            out = out.replace(h.as_str(), "[hidden]");
+        }
+        out
     }
 
     /// Text about this destination with its secrets taken out, cut to
@@ -375,7 +386,7 @@ async fn send_webhook(target: &Target, events: &[(String, String)], deadline: In
     let host = url.host_str().unwrap_or_default().to_owned();
     let pinned = match pin(&url, &policy).await {
         Ok(p) => p.into_iter().collect::<Vec<_>>(),
-        Err(e) => return (0, Some(unreachable(&host, &e, &target.id))),
+        Err(e) => return (0, Some(unreachable(&host, &e, target))),
     };
     let client = match http_client(&pinned, target.settings.ca_certificate.as_deref()) {
         Ok(c) => c,
@@ -420,7 +431,7 @@ async fn send_webhook(target: &Target, events: &[(String, String)], deadline: In
                 let status = r.status();
                 return (sent, Some(Failure::answered(status, answer(r, target).await, false)));
             }
-            Err(e) => return (sent, Some(unreachable(&host, &format!("{e:?}"), &target.id))),
+            Err(e) => return (sent, Some(unreachable(&host, &format!("{:?}", e.without_url()), target))),
         }
         let took = started.elapsed();
         if took > SLOW_WEBHOOK {
@@ -490,7 +501,7 @@ async fn send_syslog(target: &Target, events: &[(String, String)], deadline: Ins
             ))),
         ),
         Ok(()) => (events.len(), None),
-        Err(SyslogError::Connecting(detail)) => (0, Some(unreachable(&host, &detail, &target.id))),
+        Err(SyslogError::Connecting(detail)) => (0, Some(unreachable(&host, &detail, target))),
         Err(SyslogError::Sending) => (
             0,
             Some(Failure::retry(format!("{host} closed the connection or stopped reading while events were sent."))),
@@ -542,7 +553,7 @@ async fn send_syslog_inner(target: &Target, events: &[(String, String)]) -> Resu
         return match tokio::time::timeout(Duration::from_secs(15), write).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                info!("Event destination {} lost {host} while sending: {e}", target.id);
+                info!("Event destination {} lost {host} while sending: {}", target.id, target.scrub(&e.to_string()));
                 Err(SyslogError::Sending)
             }
             Err(_) => Err(SyslogError::Sending),
@@ -577,7 +588,7 @@ async fn sentinel_token(target: &Target, client: &Client, token_url: &str) -> Re
     ];
     let response = match client.post(token_url).form(&form).send().await {
         Ok(r) => r,
-        Err(e) => return Err(unreachable("Microsoft Entra", &format!("{e:?}"), &target.id)),
+        Err(e) => return Err(unreachable("Microsoft Entra", &format!("{:?}", e.without_url()), target)),
     };
     if !response.status().is_success() {
         let status = response.status();
@@ -618,7 +629,7 @@ async fn send_sentinel(target: &Target, events: &[(String, String)], deadline: I
         match pin(&parsed, &policy).await {
             Ok(Some(p)) if !pinned.iter().any(|(h, _): &(String, Vec<SocketAddr>)| *h == p.0) => pinned.push(p),
             Ok(_) => {}
-            Err(e) => return (0, Some(unreachable(parsed.host_str().unwrap_or_default(), &e, &target.id))),
+            Err(e) => return (0, Some(unreachable(parsed.host_str().unwrap_or_default(), &e, target))),
         }
     }
     let client = match http_client(&pinned, azure_ca().as_deref()) {
@@ -673,8 +684,8 @@ async fn send_sentinel(target: &Target, events: &[(String, String)], deadline: I
                     sent,
                     Some(unreachable(
                         url::Url::parse(&endpoint).ok().as_ref().and_then(url::Url::host_str).unwrap_or_default(),
-                        &format!("{e:?}"),
-                        &target.id,
+                        &format!("{:?}", e.without_url()),
+                        target,
                     )),
                 );
             }
@@ -1448,6 +1459,37 @@ mod tests {
         assert!(out.starts_with("401: bad token [hidden]"), "{out}");
     }
 
+    fn webhook_to(url: &str) -> Target {
+        Target {
+            id: "d".into(),
+            kind: EventKind::Webhook,
+            settings: EventSettings::default(),
+            secrets: EventSecrets {
+                url: Some(url.to_owned()),
+                signing_secret: Some("whsec_abcdef".into()),
+                header_value: Some("Bearer tok-xyz".into()),
+                client_secret: None,
+            },
+        }
+    }
+
+    /// What the server's log says when a destination can't be reached: the
+    /// error as reqwest or the TLS library describes it, which can name the
+    /// URL, without the URL's secret path and query, or any other secret.
+    #[test]
+    fn the_log_never_gets_a_destinations_secrets() {
+        let target = webhook_to("https://collector.example/hooks/8f3a9c1e7b2d4f60/in?code=s3cr3t-value&x=1");
+        let error = "reqwest::Error { kind: Request, url: \"https://collector.example/hooks/8f3a9c1e7b2d4f60/in?code=s3cr3t-value&x=1\", source: ConnectError(\"tcp connect error\", Os { code: 61 }) } tok-xyz";
+        let logged = target.scrub(error);
+        for secret in ["8f3a9c1e7b2d4f60", "s3cr3t-value", "code=", "tok-xyz", "/hooks/"] {
+            assert!(!logged.contains(secret), "{logged}");
+        }
+        assert!(logged.contains("tcp connect error"), "{logged}");
+        // Unlike what people are shown, the log isn't cut short.
+        let long = "x".repeat(SHOWN * 2);
+        assert_eq!(target.scrub(&long), long);
+    }
+
     /// A collector that echoes the path, where the cut to 200 characters
     /// would fall inside a token in it: the token is hidden before the cut,
     /// so no part of it shows, whether it's echoed raw, decoded, or as JSON
@@ -1489,7 +1531,7 @@ mod tests {
     fn slow_isnt_failing() {
         let slow = Failure::slow("It took 9 seconds to answer.");
         assert!(slow.slow && !slow.stop && !slow.before_tls);
-        let gone = unreachable("siem.example", "connection refused", "d");
+        let gone = unreachable("siem.example", "connection refused", &webhook_to("https://siem.example/in"));
         assert!(gone.before_tls && !gone.slow);
     }
 
@@ -1497,7 +1539,10 @@ mod tests {
     fn emails_say_only_the_status_or_the_kind_of_trouble() {
         let f = Failure::answered(StatusCode::GONE, "It answered 410 Gone: secret text".into(), true);
         assert_eq!(f.summary(), "It answered HTTP 410.");
-        assert_eq!(unreachable("10.0.0.1", "refused", "d").summary(), "It couldn't be reached.");
+        assert_eq!(
+            unreachable("10.0.0.1", "refused", &webhook_to("https://10.0.0.1/in")).summary(),
+            "It couldn't be reached."
+        );
         assert_eq!(Failure::retry("10.0.0.1 closed the connection").summary(), "Sending to it failed.");
         assert_eq!(Failure::stop("Its secrets can't be read").summary(), "Its secrets can't be read");
     }
