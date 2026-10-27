@@ -32,10 +32,20 @@ impl SignInMethod {
     /// Whether the session signed in with the master password: not with a
     /// device's approval, an API key, or SSO (which has its own
     /// trusted-device design to come). Only such a session approves a
-    /// sign-in, or sets up emergency access (emergency_access.rs), so a
-    /// session a device's approval began can't hand the account on.
+    /// sign-in.
     pub fn is_master_password(&self) -> bool {
         self.0 == Some(AuthMethod::Password)
+    }
+
+    /// Whether the person proved who they are to start this session: with
+    /// the master password, or with an organization's single sign-on. Not a
+    /// session a device's approval began, an API key's, or one that doesn't
+    /// say. Only such a session uses emergency access, on either side
+    /// (emergency_access.rs), so one mistaken approval can't set up, or
+    /// start, a takeover; members an organization requires to use single
+    /// sign-on still can.
+    pub fn proved_who_they_are(&self) -> bool {
+        matches!(self.0, Some(AuthMethod::Password | AuthMethod::Sso))
     }
 }
 
@@ -117,6 +127,17 @@ pub fn redacts(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_password_or_sso_session_uses_emergency_access() {
+        for method in [AuthMethod::Password, AuthMethod::Sso] {
+            assert!(SignInMethod(Some(method)).proved_who_they_are());
+        }
+        for method in [AuthMethod::AuthRequest, AuthMethod::UserApiKey, AuthMethod::OrgApiKey] {
+            assert!(!SignInMethod(Some(method)).proved_who_they_are());
+        }
+        assert!(!SignInMethod(None).proved_who_they_are());
+    }
 
     #[test]
     fn only_a_master_password_session_approves() {
