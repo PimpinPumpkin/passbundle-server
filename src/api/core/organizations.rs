@@ -3236,6 +3236,10 @@ async fn recover_account(
         }
     }
 
+    // Keykeeper: resetting two-step login may take the last method that counts
+    // from someone two-step login for admins covers, which ends their sessions
+    // (a new master password ends them anyway).
+    let watch = super::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
     if req.reset_two_factor {
         TwoFactor::delete_all_by_user(&user.uuid, &conn).await?;
         Device::clear_twofactor_remember_by_user(&user.uuid, &conn).await?;
@@ -3246,6 +3250,7 @@ async fn recover_account(
     }
 
     user.save(&conn).await?;
+    watch.settle(&conn).await?;
 
     nt.send_logout(&user, None, &conn).await;
 
