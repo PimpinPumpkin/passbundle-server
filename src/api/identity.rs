@@ -432,7 +432,7 @@ async fn keykeeper_sso_login(
     // records it for its refreshes; any other that isn't met gets a setup
     // session instead of a login.
     let sso_org = login.counts_for_two_step().then(|| login.org_id().clone());
-    keykeeper_two_step::check_sign_in(&user, sso_org.as_ref(), false, device.atype, conn).await?;
+    keykeeper_two_step::check_sign_in(&user, sso_org.as_ref(), device.atype, conn).await?;
 
     keykeeper_sso::finish_login(&login, &user, device.atype, &ip.ip, conn).await?;
     let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Sso, data.client_id).with_sso_org(sso_org);
@@ -602,8 +602,8 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
 
     // Keykeeper: the organizations' rules for a sign-in with a device's
     // approval, which proves no password: the hook for any rule that must
-    // hold for it as well as for a password (requiring single sign-on now;
-    // an admin two-step rule belongs there too). See
+    // hold for it as well as for a password (requiring single sign-on, and
+    // two-step login for admins). See
     // keykeeper_device_approval::approved_sign_in_rules.
     if data.auth_request.is_some() {
         keykeeper_device_approval::approved_sign_in_rules(&user, &device, conn).await?;
@@ -632,8 +632,11 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     // and who has no method that counts (an authenticator app, a security key
     // or passkey, or Duo; email codes don't) gets a setup session, which can
     // only set one up, instead of a login. A device's approval proves no
-    // password, so it gets none. See keykeeper_two_step.
-    keykeeper_two_step::check_sign_in(&user, None, data.auth_request.is_some(), device.atype, conn).await?;
+    // password, so it gets none: approved_sign_in_rules refused it above.
+    // See keykeeper_two_step.
+    if data.auth_request.is_none() {
+        keykeeper_two_step::check_sign_in(&user, None, device.atype, conn).await?;
+    }
 
     // Like upstream, an auth request can be used for one login only. Marked after 2FA so a 2FA prompt doesn't use it up.
     if let Some(ref auth_request_id) = data.auth_request

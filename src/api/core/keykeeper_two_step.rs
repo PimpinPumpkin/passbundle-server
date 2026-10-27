@@ -192,13 +192,16 @@ fn counts(tf: &TwoFactor) -> bool {
     }
     match TwoFactorType::from_i32(tf.atype) {
         Some(TwoFactorType::Authenticator) => true,
-        Some(TwoFactorType::Webauthn) => {
-            CONFIG.is_webauthn_2fa_supported()
-                && serde_json::from_str::<Vec<Value>>(&tf.data).is_ok_and(|keys| !keys.is_empty())
-        }
+        Some(TwoFactorType::Webauthn) => CONFIG.is_webauthn_2fa_supported() && has_keys(&tf.data),
         Some(TwoFactorType::Duo) => duo_uses_server_keys(&tf.data) && has_global_duo_credentials(),
         _ => false,
     }
+}
+
+/// Whether a security key or passkey method has a key left: upstream leaves
+/// the method on with none when the last one is removed.
+fn has_keys(data: &str) -> bool {
+    serde_json::from_str::<Vec<Value>>(data).is_ok_and(|keys| !keys.is_empty())
 }
 
 /// Whether a Duo method uses this server's Duo account: it was set up without
@@ -269,8 +272,7 @@ fn required_sentence(names: &[String]) -> String {
 /// sign-on) and any email code checked out. Someone it covers who has no
 /// method that counts gets a setup session instead (the answer carries
 /// `KeykeeperTwoStepSetup`), which only the setup endpoints take. A sign-in
-/// with a device's approval proves no password, so it starts none: the person
-/// signs in with their master password to set it up.
+/// with a device's approval goes to check_approved_sign_in instead.
 ///
 /// An account without a master password yet (an invitation's first single
 /// sign-on, which goes on to set one) isn't held up: the rule applies from its
@@ -279,7 +281,6 @@ fn required_sentence(names: &[String]) -> String {
 pub async fn check_sign_in(
     user: &User,
     sso_org: Option<&OrganizationId>,
-    approved_by_device: bool,
     device_type: i32,
     conn: &DbConn,
 ) -> EmptyResult {
@@ -293,12 +294,6 @@ pub async fn check_sign_in(
     }
     let names = requirer_names(&unmet);
     let required = required_sentence(&names);
-    if approved_by_device {
-        err!(format!(
-            "{required} Sign in with your master password in the web vault at {} to set it up.",
-            CONFIG.domain()
-        ))
-    }
     let (token, row) = TwoStepSetupSession::generate(user.uuid.clone(), device_type);
     row.insert(conn).await?;
     let message = format!(
@@ -315,6 +310,27 @@ pub async fn check_sign_in(
         }),
         format!("Two-step login required for {}; started a setup session.", user.email)
     )
+}
+
+/// The rule for a sign-in with a device's approval
+/// (keykeeper_device_approval::approved_sign_in_rules). It proves no
+/// password, so it starts no setup session: someone the rule covers who has no
+/// method that counts is refused, and signs in with their master password to
+/// set one up. An account without a master password isn't held up, as in
+/// check_sign_in.
+pub async fn check_approved_sign_in(user: &User, conn: &DbConn) -> EmptyResult {
+    if user.password_hash.is_empty() {
+        return Ok(());
+    }
+    let unmet = unmet(&user.uuid, &[], conn).await?;
+    if unmet.is_empty() {
+        return Ok(());
+    }
+    err!(format!(
+        "{} Sign in with your master password in the web vault at {} to set it up.",
+        required_sentence(&requirer_names(&unmet)),
+        CONFIG.domain()
+    ))
 }
 
 /// The organization whose single sign-on started a session, as the rule counts
@@ -891,6 +907,35 @@ mod tests {
             name: "m".to_owned(),
         };
         assert!(!staff.met_by_sso(&[a, b]));
+    }
+
+    #[test]
+    fn a_security_key_method_counts_only_with_a_key() {
+        assert!(has_keys(r#"[{"id":1,"name":"Key"}]"#));
+        assert!(!has_keys("[]"));
+        assert!(!has_keys(""));
+        assert!(!has_keys("not json"));
+    }
+
+    #[test]
+    fn duo_counts_only_with_this_servers_keys() {
+        // Set up without keys of its own: upstream stores nothing, and uses
+        // the server's.
+        assert!(duo_uses_server_keys(""));
+        // Someone's own Duo application, whose policy they set.
+        assert!(!duo_uses_server_keys(r#"{"host":"api-1.duosecurity.com","ik":"DIXXX","sk":"secret"}"#));
+    }
+
+    #[test]
+    fn admin_paths_are_the_msp_console_and_organizations_settings() {
+        assert!(admin_path("/api/keykeeper/msp"));
+        assert!(admin_path("/api/keykeeper/msp/5d7f/two-step"));
+        assert!(admin_path("/api/keykeeper/organizations/5d7f/admin-two-step"));
+        assert!(admin_path("/vault/api/keykeeper/organizations/5d7f/sso"));
+        assert!(!admin_path("/api/keykeeper/ciphers/5d7f/history"));
+        assert!(!admin_path("/api/keykeeper/settings"));
+        assert!(!admin_path("/api/sync"));
+        assert!(!admin_path("/api/organizations/5d7f/users"));
     }
 
     #[test]
