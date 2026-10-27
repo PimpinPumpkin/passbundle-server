@@ -412,33 +412,40 @@ fn trim(cipher: &CipherId, conn: &mut crate::db::DbConnInner) -> Result<(), dies
 
 /// Of an item's versions newest first (id, when replaced, size), the ones to
 /// forget. An item keeps two kinds of versions, each within a budget of its
-/// own: its newest KEEP_NEWEST versions, every one, within MAX_HISTORY_BYTES;
-/// and before those, one a day (UTC), the first that day's edits replaced, so
-/// the item as it was before them, at most MAX_VERSIONS in all and within
-/// MAX_HISTORY_BYTES of their own, newest first. A burst of saves, however
-/// many and however big, can push out only the newest, never the days before
-/// them: those make room only for later days.
+/// own. One a day (UTC): the first that day's edits replaced, so the item as
+/// it was before them, within MAX_HISTORY_BYTES of their own, newest first,
+/// today's included. And the newest KEEP_NEWEST of the rest, every one,
+/// within another MAX_HISTORY_BYTES. At most MAX_VERSIONS in all. So a burst
+/// of saves, however many and however big, can push out only the newest,
+/// never the item as it was before them that day or any day before: those
+/// make room only for later days.
 fn to_forget(newest_first: &[(String, NaiveDateTime, i32)]) -> Vec<String> {
-    let newest: Vec<usize> = (0..newest_first.len().min(KEEP_NEWEST)).collect();
     // Newest first, so the last one seen of each day is its first replaced.
     let mut first_of_day: HashMap<NaiveDate, usize> = HashMap::new();
-    for (i, (_, replaced_at, _)) in newest_first.iter().enumerate().skip(KEEP_NEWEST) {
+    for (i, (_, replaced_at, _)) in newest_first.iter().enumerate() {
         first_of_day.insert(replaced_at.date(), i);
     }
     let mut days: Vec<usize> = first_of_day.into_values().collect();
     days.sort_unstable();
+    let newest: Vec<usize> =
+        (0..newest_first.len()).filter(|i| days.binary_search(i).is_err()).take(KEEP_NEWEST).collect();
 
     let mut keep = vec![false; newest_first.len()];
-    for (kind, most) in [(newest, KEEP_NEWEST), (days, MAX_VERSIONS - KEEP_NEWEST)] {
-        let mut bytes = 0i64;
-        for (count, i) in kind.into_iter().enumerate() {
+    // Takes a kind's versions newest first, while they fit its budget.
+    let mut take = |kind: Vec<usize>, most: usize| {
+        let (mut taken, mut bytes) = (0usize, 0i64);
+        for i in kind {
             bytes += i64::from(newest_first[i].2);
-            if count >= most || bytes > MAX_HISTORY_BYTES {
+            if taken >= most || bytes > MAX_HISTORY_BYTES {
                 break;
             }
             keep[i] = true;
+            taken += 1;
         }
-    }
+        taken
+    };
+    let newest_kept = take(newest, KEEP_NEWEST);
+    take(days, MAX_VERSIONS - newest_kept);
     newest_first.iter().zip(keep).filter(|(_, k)| !k).map(|((id, _, _), _)| id.clone()).collect()
 }
 
@@ -551,9 +558,17 @@ mod tests {
         // Big ones only make room for later days, one a day.
         let mut list: Vec<(String, NaiveDateTime, i32)> =
             (0..20).map(|m| (format!("new-{m}"), at(28, 0) - TimeDelta::minutes(m), 100)).collect();
-        list.extend((0..10).map(|d| (format!("day-{d}"), at(27, 0) - TimeDelta::days(d), big)));
+        list.extend((0..10).map(|d| (format!("day-{d}"), at(27, 0) - TimeDelta::days(d), 500_000)));
         let forget = to_forget(&list);
         assert_eq!(forget, (8..10).map(|d| format!("day-{d}")).collect::<Vec<_>>());
+
+        // While a burst is still among the newest, the version before it is
+        // already kept apart: the newest filling their budget can't take it.
+        let mut list: Vec<(String, NaiveDateTime, i32)> =
+            (0..12).rev().map(|m| (format!("big-{m}"), at(23, 10 + m), big)).collect();
+        list.extend(versions(&[("before", at(23, 0), 900)]));
+        let forget = to_forget(&list);
+        assert_eq!(forget, ["big-3", "big-2", "big-1", "big-0"]);
     }
 
     #[test]
@@ -565,13 +580,13 @@ mod tests {
         assert_eq!(forget.len(), 150 - MAX_VERSIONS);
         assert_eq!(forget.first().map(String::as_str), Some("day-100"));
 
-        // Large versions: only the newest that fit the budget.
+        // Large versions in one day: the newest that fit their budget, and
+        // the day's first, the item as it was before them, in its own.
         let big = i32::try_from(MAX_ITEM_BYTES).unwrap();
         let list: Vec<(String, NaiveDateTime, i32)> =
             (0..12).map(|m| (format!("big-{m}"), at(23, 0) - TimeDelta::minutes(m), big)).collect();
         let forget = to_forget(&list);
-        assert_eq!(forget.len(), 12 - 8);
-        assert_eq!(forget.first().map(String::as_str), Some("big-8"));
+        assert_eq!(forget, ["big-8", "big-9", "big-10"]);
 
         assert!(to_forget(&[]).is_empty());
     }
