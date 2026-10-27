@@ -5,11 +5,16 @@
 // The server stores copies it can't read: the token key that encrypts them is
 // derived from a seed only the admin's browser and the script ever have.
 
-use std::{net::IpAddr, num::NonZeroU32, sync::LazyLock};
+use std::{
+    collections::VecDeque,
+    net::IpAddr,
+    sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use dashmap::DashMap;
 use data_encoding::{BASE64, BASE64URL_NOPAD};
-use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
 use ring::digest;
 use rocket::{
     Request, Route,
@@ -62,9 +67,55 @@ const MAX_COPY: usize = 64 * 1024;
 const MAX_SPEC: usize = 8 * 1024;
 const MAX_NAME: usize = 100;
 
-/// Reads per token per minute.
-static SCRIPT_READS: LazyLock<RateLimiter<String, DashMapStateStore<String>, DefaultClock>> =
-    LazyLock::new(|| RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(60).expect("Non-zero script read limit"))));
+/// Reads a token may make in any minute.
+const READS_PER_MINUTE: usize = 60;
+const MINUTE: Duration = Duration::from_secs(60);
+
+/// At most READS_PER_MINUTE reads per token in any minute: when each token's
+/// reads of the last minute were, and a read is refused while there are 60.
+/// (A token bucket, which lets 60 through at once and then one a second,
+/// would let up to 119 through in a minute.)
+#[derive(Default)]
+struct ReadLimit {
+    reads: DashMap<String, VecDeque<Instant>>,
+    pruned: Mutex<Option<Instant>>,
+}
+
+impl ReadLimit {
+    /// Counts a read now, or refuses it and says how long until the token
+    /// may read again.
+    fn check(&self, token: &str) -> Result<(), Duration> {
+        self.check_at(token, Instant::now())
+    }
+
+    fn check_at(&self, token: &str, now: Instant) -> Result<(), Duration> {
+        let answer = {
+            let mut reads = self.reads.entry(token.to_owned()).or_default();
+            while reads.front().is_some_and(|&at| now.saturating_duration_since(at) >= MINUTE) {
+                reads.pop_front();
+            }
+            match reads.front() {
+                Some(&oldest) if reads.len() >= READS_PER_MINUTE => {
+                    Err(MINUTE.saturating_sub(now.saturating_duration_since(oldest)))
+                }
+                _ => {
+                    reads.push_back(now);
+                    Ok(())
+                }
+            }
+        };
+        // Forgets tokens that haven't read in the last minute, every few minutes.
+        if let Ok(mut pruned) = self.pruned.lock()
+            && pruned.is_none_or(|at| now.saturating_duration_since(at) >= 5 * MINUTE)
+        {
+            *pruned = Some(now);
+            self.reads.retain(|_, reads| reads.back().is_some_and(|&at| now.saturating_duration_since(at) < MINUTE));
+        }
+        answer
+    }
+}
+
+static SCRIPT_READS: LazyLock<ReadLimit> = LazyLock::new(ReadLimit::default);
 
 /// An encrypted value as upstream writes it (`2.<iv>|<data>|<mac>`), at most `max` long.
 fn valid_enc_string(value: &str, max: usize) -> bool {
@@ -531,7 +582,7 @@ impl<'r> FromRequest<'r> for ScriptCaller {
             Some("expired")
         } else if !token.allows(&ip) {
             Some("outside its networks")
-        } else if SCRIPT_READS.check_key(&token.uuid).is_err() {
+        } else if SCRIPT_READS.check(&token.uuid).is_err() {
             Some("too many reads")
         } else {
             None
@@ -643,6 +694,55 @@ mod tests {
         ] {
             assert!(parse_authorization(header).is_none(), "{header}");
         }
+    }
+
+    /// 60 reads in any minute, however they're spread: a token that read 60
+    /// times at once can't read again a second later (as a token bucket
+    /// would let it), only once the first read is a minute old.
+    #[test]
+    fn a_token_reads_at_most_60_times_in_any_minute() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let limit = ReadLimit::default();
+        for _ in 0..60 {
+            assert!(limit.check_at("burst", at(0)).is_ok());
+        }
+        assert_eq!(limit.check_at("burst", at(0)), Err(MINUTE));
+        assert_eq!(limit.check_at("burst", at(1_000)), Err(Duration::from_secs(59)));
+        assert_eq!(limit.check_at("burst", at(59_999)), Err(Duration::from_millis(1)));
+        // Refusals don't count: once the burst is a minute old, 60 more.
+        for _ in 0..60 {
+            assert!(limit.check_at("burst", at(60_000)).is_ok());
+        }
+        assert!(limit.check_at("burst", at(60_000)).is_err());
+
+        // One a second: a 61st, half a second before the first read is a
+        // minute old, waits that half second; then one more each second.
+        let spread = ReadLimit::default();
+        for i in 0..60 {
+            assert!(spread.check_at("spread", at(i * 1_000)).is_ok(), "{i}");
+        }
+        assert_eq!(spread.check_at("spread", at(59_500)), Err(Duration::from_millis(500)));
+        assert!(spread.check_at("spread", at(60_000)).is_ok());
+        assert!(spread.check_at("spread", at(60_500)).is_err());
+        assert!(spread.check_at("spread", at(61_000)).is_ok());
+
+        // Each token has its own minute.
+        assert!(limit.check_at("another", at(60_000)).is_ok());
+    }
+
+    #[test]
+    fn tokens_that_stopped_reading_are_forgotten() {
+        let t0 = Instant::now();
+        let limit = ReadLimit::default();
+        assert!(limit.check_at("old", t0).is_ok());
+        assert!(limit.check_at("new", t0 + Duration::from_secs(250)).is_ok());
+        assert_eq!(limit.reads.len(), 2);
+        // Five minutes after the last time it pruned (the first read), it
+        // forgets the token whose reads are all over a minute old.
+        assert!(limit.check_at("new", t0 + Duration::from_secs(300)).is_ok());
+        assert_eq!(limit.reads.len(), 1);
+        assert!(limit.reads.contains_key("new"));
     }
 
     #[test]
