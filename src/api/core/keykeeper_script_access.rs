@@ -168,6 +168,19 @@ pub(super) async fn is_token_admin(
     }
 }
 
+/// Whoever made a token still manages the organization: their account is
+/// enabled and they're still a token admin there (`is_token_admin`). A token
+/// works only while they do, so removing or revoking them, demoting them, or
+/// a client removing its MSP stops what they made. See DESIGN.md,
+/// "Offboarding", in the meta repo.
+pub(super) async fn creator_has_access(
+    org_id: &OrganizationId,
+    creator: &crate::db::models::UserId,
+    conn: &DbConn,
+) -> bool {
+    User::find_by_uuid(creator, conn).await.is_some_and(|u| u.enabled) && is_token_admin(org_id, creator, conn).await
+}
+
 /// Records an event in the MSP's activity log when the organization is an MSP's client.
 async fn record_for_msp(
     org_id: &OrganizationId,
@@ -240,7 +253,10 @@ async fn token_view(token: &ScriptToken, conn: &DbConn) -> Value {
     }
     let networks: Vec<String> = serde_json::from_str(&token.networks).unwrap_or_default();
     let created_by = User::find_by_uuid(&token.created_by, conn).await.map(|u| u.email);
+    // Keykeeper: a token stops when whoever made it no longer manages the organization.
+    let stopped = token.revoked_at.is_none() && !creator_has_access(&token.org_uuid, &token.created_by, conn).await;
     json!({
+        "creatorLostAccess": stopped,
         "id": token.uuid,
         "organizationId": token.org_uuid,
         "name": token.name,
@@ -429,6 +445,9 @@ async fn set_grant(
     if !token.is_live(Utc::now().naive_utc()) {
         err!("That token was revoked or expired")
     }
+    if !creator_has_access(&org_id, &token.created_by, &conn).await {
+        err!("That token stopped working: whoever made it no longer manages this organization")
+    }
     let existing = ScriptGrant::find(&token.uuid, &item_id, &conn).await;
     let admin = is_token_admin(&org_id, &headers.user.uuid, &conn).await;
     let grant = GrantData {
@@ -510,7 +529,9 @@ async fn stale_grants(headers: Headers, conn: DbConn) -> JsonResult {
     let mut data = Vec::new();
     for member in Membership::find_confirmed_by_user(&headers.user.uuid, &conn).await {
         for token in ScriptToken::find_by_org(&member.org_uuid, &conn).await {
-            if !token.is_live(now) {
+            // Keykeeper: never a token whose maker no longer manages the
+            // organization: refreshing it would hand them the new password.
+            if !token.is_live(now) || !creator_has_access(&token.org_uuid, &token.created_by, &conn).await {
                 continue;
             }
             for grant in ScriptGrant::find_for_token(&token.uuid, &conn).await {
@@ -582,6 +603,11 @@ impl<'r> FromRequest<'r> for ScriptCaller {
             Some("expired")
         } else if !token.allows(&ip) {
             Some("outside its networks")
+        } else if Organization::find_by_uuid(&token.org_uuid, &conn).await.is_none() {
+            Some("organization gone")
+        } else if !creator_has_access(&token.org_uuid, &token.created_by, &conn).await {
+            // Keykeeper: checked on every use (DESIGN.md, "Offboarding").
+            Some("its maker no longer manages the organization")
         } else if SCRIPT_READS.check(&token.uuid).is_err() {
             Some("too many reads")
         } else {

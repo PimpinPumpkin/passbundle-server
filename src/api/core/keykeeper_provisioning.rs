@@ -50,6 +50,16 @@ async fn require_admin(org_id: &OrganizationId, headers: &Headers, conn: &DbConn
     Ok(())
 }
 
+/// Whether whoever made the organization's token still manages it (as for
+/// script tokens, keykeeper_script_access::creator_has_access): the token
+/// works only while they do. See DESIGN.md, "Offboarding".
+pub async fn token_maker_has_access(token: &ScimToken, conn: &DbConn) -> bool {
+    match &token.created_by_user {
+        Some(maker) => super::keykeeper_script_access::creator_has_access(&token.org_uuid, maker, conn).await,
+        None => false,
+    }
+}
+
 /// The organization's SCIM URL, the one to paste into Entra as the Tenant URL.
 pub fn scim_url(org_id: &OrganizationId) -> String {
     format!("{}/scim/v2/{org_id}", CONFIG.domain())
@@ -71,6 +81,10 @@ async fn role_of(person: &ScimPerson, conn: &DbConn) -> &'static str {
 
 async fn view(org_id: &OrganizationId, conn: &DbConn) -> Value {
     let token = ScimToken::find(org_id, conn).await;
+    let maker_lost_access = match &token {
+        Some(token) => !token_maker_has_access(token, conn).await,
+        None => false,
+    };
     let people = ScimPerson::load_org(org_id, conn).await;
     let mut linked = 0;
     let mut provisioned = 0;
@@ -118,6 +132,8 @@ async fn view(org_id: &OrganizationId, conn: &DbConn) -> Value {
             "createdBy": t.created_by,
             "lastUsedAt": t.last_used_at.as_ref().map(format_date),
             "lastUsedIp": t.last_used_ip,
+            // Keykeeper: it stopped working; make a new one.
+            "creatorLostAccess": maker_lost_access,
         })),
         "people": linked,
         "provisioned": provisioned,
@@ -160,7 +176,8 @@ async fn get_provisioning(org_id: OrganizationId, headers: Headers, conn: DbConn
 async fn make_token(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&org_id, &headers, &conn).await?;
     let replaced = ScimToken::find(&org_id, &conn).await.is_some();
-    let (token, row) = ScimToken::generate(org_id.clone(), &headers.user.email);
+    let (token, mut row) = ScimToken::generate(org_id.clone(), &headers.user.email);
+    row.created_by_user = Some(headers.user.uuid.clone());
     row.replace(&conn).await?;
     let event = if replaced {
         "provisioning_token_replaced"

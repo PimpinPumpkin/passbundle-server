@@ -709,6 +709,22 @@ impl MspClient {
         Ok(())
     }
 
+    /// Forgets the client's Templates collection, which the client deleted:
+    /// the console makes a new one the next time it sends a template.
+    pub async fn clear_templates_collection(&mut self, conn: &DbConn) -> EmptyResult {
+        let org = self.org_uuid.clone();
+        conn.run(move |conn| {
+            diesel::update(msp_clients::table.filter(msp_clients::org_uuid.eq(org)))
+                .set(msp_clients::templates_collection.eq(None::<CollectionId>))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error forgetting the Templates collection")
+        })
+        .await?;
+        self.templates_collection = None;
+        Ok(())
+    }
+
     pub async fn find_by_msp(msp_uuid: &MspId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             msp_clients::table
@@ -984,6 +1000,32 @@ impl MspEvent {
         // And to the MSP's security tools, if it sends its events to any.
         super::keykeeper_event_streaming::stream_msp(self, conn).await;
         Ok(())
+    }
+
+    /// How many of an MSP's events of one kind happened since a time, about
+    /// one person if `target` is given: for limits such as how many
+    /// invitations it emails. A database error counts as too many.
+    pub async fn count_since(
+        msp_uuid: &MspId,
+        event: &str,
+        since: NaiveDateTime,
+        target: Option<&str>,
+        conn: &DbConn,
+    ) -> i64 {
+        let event = event.to_owned();
+        let target = target.map(str::to_lowercase);
+        conn.run(move |conn| {
+            let mut query = msp_events::table
+                .filter(msp_events::msp_uuid.eq(msp_uuid))
+                .filter(msp_events::event.eq(event))
+                .filter(msp_events::created_at.ge(since))
+                .into_boxed();
+            if let Some(target) = target {
+                query = query.filter(msp_events::target_email.eq(target));
+            }
+            query.count().get_result::<i64>(conn).unwrap_or(i64::MAX)
+        })
+        .await
     }
 
     /// The newest events first, older than `before` if given. With `only`,

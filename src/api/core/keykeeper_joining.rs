@@ -232,6 +232,17 @@ async fn set_msp_joining(msp_id: MspId, data: Json<JoiningData>, headers: Header
     for seal in data.seals.values() {
         super::keykeeper_enrollment::checked_seal(Some(seal))?;
     }
+    // Keykeeper: a client following the default where the caller has no place
+    // of their own (it may have revoked them) keeps how people join it now,
+    // as its own setting, with its seal (keykeeper_offboarding.rs).
+    let before = msp_default(&msp_id, &conn).await;
+    for client in MspClient::find_by_msp(&msp_id, &conn).await {
+        if OrgJoining::find(&client.org_uuid, &conn).await.is_none()
+            && !super::keykeeper_offboarding::has_client_place(&client.org_uuid, &headers.user.uuid, true, &conn).await
+        {
+            OrgJoining::new(client.org_uuid.clone(), before).save(&conn).await?;
+        }
+    }
     MspJoining::new(msp_id.clone(), joining).save(&conn).await?;
     // Every client that follows the default gets the seal the app made for
     // it, or none: then its joins need approval until an admin seals it.

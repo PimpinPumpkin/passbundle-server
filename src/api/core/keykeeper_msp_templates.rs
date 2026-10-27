@@ -18,13 +18,20 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Cipher, CipherId, Collection, CollectionId, CollectionUser, Membership, MembershipStatus, MembershipType,
+            Cipher, CipherId, Collection, CollectionUser, EventType, Membership, MembershipStatus, MembershipType,
             MspClient, MspId, MspMembership, MspTemplate, MspTemplateCopy, OrganizationId,
         },
     },
 };
 
-use super::keykeeper_msp::{Audit, require_admin, staff_member};
+use super::{
+    keykeeper_msp::{Audit, require_admin, staff_member},
+    keykeeper_offboarding::require_client_place,
+    log_event,
+};
+
+/// Upstream's cipher type for a secure note, which every template copy is.
+const SECURE_NOTE: i32 = 2;
 
 pub fn routes() -> Vec<Route> {
     routes![get_templates, set_template, stop_template, record_copies, set_templates_collection]
@@ -250,11 +257,34 @@ async fn record_copies(
         if !ours.contains(&copy.organization_id) || !seen.insert(copy.organization_id.clone()) {
             err!("Client not found")
         }
-        let in_client = Cipher::find_by_uuid_and_org(&copy.cipher_id, &copy.organization_id, &conn)
+        // Keykeeper: only in clients where the caller has a place of their
+        // own (keykeeper_offboarding.rs).
+        require_client_place(&copy.organization_id, &headers.user.uuid, true, &conn).await?;
+        let Some(cipher) = Cipher::find_by_uuid_and_org(&copy.cipher_id, &copy.organization_id, &conn)
             .await
-            .is_some_and(|c| c.deleted_at.is_none());
-        if !in_client {
+            .filter(|c| c.deleted_at.is_none())
+        else {
             err!("Copy not found")
+        };
+        // A copy is what the console writes: a secure note in the client's
+        // Templates collection, and not another template's copy, so no other
+        // item can be recorded as one and later replaced by an update.
+        let templates = MspClient::find_by_org(&copy.organization_id, &conn).await.and_then(|c| c.templates_collection);
+        let in_templates = match &templates {
+            Some(collection) => {
+                cipher.get_admin_collections(headers.user.uuid.clone(), &conn).await.contains(collection)
+            }
+            None => false,
+        };
+        if cipher.atype != SECURE_NOTE || !in_templates {
+            err!("That item isn't a template copy in the client's Templates collection")
+        }
+        let another = MspTemplateCopy::find_by_org(&copy.organization_id, &conn)
+            .await
+            .into_iter()
+            .any(|c| c.cipher_uuid == copy.cipher_id && c.template_id != template_id);
+        if another {
+            err!("That item is another template's copy")
         }
         if copy.source_revision.is_empty() || copy.source_revision.len() > 64 {
             err!("Invalid source revision")
@@ -287,11 +317,16 @@ async fn record_copies(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CollectionData {
-    collection_id: CollectionId,
+    /// The new Templates collection's name, encrypted with the client's key.
+    name: String,
 }
 
-/// Records the client's Templates collection, which the console creates the
-/// first time it sends that client a template.
+/// Makes the client's Templates collection, which the console asks for the
+/// first time it sends that client a template, or after the client deleted
+/// it. The server makes it, so it's always a new, empty collection nobody has
+/// been given: every regular member of the client gets to read it, so it can
+/// never be one that holds anything else. Needs the caller's own place in
+/// the client (keykeeper_offboarding.rs), and goes in the client's event log.
 #[put("/keykeeper/msp/<msp_id>/clients/<org_id>/templates-collection", data = "<data>")]
 async fn set_templates_collection(
     msp_id: MspId,
@@ -305,16 +340,29 @@ async fn set_templates_collection(
         Some(c) if c.msp_uuid == msp_id => c,
         _ => err!("Client not found"),
     };
-    let collection_id = data.into_inner().collection_id;
-    let Some(collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
-        err!("Collection not found")
-    };
-    // Set once: every regular member of the client gets to read it, so it
-    // can't later be pointed at a collection they shouldn't see.
-    if client.templates_collection.as_ref().is_some_and(|c| c != &collection_id) {
+    require_client_place(&org_id, &headers.user.uuid, true, &conn).await?;
+    let name = data.into_inner().name;
+    if !crate::db::models::valid_encrypted_secret(&name) {
+        err!("The collection's name must be encrypted with the client's key")
+    }
+    if let Some(existing) = &client.templates_collection
+        && Collection::find_by_uuid_and_org(existing, &org_id, &conn).await.is_some()
+    {
         err!("This client already has its Templates collection")
     }
-    client.set_templates_collection(collection_id.clone(), &conn).await?;
+    let collection = Collection::new(org_id.clone(), name, None);
+    collection.save(&conn).await?;
+    client.set_templates_collection(collection.uuid.clone(), &conn).await?;
+    log_event(
+        EventType::CollectionCreated,
+        &collection.uuid,
+        &org_id,
+        &headers.user.uuid,
+        headers.device.atype,
+        &headers.ip.ip,
+        &conn,
+    )
+    .await;
     let org_name =
         crate::db::models::Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
     Audit::by("templates_collection_set", &headers)
@@ -325,7 +373,7 @@ async fn set_templates_collection(
     for member in Membership::find_by_org(&org_id, &conn).await {
         give_templates(&member, &client, &conn).await?;
     }
-    Ok(Json(json!({ "collectionId": collection_id })))
+    Ok(Json(json!({ "collectionId": collection.uuid })))
 }
 
 /// Gives one of a client's own members its Templates collection, read-only:
@@ -337,6 +385,31 @@ pub async fn give_templates(member: &Membership, client: &MspClient, conn: &DbCo
     let Some(collection) = &client.templates_collection else {
         return Ok(());
     };
+    // The client deleted it: nobody gets it, and the MSP's console makes a
+    // new one the next time it sends a template, rather than this failing
+    // every confirmation in the client.
+    if Collection::find_by_uuid_and_org(collection, &client.org_uuid, conn).await.is_none() {
+        warn!("{}'s Templates collection is gone; its MSP's console will make a new one", client.org_uuid);
+        let mut client = MspClient::find_by_org(&client.org_uuid, conn).await.filter(|c| c.msp_uuid == client.msp_uuid);
+        if let Some(client) = client.as_mut().filter(|c| c.templates_collection.is_some()) {
+            client.clear_templates_collection(conn).await?;
+            let org_name = crate::db::models::Organization::find_by_uuid(&client.org_uuid, conn)
+                .await
+                .map(|o| o.name)
+                .unwrap_or_default();
+            Audit {
+                event: "templates_collection_gone",
+                actor: None,
+                ip: None,
+                org: Some((&client.org_uuid, &org_name)),
+                target_email: None,
+                detail: None,
+            }
+            .record(&client.msp_uuid, conn)
+            .await?;
+        }
+        return Ok(());
+    }
     // Members still joining get it when they're confirmed.
     if member.status != MembershipStatus::Confirmed as i32
         || member.atype >= MembershipType::Admin

@@ -27,7 +27,7 @@ use crate::{
         models::{
             Collection, CustomRole, Membership, MembershipId, MembershipStatus, MembershipType, Msp, MspClient,
             MspEvent, MspId, MspInvite, MspMembership, MspRole, MspStaff, OrgSetup, Organization, OrganizationId,
-            TechnicianAccess, User, UserId, effective_joining,
+            RemovedMember, TechnicianAccess, User, UserId, effective_joining,
             keykeeper_roles::{self, CustomPermissions, Permission},
         },
     },
@@ -238,7 +238,8 @@ impl Grant {
 
 /// Gives someone the MSP's access to one client: a new membership waiting to
 /// be confirmed, recorded as the MSP's. Leaves any membership they already
-/// have alone, since the client granted it.
+/// have alone, since the client granted it, and never adds someone the client
+/// removed or revoked (keykeeper_offboarding.rs).
 async fn add_msp_membership(
     msp_id: &MspId,
     org_id: &OrganizationId,
@@ -247,7 +248,9 @@ async fn add_msp_membership(
     invited_by: &str,
     conn: &DbConn,
 ) -> EmptyResult {
-    if Membership::find_by_user_and_org(user_id, org_id, conn).await.is_some() {
+    if Membership::find_by_user_and_org(user_id, org_id, conn).await.is_some()
+        || RemovedMember::exists(org_id, user_id, conn).await
+    {
         return Ok(());
     }
     let mut member = Membership::new(user_id.clone(), org_id.clone(), Some(invited_by.to_owned()));
@@ -266,8 +269,17 @@ async fn add_msp_membership(
 /// and access, all at once: new memberships (waiting for the org key) in
 /// clients they now reach, the right role and vault access in the rest, and
 /// the MSP's memberships removed from clients they no longer reach.
-/// Memberships a client granted itself are left alone.
-async fn sync_staff_memberships(msp_id: &MspId, staff: &MspStaff, invited_by: &str, conn: &DbConn) -> EmptyResult {
+/// Memberships a client granted itself are left alone, and so is anyone the
+/// client removed or revoked. Additions and role changes happen only in
+/// clients where `actor`, who made the change, has a place of their own
+/// (keykeeper_offboarding.rs); removals happen everywhere.
+async fn sync_staff_memberships(
+    msp_id: &MspId,
+    staff: &MspStaff,
+    actor: Option<&UserId>,
+    invited_by: &str,
+    conn: &DbConn,
+) -> EmptyResult {
     let reach = staff.reach(conn).await;
     let roles = staff.client_roles(conn).await?;
     let ours = msp_membership_ids(msp_id, conn).await;
@@ -276,11 +288,18 @@ async fn sync_staff_memberships(msp_id: &MspId, staff: &MspStaff, invited_by: &s
             return Ok(());
         };
         let reached = reach.as_ref().is_none_or(|r| r.contains(&client.org_uuid));
+        let allowed = match actor {
+            Some(actor) => super::keykeeper_offboarding::has_client_place(&client.org_uuid, actor, true, conn).await,
+            None => false,
+        } && !RemovedMember::exists(&client.org_uuid, &staff.user_uuid, conn).await;
         match Membership::find_by_user_and_org(&staff.user_uuid, &client.org_uuid, conn).await {
-            None if reached => {
+            None if reached && allowed => {
                 add_msp_membership(msp_id, &client.org_uuid, &staff.user_uuid, &grant, invited_by, conn).await?;
             }
             Some(mut member) if ours.contains(&member.uuid) => {
+                if reached && !allowed {
+                    continue;
+                }
                 if reached {
                     member.atype = grant.atype as i32;
                     member.access_all = grant.access_all;
@@ -368,6 +387,7 @@ async fn create_msp(headers: Headers, data: Json<CreateMspData>, conn: DbConn) -
     let msp = Msp::new(clean_name(&data.name)?);
     msp.insert(&conn).await?;
     MspStaff::new(msp.uuid.clone(), headers.user.uuid.clone(), MspRole::Admin).insert(&conn).await?;
+    end_recovery_enrollments(&headers.user.uuid, &conn).await?;
     keykeeper_msp_policies::seed_defaults(&msp.uuid, &conn).await?;
     Audit::by("msp_created", &headers).detail(msp.name.clone()).record(&msp.uuid, &conn).await?;
     Ok(Json(json!({ "id": msp.uuid, "name": msp.name, "role": MspRole::Admin.as_str() })))
@@ -386,6 +406,9 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
         err_code!("MSP not found", rocket::http::Status::NotFound.code)
     };
 
+    // The MSP's people its clients removed or revoked themselves: they stay
+    // out of those clients (keykeeper_offboarding.rs).
+    let removed = RemovedMember::find_by_msp(&msp_id, &conn).await;
     let mut staff = Vec::new();
     for member in MspStaff::find_by_msp(&msp_id, &conn).await {
         if let (Some(user), Some(member_role)) = (User::find_by_uuid(&member.user_uuid, &conn).await, member.role()) {
@@ -394,12 +417,24 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
             } else {
                 Value::Null
             };
+            let removed_by: Vec<Value> = removed
+                .iter()
+                .filter(|r| r.user_uuid == user.uuid && reach.as_ref().is_none_or(|reach| reach.contains(&r.org_uuid)))
+                .map(|r| {
+                    json!({
+                        "organizationId": r.org_uuid,
+                        "revoked": r.revoked,
+                        "at": crate::util::format_date(&r.removed_at),
+                    })
+                })
+                .collect();
             staff.push(json!({
                 "userId": user.uuid,
                 "email": user.email,
                 "name": user.name,
                 "role": member_role.as_str(),
                 "access": access,
+                "removedByClient": removed_by,
             }));
         }
     }
@@ -435,6 +470,15 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
                 _ => revoked += 1,
             }
         }
+        let mut removed_here = Vec::new();
+        for r in removed.iter().filter(|r| r.org_uuid == org.uuid) {
+            removed_here.push(json!({
+                "userId": r.user_uuid,
+                "email": User::find_by_uuid(&r.user_uuid, &conn).await.map(|u| u.email),
+                "revoked": r.revoked,
+                "at": crate::util::format_date(&r.removed_at),
+            }));
+        }
         clients.push(json!({
             "id": org.uuid,
             "name": org.name,
@@ -445,6 +489,11 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
             // That an MSP admin's browser, holding the client's key, made it this
             // MSP's client. The apps check it before writing anything there.
             "seal": client.client_seal,
+            // Keykeeper: the MSP's people this client took out itself, and how
+            // many people it removed since the install command's token was
+            // made, who may still have the command (DESIGN.md, "Offboarding").
+            "removedByClient": removed_here,
+            "removedSinceToken": RemovedMember::count_since(&org.uuid, client.enrollment_token_created_at, &conn).await,
             // Keykeeper: whether the client provisions from Entra, and its last sync.
             "provisioning": crate::db::models::ScimToken::find(&org.uuid, &conn).await.map(|t| json!({
                 "lastUsedAt": t.last_used_at.as_ref().map(crate::util::format_date),
@@ -606,8 +655,22 @@ struct AddStaffData {
     access: Option<TechnicianAccess>,
 }
 
+/// No organization may recover a staff account (DESIGN.md, "MSP staff and
+/// account recovery"), so any enrollment someone had ends when they join a
+/// staff, or make an MSP.
+async fn end_recovery_enrollments(user_id: &UserId, conn: &DbConn) -> EmptyResult {
+    for mut member in Membership::find_by_user(user_id, conn).await {
+        if member.reset_password_key.is_some() {
+            member.reset_password_key = None;
+            member.save(conn).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Puts someone on the MSP's staff and adds them to the clients they reach,
-/// waiting for the org key.
+/// waiting for the org key: the clients where whoever invited them has a
+/// place of their own.
 async fn add_to_staff(
     msp_id: &MspId,
     user: &User,
@@ -618,21 +681,15 @@ async fn add_to_staff(
 ) -> EmptyResult {
     let mut staff = MspStaff::new(msp_id.clone(), user.uuid.clone(), role);
     staff.insert(conn).await?;
-    // No organization may recover a staff account (DESIGN.md, "MSP staff and
-    // account recovery"), so any enrollment they had ends now.
-    for mut member in Membership::find_by_user(&user.uuid, conn).await {
-        if member.reset_password_key.is_some() {
-            member.reset_password_key = None;
-            member.save(conn).await?;
-        }
-    }
+    end_recovery_enrollments(&user.uuid, conn).await?;
     MspInvite::delete_by_msp_and_email(msp_id, &user.email, conn).await?;
     if role == MspRole::Technician
         && let Some(access) = access
     {
         staff.set_access(access, conn).await?;
     }
-    sync_staff_memberships(msp_id, &staff, added_by, conn).await
+    let inviter = User::find_by_mail(added_by, conn).await.map(|u| u.uuid);
+    sync_staff_memberships(msp_id, &staff, inviter.as_ref(), added_by, conn).await
 }
 
 /// Checks a technician's access before storing it: chosen clients must be the
@@ -742,6 +799,28 @@ fn role_in_words(custom: Option<&CustomRole>) -> String {
     }
 }
 
+/// Invitation emails an MSP may send in any hour, and to one address in any day.
+const INVITES_PER_HOUR: i64 = 20;
+const INVITES_PER_ADDRESS_PER_DAY: i64 = 3;
+
+/// Refuses an invitation email past the MSP's limits, so a staff page can't
+/// be used to flood someone's inbox. Each invitation counts once sent, even
+/// if it's cancelled.
+async fn check_invite_emails(msp_id: &MspId, email: &str, conn: &DbConn) -> EmptyResult {
+    let now = chrono::Utc::now().naive_utc();
+    let hour = MspEvent::count_since(msp_id, "staff_invited", now - chrono::TimeDelta::hours(1), None, conn).await;
+    if hour >= INVITES_PER_HOUR {
+        err!(format!("Your MSP has sent {INVITES_PER_HOUR} invitations in the last hour. Try again later."))
+    }
+    let day = MspEvent::count_since(msp_id, "staff_invited", now - chrono::TimeDelta::days(1), Some(email), conn).await;
+    if day >= INVITES_PER_ADDRESS_PER_DAY {
+        err!(format!(
+            "{email} has had {INVITES_PER_ADDRESS_PER_DAY} invitations from your MSP today. Try again tomorrow, or pass on the link you have."
+        ))
+    }
+    Ok(())
+}
+
 fn invite_url(token: &str) -> String {
     format!("{}/#/msp?invite={token}", CONFIG.domain())
 }
@@ -777,6 +856,9 @@ async fn add_staff(msp_id: MspId, headers: Headers, data: Json<AddStaffData>, co
     }
     if MspInvite::find_by_msp_and_email(&msp_id, &email, &conn).await.is_some() {
         err!("They're already invited. Cancel the invitation to send a new one.")
+    }
+    if CONFIG.mail_enabled() {
+        check_invite_emails(&msp_id, &email, &conn).await?;
     }
     let Some(msp) = Msp::find_by_uuid(&msp_id, &conn).await else {
         err_code!("MSP not found", rocket::http::Status::NotFound.code)
@@ -926,7 +1008,7 @@ async fn change_staff_role(
         ensure_owners_remain(&staff_memberships(&msp_id, &user_id, &conn).await, &conn).await?;
     }
     staff.set_role(role, &conn).await?;
-    sync_staff_memberships(&msp_id, &staff, &headers.user.email, &conn).await?;
+    sync_staff_memberships(&msp_id, &staff, Some(&headers.user.uuid), &headers.user.email, &conn).await?;
     let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
     Audit::by("staff_role_changed", &headers).target(&email).detail(role.as_str()).record(&msp_id, &conn).await
 }
@@ -952,7 +1034,7 @@ async fn set_staff_access(
     }
     let access = validate_access(&msp_id, data.into_inner(), &conn).await?;
     staff.set_access(&access, &conn).await?;
-    sync_staff_memberships(&msp_id, &staff, &headers.user.email, &conn).await?;
+    sync_staff_memberships(&msp_id, &staff, Some(&headers.user.uuid), &headers.user.email, &conn).await?;
     let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
     // Clients they no longer reach lose their staff seal there too.
     if let Some(reach) = staff.reach(&conn).await {
@@ -1177,9 +1259,13 @@ async fn get_organization_msp(org_id: OrganizationId, headers: Headers, conn: Db
 }
 
 /// For a client's own owners: removes the MSP and all of its staff from the
-/// organization in one step. The MSP's own staff can't do this.
+/// organization in one step, and everything they made there that would keep
+/// working without them: script and provisioning tokens, event destinations,
+/// and staff seals (keykeeper_offboarding.rs). The MSP's own staff can't do
+/// this. Answers with what went, for the owner to see, and the single
+/// sign-on settings to review.
 #[delete("/keykeeper/organizations/<org_id>/msp")]
-async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
     let Some(caller) = Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, &conn).await else {
         err_code!("Organization not found", rocket::http::Status::NotFound.code)
     };
@@ -1190,10 +1276,20 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
     if caller.atype != MembershipType::Owner as i32 || caller_is_msp {
         err_code!("Only the organization's own owners can remove its MSP", rocket::http::Status::Forbidden.code)
     }
+    let msp_id = client.msp_uuid.clone();
+    let msp_name = Msp::find_by_uuid(&msp_id, &conn).await.map(|m| m.name).unwrap_or_default();
     // Fails closed: if the MSP's memberships can't be read, nothing changes
     // and the owner can try again.
     let ours: HashSet<MembershipId> =
-        MspMembership::try_find_by_msp(&client.msp_uuid, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();
+        MspMembership::try_find_by_msp(&msp_id, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();
+    let mut people = HashSet::new();
+    for member in Membership::find_by_org(&org_id, &conn).await {
+        if ours.contains(&member.uuid) {
+            people.insert(member.user_uuid.clone());
+        }
+    }
+    // What they made here stops working first, while it's still known whose it was.
+    let mut summary = super::keykeeper_offboarding::cut_msp_out(&org_id, &msp_id, &people, &conn).await?;
     for member in Membership::find_by_org(&org_id, &conn).await {
         if ours.contains(&member.uuid) {
             member.delete(&conn).await?;
@@ -1205,7 +1301,6 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
     if crate::db::models::OrgJoining::find(&org_id, &conn).await.is_none() {
         crate::db::models::OrgJoining::new(org_id.clone(), joining).save(&conn).await?;
     }
-    let msp_id = client.msp_uuid.clone();
     // The organization keeps its preset and the collection people who join
     // get, as a company's own. Not the install command: its token was the
     // MSP's, so the owners make a new one in the admin console.
@@ -1220,10 +1315,15 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
         MspMembership::try_find_by_msp(&msp_id, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();
     for member in Membership::find_by_org(&org_id, &conn).await {
         if ours.contains(&member.uuid) {
+            people.insert(member.user_uuid.clone());
             member.delete(&conn).await?;
         }
     }
     // The MSP keeps a record that the client removed it.
     let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
-    Audit::by("client_removed_msp", &headers).org(&org_id, &org_name).record(&msp_id, &conn).await
+    Audit::by("client_removed_msp", &headers).org(&org_id, &org_name).record(&msp_id, &conn).await?;
+    summary["msp"] = json!({ "id": msp_id, "name": msp_name });
+    summary["peopleRemoved"] = json!(people.len());
+    summary["installCommandRemoved"] = json!(true);
+    Ok(Json(summary))
 }
