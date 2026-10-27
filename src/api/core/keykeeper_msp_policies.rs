@@ -83,6 +83,7 @@ fn policy_name(t: OrgPolicyType) -> &'static str {
         OrgPolicyType::UriMatchDefaults => "Default URI match detection",
         OrgPolicyType::OrganizationUserNotification => "Vault banner",
         OrgPolicyType::MaximumVaultTimeout => "Vault lock",
+        OrgPolicyType::RequireSso => "Require single sign-on",
     }
 }
 

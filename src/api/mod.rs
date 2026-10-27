@@ -14,6 +14,8 @@ pub use crate::api::{
     admin::catchers as admin_catchers,
     admin::routes as admin_routes,
     core::catchers as core_catchers,
+    // Keykeeper: single sign-on's identity routes, logged without their queries.
+    core::keykeeper_sso::redacts as keykeeper_sso_redacts,
     core::purge_auth_requests,
     core::purge_sends,
     core::purge_trashed_ciphers,

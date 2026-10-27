@@ -21,6 +21,7 @@ mod keykeeper_scim;
 mod keykeeper_script_access;
 mod keykeeper_seals;
 mod keykeeper_site_fixes;
+mod keykeeper_sso;
 mod keykeeper_user_settings;
 mod org_policy;
 mod organization;
@@ -67,6 +68,11 @@ pub use self::keykeeper_script_access::{ScriptGrant, ScriptRead, ScriptToken, pa
 pub use self::keykeeper_seals::{JoinSeal, JoiningSeal, SealKind, valid_encrypted_secret, valid_seal};
 pub use self::keykeeper_site_fixes::{
     Fix, FixField, MspSiteFixReport, MspSiteRule, ProblemField, SiteFix, SiteProblem,
+};
+pub use self::keykeeper_sso::{
+    CONSUMER_TENANT, SSO_AUTH_MINUTES, SSO_LINK_TICKET_MINUTES, SsoAuthRow, SsoConfig, SsoDomain, SsoLink,
+    SsoLinkSession, SsoLinkTicket, email_domain, normalize_domain, normalize_guid, normalize_identifier,
+    pkce_challenge, sso_hash, sso_random, txt_value,
 };
 pub use self::keykeeper_user_settings::{UserSettings, valid_settings};
 pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
