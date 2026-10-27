@@ -4,7 +4,9 @@
 // web vault and the browser extension keep to it as they are, and our apps
 // keep to it through the core. "When the computer locks" may also have
 // `webMinutes`: a web page can't see the computer lock, so the web vault locks
-// after that many minutes without use instead (15 when it's missing). This
+// after that many minutes without use instead (15 when it's missing). Any type
+// may have `webReload: false`, which keeps members' web vaults from staying
+// unlocked across a reload (keykeeper_reload_keys). This
 // refuses data a client couldn't read (the extension stops on a type it
 // doesn't know). See docs/core.md, "Locking by policy", in the meta repo.
 
@@ -63,6 +65,12 @@ pub(super) fn check(policy: &PolicyData) -> EmptyResult {
         },
     }
 
+    // Whether web vaults may stay unlocked across a reload: only a yes or no.
+    match present("webReload") {
+        None | Some(Value::Bool(_)) => {}
+        Some(_) => err!("Staying unlocked across a reload is on or off, nothing else"),
+    }
+
     match present("action") {
         None => {}
         Some(Value::String(a)) if a == "lock" || a == "logOut" => {}
@@ -95,6 +103,8 @@ mod tests {
         assert!(allowed(true, json!({ "type": "onSystemLock", "webMinutes": 1 })));
         assert!(allowed(true, json!({ "type": "onSystemLock", "webMinutes": 1440, "action": "logOut" })));
         assert!(allowed(true, json!({ "type": "custom", "minutes": 15, "webMinutes": null })));
+        assert!(allowed(true, json!({ "type": "custom", "minutes": 15, "webReload": false })));
+        assert!(allowed(true, json!({ "type": "onSystemLock", "webReload": true })));
         assert!(allowed(true, json!({ "type": "onAppRestart", "minutes": 0 })));
         assert!(allowed(true, json!({ "type": "never" })));
         // Off, it may have nothing, or whatever it had.
@@ -137,6 +147,10 @@ mod tests {
         assert!(!allowed(true, json!({ "type": "custom", "minutes": 15, "webMinutes": 5 })));
         assert!(!allowed(true, json!({ "minutes": 15, "webMinutes": 5 })));
         assert!(!allowed(true, json!({ "type": "immediately", "webMinutes": 5 })));
+        // Staying unlocked across a reload: true or false only.
+        for reload in [json!("false"), json!(0), json!({})] {
+            assert!(!allowed(true, json!({ "minutes": 15, "webReload": reload })), "{reload}");
+        }
         // Off doesn't excuse unreadable data that's there.
         assert!(!allowed(false, json!({ "type": "onIdle" })));
     }
