@@ -1047,7 +1047,7 @@ impl InviteData {
 
         // Keykeeper: seals are checked before anyone is invited.
         for seal in self.keykeeper_seals.values() {
-            super::keykeeper_enrollment::checked_seal(Some(seal))?;
+            super::keykeeper_enrollment::checked_expiring_seal(Some(seal))?;
         }
 
         Ok(())
@@ -1168,7 +1168,7 @@ async fn send_invite(
             &org_id,
             email,
             crate::db::models::SealKind::Invite,
-            super::keykeeper_enrollment::checked_seal(seal)?,
+            super::keykeeper_enrollment::checked_expiring_seal(seal)?,
             &conn,
         )
         .await?;
@@ -1558,6 +1558,14 @@ async fn confirm_invite_impl(
     }
 
     let save_result = member_to_confirm.save(conn).await;
+
+    // Keykeeper: the seals that vouched for them are used up (DESIGN.md,
+    // "Joins a hacked server can't forge").
+    if save_result.is_ok()
+        && let Some(user) = User::find_by_uuid(&member_to_confirm.user_uuid, conn).await
+    {
+        crate::db::models::JoinSeal::used_up(org_id, &user.email, conn).await?;
+    }
 
     // Keykeeper: a client's own members get its Templates collection,
     // read-only, once they're in. Every way in ends here.

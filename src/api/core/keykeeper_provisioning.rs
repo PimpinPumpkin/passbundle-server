@@ -17,7 +17,8 @@ use rocket::{Route, serde::json::Json};
 use serde_json::{Value, json};
 
 use super::{
-    keykeeper_enrollment::checked_seal, keykeeper_msp::Audit, keykeeper_script_access::is_token_admin, log_event,
+    keykeeper_enrollment::checked_expiring_seal, keykeeper_msp::Audit, keykeeper_script_access::is_token_admin,
+    log_event,
 };
 use crate::{
     CONFIG,
@@ -230,7 +231,7 @@ async fn let_in(org_id: OrganizationId, data: Json<LetInData>, headers: Headers,
     }
     let people = ScimPerson::load_org(&org_id, &conn).await;
     for s in &data.seals {
-        checked_seal(Some(&s.seal))?;
+        checked_expiring_seal(Some(&s.seal))?;
         let waiting = people.iter().any(|p| {
             p.user.email.eq_ignore_ascii_case(s.email.trim())
                 && !p.protected

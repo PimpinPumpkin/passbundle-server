@@ -231,6 +231,10 @@ pub struct MspClient {
     /// The install command's join secret, encrypted with the client's key by
     /// the MSP admin's browser. See DESIGN.md, "Joins a hacked server can't forge".
     pub enrollment_secret: Option<String>,
+    /// The client seal: the MSP admin's browser, holding the client's key,
+    /// says it's this MSP's client. Apps write into a client only where it
+    /// checks out. See DESIGN.md, "Joins a hacked server can't forge".
+    pub client_seal: Option<String>,
 }
 
 /// Someone who joined a client through its enrollment token, and when.
@@ -564,6 +568,7 @@ impl MspClient {
             everyone_collection,
             templates_collection: None,
             enrollment_secret: None,
+            client_seal: None,
         }
     }
 
@@ -586,6 +591,22 @@ impl MspClient {
         })
         .await?;
         self.enrollment_secret = secret;
+        Ok(())
+    }
+
+    /// Keeps the client seal an MSP admin's browser made.
+    pub async fn set_client_seal(&mut self, seal: &str, conn: &DbConn) -> EmptyResult {
+        let org = self.org_uuid.clone();
+        let saved = seal.to_owned();
+        conn.run(move |conn| {
+            diesel::update(msp_clients::table.filter(msp_clients::org_uuid.eq(org)))
+                .set(msp_clients::client_seal.eq(Some(saved)))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error saving the client seal")
+        })
+        .await?;
+        self.client_seal = Some(seal.to_owned());
         Ok(())
     }
 
