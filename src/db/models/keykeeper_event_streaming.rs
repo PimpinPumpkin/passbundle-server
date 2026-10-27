@@ -754,11 +754,13 @@ pub struct EventDelivery {
 pub const KEPT: i32 = 3;
 
 /// An event's priority in the queue: kept for changes to who can do what
-/// (members, groups, shared folders, the organization's settings, policies,
-/// where events go, and the MSP's staff and clients), otherwise by severity.
+/// (members, groups, shared folders, the organization's settings, single
+/// sign-on and its domains, policies, where events go, and the MSP's staff
+/// and clients), otherwise by severity. Single sign-on's sign-ins and
+/// refusals (1590 and 1591) go by severity, as logins do.
 pub fn priority(code: i32, severity: &str) -> i32 {
-    let kept = matches!(code, 1300..=1302 | 1400..=1499 | 1600 | 1601 | 1690..=1699 | 1700)
-        || (matches!(code, 1500..=1599) && code != 1522)
+    let kept = matches!(code, 1300..=1302 | 1400..=1499 | 1600 | 1601 | 1604 | 1605 | 1690..=1699 | 1700 | 2000..=2002)
+        || (matches!(code, 1500..=1599) && !matches!(code, 1522 | 1590 | 1591))
         || (matches!(code, 9100..=9199) && !matches!(code, 9120 | 9121 | 9199));
     if kept {
         return KEPT;
@@ -771,11 +773,12 @@ pub fn priority(code: i32, severity: &str) -> i32 {
 }
 
 /// Which events are merged while they wait, by type: what apps report
-/// (views, shows, copies, fills, exports, notice clicks) and failed logins,
-/// which anyone can make many of. Not what the server records itself, such
-/// as moving items to the trash.
+/// (views, shows, copies, fills, exports, notice clicks), failed logins, and
+/// single sign-on's refusals, which anyone can make many of (anyone can start
+/// a sign-in and send back a bad answer). Not what the server records itself,
+/// such as moving items to the trash.
 pub fn merges(code: i32) -> bool {
-    matches!(code, 1005 | 1006 | 1007 | 1107..=1114 | 1117..=1132 | 1522 | 1602)
+    matches!(code, 1005 | 1006 | 1007 | 1107..=1114 | 1117..=1132 | 1522 | 1591 | 1602)
 }
 
 /// When a paused destination's events are due: not until it's turned on again.
@@ -1153,8 +1156,8 @@ pub fn backoff(attempts: i32) -> TimeDelta {
 }
 
 /// What kind of thing an event is about, its name in words, and how much a
-/// security team should care, by upstream's event type codes. Codes 1190 and
-/// 1690 to 1692 are ours.
+/// security team should care, by upstream's event type codes. Codes 1190,
+/// 1191, 1590, 1591, and 1690 to 1694 are ours.
 pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
     let (name, severity) = match code {
         1000 => ("Logged in", "low"),
@@ -1218,6 +1221,7 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         1506 => ("Enrolled in account recovery", "low"),
         1507 => ("Withdrew from account recovery", "medium"),
         1508 => ("Reset a member's master password", "high"),
+        1510 => ("Linked an account to single sign-on", "high"),
         1511 => ("Revoked a member", "medium"),
         1512 => ("Restored a member", "low"),
         1513 => ("Approved a device for a member", "medium"),
@@ -1226,14 +1230,23 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         1516 => ("Left the organization", "low"),
         1519 => ("Reset a member's two-step login", "high"),
         1522 => ("Opened a notice from the organization", "low"),
+        1590 => ("Signed in with single sign-on", "low"),
+        1591 => ("Single sign-on refused someone", "medium"),
         1600 => ("Edited the organization's settings", "medium"),
         1601 => ("Purged the organization's vault", "high"),
         1602 => ("Exported the organization's vault", "high"),
+        1604 => ("Turned on single sign-on", "high"),
+        1605 => ("Turned off single sign-on", "high"),
         1690 => ("Added a place events are sent", "high"),
         1691 => ("Changed a place events are sent", "high"),
         1692 => ("Removed a place events are sent", "high"),
         1693 => ("The server stopped sending to a place events are sent", "high"),
+        1694 => ("Changed the single sign-on settings", "high"),
         1700 => ("Changed a policy", "medium"),
+        2000 => ("Added a domain for single sign-on", "high"),
+        2001 => ("Removed a domain from single sign-on", "high"),
+        2002 => ("Verified a domain for single sign-on", "high"),
+        2003 => ("Checked a domain that isn't verified yet", "low"),
         crate::keykeeper_streaming::TEST_EVENT_TYPE => ("Test event", "low"),
         _ => ("Event", "low"),
     };
@@ -1243,7 +1256,8 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         1300..=1399 => "folder",
         1400..=1499 => "group",
         1500..=1599 => "member",
-        1600..=1699 => "organization",
+        // 2000 to 2099: single sign-on's domains.
+        1600..=1699 | 2000..=2099 => "organization",
         1700..=1799 => "policy",
         9100..=9199 => "msp",
         crate::keykeeper_streaming::TEST_EVENT_TYPE => "test",
@@ -1277,6 +1291,11 @@ pub async fn event_json(event: &Event, org: &Organization, msp: Option<&Msp>, co
     }
     if let Some(msp) = msp {
         out["msp"] = json!({ "id": msp.uuid, "name": msp.name });
+    }
+    // Single sign-on's events say what changed, which domain, or why someone
+    // was refused (keykeeper_sso): never a secret.
+    if let Some(detail) = &event.keykeeper_detail {
+        out["detail"] = json!(detail);
     }
     out
 }
@@ -1355,17 +1374,19 @@ pub async fn stream(event: &Event, conn: &DbConn) {
     };
     let mut own = event_json(event, &org, None, conn).await;
     // What the code that logged it added for destinations (which destination
-    // changed, and how).
+    // changed, and how, or why single sign-on refused someone).
+    let mut reason = None;
     if let Some((_, extra)) = EVENT_EXTRAS.remove(event.uuid.as_str())
         && let Some(extra) = extra.as_object()
     {
+        reason = extra.get("reason").and_then(Value::as_str).map(str::to_owned);
         for (k, v) in extra {
             own[k] = v.clone();
         }
     }
     let own = own.to_string();
     let rank = priority(event.event_type, describe(event.event_type).2);
-    let merge_key = merge_key(event, Utc::now().timestamp() / 60);
+    let merge_key = merge_key(event, Utc::now().timestamp() / 60, reason.as_deref());
     let for_msp = msp.as_ref().map(|m| {
         let mut v: Value = serde_json::from_str(&own).unwrap_or_default();
         v["msp"] = json!({ "id": m.uuid, "name": m.name });
@@ -1397,14 +1418,16 @@ pub async fn stream(event: &Event, conn: &DbConn) {
 /// the same kind, organization, and person (or account, for failed logins),
 /// in the same minute of the server's clock (an app says when its events
 /// happened, so not theirs). The organization keeps a person in several of
-/// an MSP's clients from merging across them in the MSP's feed.
-fn merge_key(event: &Event, minute: i64) -> Option<String> {
+/// an MSP's clients from merging across them in the MSP's feed. A reason
+/// code (single sign-on's refusals) keeps different reasons apart.
+fn merge_key(event: &Event, minute: i64, reason: Option<&str>) -> Option<String> {
     if !merges(event.event_type) {
         return None;
     }
     let org = event.org_uuid.as_ref().map(ToString::to_string).unwrap_or_default();
     let who = event.act_user_uuid.as_ref().or(event.user_uuid.as_ref()).map(ToString::to_string).unwrap_or_default();
-    Some(format!("{}:{org}:{who}:{minute}", event.event_type))
+    let reason = reason.unwrap_or_default();
+    Some(format!("{}:{org}:{who}:{minute}:{reason}", event.event_type))
 }
 
 /// Fields that the code logging an event adds to what destinations get, by
@@ -1480,6 +1503,14 @@ fn msp_code(action: &str) -> (i32, &'static str, &'static str) {
         "event_stream_changed" => (9171, "Changed a place the MSP's events are sent", "high"),
         "event_stream_removed" => (9172, "Removed a place the MSP's events are sent", "high"),
         "event_stream_paused" => (9173, "Stopped sending to a place that kept failing", "high"),
+        "sso_turned_on" => (9180, "Turned on a client's single sign-on", "high"),
+        "sso_turned_off" => (9181, "Turned off a client's single sign-on", "high"),
+        "sso_settings_changed" => (9182, "Changed a client's single sign-on settings", "high"),
+        "sso_domain_added" => (9183, "Added a domain to a client's single sign-on", "high"),
+        "sso_domain_verified" => (9184, "Verified a domain for a client's single sign-on", "high"),
+        "sso_domain_removed" => (9185, "Removed a domain from a client's single sign-on", "high"),
+        "sso_unlinked" => (9186, "Unlinked someone's single sign-on in a client", "medium"),
+        "sso_api_keys_replaced" => (9187, "Replaced a client's members' API keys for single sign-on", "high"),
         _ => (9199, "MSP activity", "low"),
     }
 }
@@ -1599,6 +1630,47 @@ mod tests {
     }
 
     #[test]
+    fn single_sign_on_events_are_described_and_its_changes_kept() {
+        assert_eq!(describe(1510), ("member", "Linked an account to single sign-on", "high"));
+        assert_eq!(describe(1590), ("member", "Signed in with single sign-on", "low"));
+        assert_eq!(describe(1591), ("member", "Single sign-on refused someone", "medium"));
+        assert_eq!(describe(1604), ("organization", "Turned on single sign-on", "high"));
+        assert_eq!(describe(1605), ("organization", "Turned off single sign-on", "high"));
+        assert_eq!(describe(1694), ("organization", "Changed the single sign-on settings", "high"));
+        for code in [2000, 2001, 2002] {
+            assert_eq!(describe(code).0, "organization", "{code}");
+            assert_eq!(describe(code).2, "high", "{code}");
+        }
+        assert_eq!(describe(2003).2, "low");
+        // Settings, domains, and links are never dropped from a full queue.
+        for code in [1510, 1604, 1605, 1694, 2000, 2001, 2002] {
+            assert_eq!(priority(code, describe(code).2), KEPT, "{code}");
+            assert!(!merges(code), "{code}");
+        }
+        // Sign-ins go by severity, as logins do, and refusals merge, as
+        // failed logins do.
+        assert_eq!(priority(1590, describe(1590).2), 0);
+        assert_eq!(priority(1591, describe(1591).2), 1);
+        assert!(!merges(1590));
+        assert!(merges(1591));
+        // In an MSP's feed, too.
+        for (action, code, severity) in [
+            ("sso_turned_on", 9180, "high"),
+            ("sso_turned_off", 9181, "high"),
+            ("sso_settings_changed", 9182, "high"),
+            ("sso_domain_added", 9183, "high"),
+            ("sso_domain_verified", 9184, "high"),
+            ("sso_domain_removed", 9185, "high"),
+            ("sso_unlinked", 9186, "medium"),
+            ("sso_api_keys_replaced", 9187, "high"),
+        ] {
+            let (c, _, s) = msp_code(action);
+            assert_eq!((c, s), (code, severity), "{action}");
+            assert_eq!(priority(c, s), KEPT, "{action}");
+        }
+    }
+
+    #[test]
     fn events_merge_only_within_one_organization_person_and_minute() {
         let event = |org: &str, user: &str, code: i32| {
             let mut e = Event::new(code, None);
@@ -1607,15 +1679,19 @@ mod tests {
             e.act_user_uuid = Some(user.to_owned().into());
             e
         };
-        let a = merge_key(&event("org-a", "x", 1005), 100).unwrap();
+        let a = merge_key(&event("org-a", "x", 1005), 100, None).unwrap();
         // The same person failing to log in to two of an MSP's clients: two
         // events in the MSP's feed, one per client.
-        assert_ne!(a, merge_key(&event("org-b", "x", 1005), 100).unwrap());
-        assert_ne!(a, merge_key(&event("org-a", "y", 1005), 100).unwrap());
-        assert_ne!(a, merge_key(&event("org-a", "x", 1006), 100).unwrap());
-        assert_ne!(a, merge_key(&event("org-a", "x", 1005), 101).unwrap());
-        assert_eq!(a, merge_key(&event("org-a", "x", 1005), 100).unwrap());
-        assert!(merge_key(&event("org-a", "x", 1502), 100).is_none());
+        assert_ne!(a, merge_key(&event("org-b", "x", 1005), 100, None).unwrap());
+        assert_ne!(a, merge_key(&event("org-a", "y", 1005), 100, None).unwrap());
+        assert_ne!(a, merge_key(&event("org-a", "x", 1006), 100, None).unwrap());
+        assert_ne!(a, merge_key(&event("org-a", "x", 1005), 101, None).unwrap());
+        assert_eq!(a, merge_key(&event("org-a", "x", 1005), 100, None).unwrap());
+        assert!(merge_key(&event("org-a", "x", 1502), 100, None).is_none());
+        // Single sign-on's refusals merge only with refusals for the same reason.
+        let refused = merge_key(&event("org-a", "x", 1591), 100, Some("not_member")).unwrap();
+        assert_eq!(refused, merge_key(&event("org-a", "x", 1591), 100, Some("not_member")).unwrap());
+        assert_ne!(refused, merge_key(&event("org-a", "x", 1591), 100, Some("microsoft_refused")).unwrap());
     }
 
     #[test]

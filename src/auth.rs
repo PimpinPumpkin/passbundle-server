@@ -103,8 +103,11 @@ pub async fn initialize_keys() -> Result<(), Error> {
     }
 
     // Keykeeper: the key for event destinations' secrets at rest, derived the
-    // same way, from the key's DER so another PEM form of it gives the same key.
-    crate::keykeeper_streaming::secrets::init(&zeroize::Zeroizing::new(priv_key.private_key_to_der()?));
+    // same way, from the key's DER so another PEM form of it gives the same key,
+    // and another for single sign-on's client secrets.
+    let priv_key_der = zeroize::Zeroizing::new(priv_key.private_key_to_der()?);
+    crate::keykeeper_streaming::secrets::init(&priv_key_der);
+    crate::api::core::keykeeper_sso::secret::init(&priv_key_der);
 
     // Derived from the RSA key, so it stays the same across restarts without storing another secret
     let prelogin_kdf_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &priv_key_buffer), b"prelogin-kdf");
@@ -1505,9 +1508,23 @@ pub async fn refresh_tokens(
         AuthMethod::Sso if CONFIG.sso_enabled() => {
             sso::exchange_refresh_token(&device, &user, client_id, refresh_claims).await?
         }
-        AuthMethod::Sso => err!("SSO is now disabled, Login again using email and master password"),
         AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
-        AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
+        // Keykeeper: a session an organization's single sign-on started goes on
+        // only while the account is still linked where single sign-on is on
+        // (unlinking, a tenant change, and turning it off end it).
+        AuthMethod::Sso if !crate::api::core::keykeeper_sso::sso_session_live(&user.uuid, conn).await => {
+            err!("Single sign-on no longer signs in this account. Sign in again.")
+        }
+        // Keykeeper: someone an organization now requires to sign in with its
+        // single sign-on signs in again, there.
+        AuthMethod::Password
+            if crate::api::core::keykeeper_sso::required_identifier(&user.uuid, conn).await.is_some() =>
+        {
+            err!("Your organization requires you to sign in with single sign-on. Sign in again.")
+        }
+        // Keykeeper: an organization's own single sign-on proves who someone
+        // is once; the session is PassBundle's own, as for a password.
+        AuthMethod::Sso | AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
         _ => err!("Invalid auth method, cannot refresh token"),
     };
 
