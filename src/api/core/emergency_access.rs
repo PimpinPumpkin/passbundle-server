@@ -6,7 +6,7 @@ use crate::{
     CONFIG,
     api::{
         EmptyResult, JsonResult,
-        core::{CipherSyncData, CipherSyncType},
+        core::{CipherSyncData, CipherSyncType, keykeeper_device_approval::SignInMethod},
     },
     auth::{Headers, decode_emergency_access_invite},
     db::{
@@ -19,6 +19,23 @@ use crate::{
     mail,
     util::NumberOrString,
 };
+
+/// Keykeeper: who may use emergency access, on either side: a grantor
+/// inviting an emergency contact, changing a grant, confirming one, or
+/// approving a takeover early, and a grantee starting one, taking over, or
+/// setting the new master password. Only a session that signed in with the
+/// master password or an organization's single sign-on, not one a device's
+/// approval began (nor an API key's), so one mistaken approval can't set up,
+/// or start, a takeover (DESIGN.md, "Approving a sign-in from another
+/// device").
+fn proved_session(signed_in: &SignInMethod) -> EmptyResult {
+    if !signed_in.proved_who_they_are() {
+        err!(
+            "Use emergency access from a device where you signed in with your master password or single sign-on, not one another device approved"
+        )
+    }
+    Ok(())
+}
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -117,9 +134,10 @@ async fn put_emergency_access(
     emer_id: EmergencyAccessId,
     data: Json<EmergencyAccessUpdateData>,
     headers: Headers,
+    signed_in: SignInMethod,
     conn: DbConn,
 ) -> JsonResult {
-    post_emergency_access(emer_id, data, headers, conn).await
+    post_emergency_access(emer_id, data, headers, signed_in, conn).await
 }
 
 #[post("/emergency-access/<emer_id>", data = "<data>")]
@@ -127,9 +145,11 @@ async fn post_emergency_access(
     emer_id: EmergencyAccessId,
     data: Json<EmergencyAccessUpdateData>,
     headers: Headers,
+    signed_in: SignInMethod,
     conn: DbConn,
 ) -> JsonResult {
     check_emergency_access_enabled()?;
+    proved_session(&signed_in)?;
 
     let data: EmergencyAccessUpdateData = data.into_inner();
 
@@ -200,8 +220,14 @@ struct EmergencyAccessInviteData {
 }
 
 #[post("/emergency-access/invite", data = "<data>")]
-async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn send_invite(
+    data: Json<EmergencyAccessInviteData>,
+    headers: Headers,
+    signed_in: SignInMethod,
+    conn: DbConn,
+) -> EmptyResult {
     check_emergency_access_enabled()?;
+    proved_session(&signed_in)?;
 
     let data: EmergencyAccessInviteData = data.into_inner();
     let email = data.email.to_lowercase();
@@ -394,9 +420,11 @@ async fn confirm_emergency_access(
     emer_id: EmergencyAccessId,
     data: Json<ConfirmData>,
     headers: Headers,
+    signed_in: SignInMethod,
     conn: DbConn,
 ) -> JsonResult {
     check_emergency_access_enabled()?;
+    proved_session(&signed_in)?;
 
     let confirming_user = headers.user;
     let data: ConfirmData = data.into_inner();
@@ -443,8 +471,14 @@ async fn confirm_emergency_access(
 // region access emergency access
 
 #[post("/emergency-access/<emer_id>/initiate")]
-async fn initiate_emergency_access(emer_id: EmergencyAccessId, headers: Headers, conn: DbConn) -> JsonResult {
+async fn initiate_emergency_access(
+    emer_id: EmergencyAccessId,
+    headers: Headers,
+    signed_in: SignInMethod,
+    conn: DbConn,
+) -> JsonResult {
     check_emergency_access_enabled()?;
+    proved_session(&signed_in)?;
 
     let initiating_user = headers.user;
     let Some(mut emergency_access) =
@@ -481,8 +515,14 @@ async fn initiate_emergency_access(emer_id: EmergencyAccessId, headers: Headers,
 }
 
 #[post("/emergency-access/<emer_id>/approve")]
-async fn approve_emergency_access(emer_id: EmergencyAccessId, headers: Headers, conn: DbConn) -> JsonResult {
+async fn approve_emergency_access(
+    emer_id: EmergencyAccessId,
+    headers: Headers,
+    signed_in: SignInMethod,
+    conn: DbConn,
+) -> JsonResult {
     check_emergency_access_enabled()?;
+    proved_session(&signed_in)?;
 
     let Some(mut emergency_access) =
         EmergencyAccess::find_by_uuid_and_grantor_uuid(&emer_id, &headers.user.uuid, &conn).await
@@ -591,8 +631,14 @@ async fn view_emergency_access(emer_id: EmergencyAccessId, headers: Headers, con
 }
 
 #[post("/emergency-access/<emer_id>/takeover")]
-async fn takeover_emergency_access(emer_id: EmergencyAccessId, headers: Headers, conn: DbConn) -> JsonResult {
+async fn takeover_emergency_access(
+    emer_id: EmergencyAccessId,
+    headers: Headers,
+    signed_in: SignInMethod,
+    conn: DbConn,
+) -> JsonResult {
     check_emergency_access_enabled()?;
+    proved_session(&signed_in)?;
 
     let requesting_user = headers.user;
     let Some(emergency_access) =
@@ -633,9 +679,11 @@ async fn password_emergency_access(
     emer_id: EmergencyAccessId,
     data: Json<EmergencyAccessPasswordData>,
     headers: Headers,
+    signed_in: SignInMethod,
     conn: DbConn,
 ) -> EmptyResult {
     check_emergency_access_enabled()?;
+    proved_session(&signed_in)?;
 
     let data: EmergencyAccessPasswordData = data.into_inner();
     let new_master_password_hash = &data.new_master_password_hash;

@@ -238,6 +238,14 @@ pub struct LoginJwtClaims {
     pub scope: Vec<String>,
     // [ "Application" ]
     pub amr: Vec<String>,
+
+    // Keykeeper: how this session signed in, as its refresh token keeps it
+    // (the master password, a device's approval, SSO, or an API key). Only a
+    // session that signed in with the master password approves another
+    // device's sign-in (DESIGN.md, "Approving a sign-in from another
+    // device"); one that doesn't say (None) can't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keykeeper_signin: Option<AuthMethod>,
 }
 
 impl LoginJwtClaims {
@@ -293,20 +301,24 @@ impl LoginJwtClaims {
             client_id: client_id.unwrap_or("undefined".to_owned()),
             scope,
             amr: vec!["Application".into()],
+            keykeeper_signin: None,
         }
     }
 
     pub fn default(device: &Device, user: &User, auth_method: &AuthMethod, client_id: Option<String>) -> Self {
         let time_now = Utc::now();
-        Self::new(
-            device,
-            user,
-            time_now.timestamp(),
-            (time_now + *DEFAULT_ACCESS_VALIDITY).timestamp(),
-            auth_method.scope_vec(),
-            client_id,
-            time_now,
-        )
+        Self {
+            keykeeper_signin: Some(auth_method.clone()),
+            ..Self::new(
+                device,
+                user,
+                time_now.timestamp(),
+                (time_now + *DEFAULT_ACCESS_VALIDITY).timestamp(),
+                auth_method.scope_vec(),
+                client_id,
+                time_now,
+            )
+        }
     }
 
     pub fn token(&self) -> String {
@@ -1377,6 +1389,10 @@ pub enum AuthMethod {
     Password,
     Sso,
     UserApiKey,
+    /// Keykeeper: the password grant with an approved sign-in request (a
+    /// device's approval) instead of the master password. It refreshes like
+    /// a password session, and never approves another sign-in.
+    AuthRequest,
 }
 
 impl AuthMethod {
@@ -1384,7 +1400,7 @@ impl AuthMethod {
         match self {
             AuthMethod::OrgApiKey => "api.organization".to_owned(),
             AuthMethod::UserApiKey => "api".to_owned(),
-            AuthMethod::Password | AuthMethod::Sso => "api offline_access".to_owned(),
+            AuthMethod::Password | AuthMethod::Sso | AuthMethod::AuthRequest => "api offline_access".to_owned(),
         }
     }
 
@@ -1508,7 +1524,9 @@ pub async fn refresh_tokens(
         AuthMethod::Sso if CONFIG.sso_enabled() => {
             sso::exchange_refresh_token(&device, &user, client_id, refresh_claims).await?
         }
-        AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
+        AuthMethod::Password | AuthMethod::AuthRequest if CONFIG.sso_enabled() && CONFIG.sso_only() => {
+            err!("SSO is now required, Login again")
+        }
         // Keykeeper: a session an organization's single sign-on started goes on
         // only while the account is still linked where single sign-on is on
         // (unlinking, a tenant change, and turning it off end it).
@@ -1516,15 +1534,20 @@ pub async fn refresh_tokens(
             err!("Single sign-on no longer signs in this account. Sign in again.")
         }
         // Keykeeper: someone an organization now requires to sign in with its
-        // single sign-on signs in again, there.
-        AuthMethod::Password
+        // single sign-on signs in again, there, whether their session started
+        // with the master password or with a device's approval.
+        AuthMethod::Password | AuthMethod::AuthRequest
             if crate::api::core::keykeeper_sso::required_identifier(&user.uuid, conn).await.is_some() =>
         {
             err!("Your organization requires you to sign in with single sign-on. Sign in again.")
         }
         // Keykeeper: an organization's own single sign-on proves who someone
-        // is once; the session is PassBundle's own, as for a password.
-        AuthMethod::Sso | AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
+        // is once; the session is PassBundle's own, as for a password. A
+        // session from a device's approval refreshes as a password's does, and
+        // keeps saying how it began.
+        AuthMethod::Sso | AuthMethod::Password | AuthMethod::AuthRequest => {
+            AuthTokens::new(&device, &user, refresh_claims.sub, client_id)
+        }
         _ => err!("Invalid auth method, cannot refresh token"),
     };
 

@@ -22,8 +22,8 @@ use crate::{
         models::{
             AuthRequest, AuthRequestId, Cipher, CipherId, CipherVersion, Device, DeviceId, DeviceType,
             DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation,
-            ItemSave, KeyId, Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send,
-            SendId, User, UserId, UserKdfType, UserSettings,
+            ItemSave, KeyId, MAX_PENDING_AUTH_REQUESTS, Membership, MembershipId, OrgPolicy, OrgPolicyType,
+            Organization, OrganizationId, Send, SendId, User, UserId, UserKdfType, UserSettings,
         },
     },
     mail,
@@ -32,6 +32,7 @@ use crate::{
 
 use super::{
     ciphers::{CipherData, update_cipher_from_data},
+    keykeeper_device_approval::{SignInMethod, valid_access_code, valid_approval_key, valid_public_key},
     sends::SendData,
 };
 
@@ -1688,6 +1689,14 @@ async fn post_auth_request(
 
     let data = data.into_inner();
 
+    // Keykeeper: a request counts against the account's own login limits,
+    // as a password would (DESIGN.md, "Login limits"), and holds what a
+    // request should: a public key and an access code of sensible sizes.
+    crate::ratelimit::check_limit_login_account(&data.email, &client_headers.ip.ip)?;
+    if !valid_public_key(&data.public_key) || !valid_access_code(&data.access_code) {
+        err!("That sign-in request isn't one PassBundle can use")
+    }
+
     let Some(user) = User::find_by_mail(&data.email, &conn).await else {
         err!("AuthRequest doesn't exist", "User not found")
     };
@@ -1697,6 +1706,20 @@ async fn post_auth_request(
         Some(device) if device.atype == client_headers.device_type => device,
         _ => err!("AuthRequest doesn't exist", "Device verification failed"),
     };
+
+    // Keykeeper: a device asks a few times an hour at most, so "Resend"
+    // can't keep the account's devices prompting.
+    crate::ratelimit::check_limit_auth_request_device(&user.uuid, &device.uuid)?;
+
+    // Keykeeper: a device's new request replaces the one it had waiting
+    // ("resend"), and an account has a few waiting at most, so nobody can
+    // fill its devices' lists. See DESIGN.md, "Approving a sign-in from
+    // another device".
+    AuthRequest::delete_pending_from_device(&user.uuid, &device.uuid, &conn).await?;
+    let waiting = AuthRequest::find_pending_by_user(&user.uuid, Utc::now().naive_utc(), &conn).await;
+    if waiting.len() >= MAX_PENDING_AUTH_REQUESTS {
+        err_code!("Too many sign-in requests are waiting for this account. Answer them, or wait 15 minutes.", 429)
+    }
 
     let auth_request = AuthRequest::new(
         user.uuid.clone(),
@@ -1736,10 +1759,17 @@ async fn post_auth_request(
 
 #[get("/auth-requests/<auth_request_id>")]
 async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn: DbConn) -> JsonResult {
+    // Keykeeper: with the requesting device's identifier, as upstream's
+    // answer has it, so the apps prompt once per device (a "Resend" replaces
+    // the request in place).
     let Some(auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
         err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
     };
+    // Keykeeper: an expired request is gone.
+    if auth_request.is_expired() {
+        err_code!("This sign-in request has expired", 404)
+    }
 
     let response_date_utc = auth_request.response_date.map(|response_date| format_date(&response_date));
 
@@ -1747,9 +1777,11 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
         "id": &auth_request_id,
         "publicKey": auth_request.public_key,
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
+        "requestDeviceIdentifier": auth_request.request_device_identifier,
         "requestIpAddress": auth_request.request_ip,
         "key": auth_request.enc_key,
-        "masterPasswordHash": auth_request.master_password_hash,
+        // Keykeeper: never a master password hash.
+        "masterPasswordHash": null,
         "creationDate": format_date(&auth_request.creation_date),
         "responseDate": response_date_utc,
         "requestApproved": auth_request.approved,
@@ -1762,8 +1794,9 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
 #[serde(rename_all = "camelCase")]
 struct AuthResponseRequest {
     device_identifier: DeviceId,
-    key: String,
-    master_password_hash: Option<String>,
+    // Keykeeper: only an approval needs the key; a denial needn't send one.
+    // A master password hash, which upstream's clients may send, is ignored.
+    key: Option<String>,
     request_approved: bool,
 }
 
@@ -1772,6 +1805,7 @@ async fn put_auth_request(
     auth_request_id: AuthRequestId,
     data: Json<AuthResponseRequest>,
     headers: Headers,
+    signed_in: SignInMethod,
     conn: DbConn,
     ant: AnonymousNotify<'_>,
     nt: Notify<'_>,
@@ -1786,8 +1820,30 @@ async fn put_auth_request(
         err!("AuthRequest doesn't exist", "Device verification failed")
     }
 
+    // Keykeeper: an expired request is gone.
+    if auth_request.is_expired() {
+        err_code!("This sign-in request has expired", 404)
+    }
+
     if auth_request.approved.is_some() {
         err!("An authentication request with the same device already exists")
+    }
+
+    // Keykeeper: a device never answers its own request, and only a device
+    // that signed in with the master password approves one: not a session
+    // that itself came from an approval, an API key, or SSO. The key must
+    // be an encrypted string. See DESIGN.md, "Approving a sign-in from
+    // another device".
+    if auth_request.request_device_identifier == headers.device.uuid {
+        err!("A device can't answer its own sign-in request")
+    }
+    if data.request_approved {
+        if !signed_in.is_master_password() {
+            err!("Approve sign-ins from a device where you signed in with your master password")
+        }
+        if !data.key.as_deref().is_some_and(valid_approval_key) {
+            err!("That approval doesn't carry a key PassBundle can use")
+        }
     }
 
     let response_date = Utc::now().naive_utc();
@@ -1795,8 +1851,10 @@ async fn put_auth_request(
 
     if data.request_approved {
         auth_request.approved = Some(data.request_approved);
-        auth_request.enc_key = Some(data.key);
-        auth_request.master_password_hash = data.master_password_hash;
+        auth_request.enc_key = data.key;
+        // Keykeeper: an approval carries the user key and nothing else: no
+        // master password hash is kept, whatever a client sends.
+        auth_request.master_password_hash = None;
         auth_request.response_device_id = Some(data.device_identifier.clone());
         auth_request.response_date = Some(response_date);
         auth_request.save(&conn).await?;
@@ -1831,7 +1889,8 @@ async fn put_auth_request(
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestIpAddress": auth_request.request_ip,
         "key": auth_request.enc_key,
-        "masterPasswordHash": auth_request.master_password_hash,
+        // Keykeeper: never a master password hash.
+        "masterPasswordHash": null,
         "creationDate": format_date(&auth_request.creation_date),
         "responseDate": response_date_utc,
         "requestApproved": auth_request.approved,
@@ -1856,6 +1915,8 @@ async fn get_auth_request_response(
     if auth_request.device_type != client_headers.device_type
         || auth_request.request_ip != client_headers.ip.ip.to_string()
         || !auth_request.check_access_code(code)
+        // Keykeeper: an expired request is gone.
+        || auth_request.is_expired()
     {
         err!("AuthRequest doesn't exist", "Invalid device, IP or code")
     }
@@ -1868,7 +1929,8 @@ async fn get_auth_request_response(
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestIpAddress": auth_request.request_ip,
         "key": auth_request.enc_key,
-        "masterPasswordHash": auth_request.master_password_hash,
+        // Keykeeper: never a master password hash.
+        "masterPasswordHash": null,
         "creationDate": format_date(&auth_request.creation_date),
         "responseDate": response_date_utc,
         "requestApproved": auth_request.approved,
@@ -1886,12 +1948,14 @@ async fn get_auth_requests(headers: Headers, conn: DbConn) -> JsonResult {
 
 #[get("/auth-requests/pending")]
 async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult {
-    let auth_requests = AuthRequest::find_by_user(&headers.user.uuid, &conn).await;
+    // Keykeeper: the requests still waiting, newest first, from the account's
+    // other devices: an expired one is gone, and a device doesn't answer its own.
+    let auth_requests = AuthRequest::find_pending_by_user(&headers.user.uuid, Utc::now().naive_utc(), &conn).await;
 
     Ok(Json(json!({
         "data": auth_requests
             .iter()
-            .filter(|request| request.approved.is_none())
+            .filter(|request| request.request_device_identifier != headers.device.uuid)
             .map(|request| {
             let response_date_utc = request.response_date.map(|response_date| format_date(&response_date));
 
@@ -1899,9 +1963,10 @@ async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult
                 "id": request.uuid,
                 "publicKey": request.public_key,
                 "requestDeviceType": DeviceType::from_i32(request.device_type).to_string(),
+                "requestDeviceIdentifier": request.request_device_identifier,
                 "requestIpAddress": request.request_ip,
                 "key": request.enc_key,
-                "masterPasswordHash": request.master_password_hash,
+                "masterPasswordHash": null,
                 "creationDate": format_date(&request.creation_date),
                 "responseDate": response_date_utc,
                 "requestApproved": request.approved,
