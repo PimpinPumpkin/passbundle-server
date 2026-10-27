@@ -99,9 +99,25 @@ pub fn callback_uri() -> String {
 }
 
 /// Where the web vault and the browser extension want the answer: the web
-/// vault's SSO connector page. Nothing else is accepted.
+/// vault's SSO connector page.
 fn connector_uri() -> String {
     format!("{}/sso-connector.html", CONFIG.domain())
+}
+
+/// Where the answer may go, by app: the web vault's SSO connector page for
+/// the web vault and the browser extension; for the command-line tool, its
+/// own listener on the computer it runs on, exactly as upstream's tool asks
+/// for it (`http://localhost:<port>`, the first free port of 8065 to 8070), as
+/// a native app's loopback redirect (RFC 8252). Nothing else is accepted.
+/// The code the answer carries works only with the app's PKCE verifier, the
+/// same client, and the same redirect URI (`redeem_code`).
+fn redirect_allowed(client_id: &str, redirect_uri: &str) -> Result<(), &'static str> {
+    match client_id {
+        "web" | "browser" if redirect_uri == connector_uri() => Ok(()),
+        "cli" if (8065..=8070).any(|port| redirect_uri == format!("http://localhost:{port}")) => Ok(()),
+        "web" | "browser" | "cli" => Err("Unsupported redirect URI"),
+        _ => Err("Single sign-on works from the web vault, the browser extension, and the command-line tool."),
+    }
 }
 
 /// The most email domains one organization may add.
@@ -1045,11 +1061,8 @@ pub async fn authorize(a: Authorize, cookies: &CookieJar<'_>, ip: &IpAddr, conn:
     // address, with the allowance pre-login gets.
     crate::ratelimit::check_limit_prelogin(ip)?;
     SsoAuthRow::purge_expired(conn).await;
-    if a.client_id != "web" && a.client_id != "browser" {
-        err!("Single sign-on works from the web vault and the browser extension.")
-    }
-    if a.redirect_uri != connector_uri() {
-        err!("Unsupported redirect URI")
+    if let Err(refused) = redirect_allowed(&a.client_id, &a.redirect_uri) {
+        err!(refused)
     }
     if a.code_challenge_method != "S256" || !looks_like_challenge(&a.code_challenge) {
         err!("Unsupported code challenge")
@@ -1588,6 +1601,36 @@ mod tests {
         assert!(looks_like_challenge("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
         for bad in ["", "short", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c=", &"a".repeat(44)] {
             assert!(!looks_like_challenge(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn each_app_gets_the_answer_only_where_it_listens() {
+        let connector = connector_uri();
+        assert_eq!(redirect_allowed("web", &connector), Ok(()));
+        assert_eq!(redirect_allowed("browser", &connector), Ok(()));
+        for port in 8065..=8070 {
+            assert_eq!(redirect_allowed("cli", &format!("http://localhost:{port}")), Ok(()));
+        }
+        for (client, uri) in [
+            ("cli", connector.as_str()),
+            ("cli", "http://localhost:8064"),
+            ("cli", "http://localhost:8071"),
+            ("cli", "http://localhost:8065/"),
+            ("cli", "http://localhost:8065/callback"),
+            ("cli", "http://localhost:8065?x=1"),
+            ("cli", "https://localhost:8065"),
+            ("cli", "http://127.0.0.1:8065"),
+            ("cli", "http://localhost.example.com:8065"),
+            ("cli", "http://localhost:8065@evil.example"),
+            ("web", "http://localhost:8065"),
+            ("browser", "http://localhost:8065"),
+            ("web", "https://evil.example/sso-connector.html"),
+        ] {
+            assert_eq!(redirect_allowed(client, uri), Err("Unsupported redirect URI"), "{client} {uri}");
+        }
+        for client in ["desktop", "mobile", "connector", ""] {
+            assert!(redirect_allowed(client, &connector).is_err(), "{client}");
         }
     }
 
