@@ -440,14 +440,18 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     let username = data.username.as_ref().unwrap().trim();
     let log_username = username.escape_debug();
     let found = User::find_by_mail(username, conn).await;
-    // Keykeeper: and the account's own limits, whether or not it exists,
-    // except for a device already signed in to it, so its owner's own devices
-    // always get through. See DESIGN.md, "Login limits".
+    // Keykeeper: and the account's own limits, whether or not it exists. A
+    // device already signed in to it gets a limit of its own across the
+    // account instead, so its owner's own devices get through guesses from
+    // elsewhere, but a device id, which isn't secret, doesn't mean unlimited
+    // guesses. See DESIGN.md, "Login limits".
     let known_device = match (&found, data.device_identifier.as_ref()) {
         (Some(user), Some(device)) => Device::find_by_uuid_and_user(device, &user.uuid, conn).await.is_some(),
         _ => false,
     };
-    if !known_device {
+    if known_device {
+        crate::ratelimit::check_limit_login_known_device(username)?;
+    } else {
         crate::ratelimit::check_limit_login_account(username, &ip.ip)?;
     }
     let Some(mut user) = found else {

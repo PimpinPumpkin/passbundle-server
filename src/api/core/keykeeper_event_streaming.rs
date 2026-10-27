@@ -19,7 +19,7 @@ use rocket::{Route, http::Status, serde::json::Json};
 use serde_json::{Value, json};
 
 use crate::{
-    api::{EmptyResult, JsonResult},
+    api::{EmptyResult, JsonResult, PasswordOrOtpData},
     auth::Headers,
     db::{
         DbConn,
@@ -257,6 +257,10 @@ struct DestinationData {
     webhook: Option<WebhookData>,
     syslog: Option<SyslogData>,
     sentinel: Option<SentinelData>,
+    /// The caller's master password or a one-time code: adding or changing a
+    /// destination needs it (DESIGN.md, "Confirming sensitive changes").
+    #[serde(flatten)]
+    verification: PasswordOrOtpData,
 }
 
 const MAX_CA: usize = 16 * 1024;
@@ -623,6 +627,7 @@ async fn record(
 }
 
 async fn create(scope: Scope, data: DestinationData, headers: &Headers, conn: &DbConn) -> JsonResult {
+    data.verification.confirm_change(&headers.user, conn).await?;
     let name = clean_name(data.name.as_deref().unwrap_or_default())?;
     let Some(kind) = data.kind.as_deref().and_then(EventKind::from_str) else {
         err!("The kind is webhook, syslog, or sentinel")
@@ -674,6 +679,7 @@ fn opened(d: &EventDestination) -> EventSecrets {
 
 async fn update(scope: Scope, id: &str, data: DestinationData, headers: &Headers, conn: &DbConn) -> JsonResult {
     let mut d = find_in(&scope, id, conn).await?;
+    data.verification.confirm_change(&headers.user, conn).await?;
     let Some(kind) = d.kind() else {
         err!("Unknown kind of destination")
     };
@@ -788,8 +794,15 @@ async fn delete(scope: Scope, id: &str, headers: &Headers, conn: &DbConn) -> Emp
 }
 
 /// A new signing secret for a webhook, shown once. The old one stops working.
-async fn new_secret(scope: Scope, id: &str, headers: &Headers, conn: &DbConn) -> JsonResult {
+async fn new_secret(
+    scope: Scope,
+    id: &str,
+    verification: &PasswordOrOtpData,
+    headers: &Headers,
+    conn: &DbConn,
+) -> JsonResult {
     let mut d = find_in(&scope, id, conn).await?;
+    verification.confirm_change(&headers.user, conn).await?;
     if d.kind() != Some(EventKind::Webhook) {
         err!("Only webhooks have a signing secret")
     }
@@ -908,10 +921,16 @@ async fn test_org(org_id: OrganizationId, id: &str, headers: Headers, conn: DbCo
     test(scope, &checked_id(id)?, &headers, conn).await
 }
 
-#[post("/keykeeper/organizations/<org_id>/event-streaming/<id>/secret")]
-async fn new_secret_org(org_id: OrganizationId, id: &str, headers: Headers, conn: DbConn) -> JsonResult {
+#[post("/keykeeper/organizations/<org_id>/event-streaming/<id>/secret", data = "<data>")]
+async fn new_secret_org(
+    org_id: OrganizationId,
+    id: &str,
+    data: Option<Json<PasswordOrOtpData>>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
     let scope = require_org_manager(&org_id, &headers, &conn).await?;
-    new_secret(scope, &checked_id(id)?, &headers, &conn).await
+    new_secret(scope, &checked_id(id)?, &data.map(Json::into_inner).unwrap_or_default(), &headers, &conn).await
 }
 
 // MSPs
@@ -952,10 +971,16 @@ async fn test_msp(msp_id: MspId, id: &str, headers: Headers, conn: DbConn) -> Js
     test(scope, &checked_id(id)?, &headers, conn).await
 }
 
-#[post("/keykeeper/msp/<msp_id>/event-streaming/<id>/secret")]
-async fn new_secret_msp(msp_id: MspId, id: &str, headers: Headers, conn: DbConn) -> JsonResult {
+#[post("/keykeeper/msp/<msp_id>/event-streaming/<id>/secret", data = "<data>")]
+async fn new_secret_msp(
+    msp_id: MspId,
+    id: &str,
+    data: Option<Json<PasswordOrOtpData>>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
     let scope = require_msp_admin(&msp_id, &headers, &conn).await?;
-    new_secret(scope, &checked_id(id)?, &headers, &conn).await
+    new_secret(scope, &checked_id(id)?, &data.map(Json::into_inner).unwrap_or_default(), &headers, &conn).await
 }
 
 #[cfg(test)]

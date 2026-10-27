@@ -21,12 +21,19 @@ use crate::{
 
 use super::{Cipher, CipherId, UserId};
 
-/// The newest versions an item always keeps, every one of them.
+/// The newest versions an item keeps, every one of them.
 pub const KEEP_NEWEST: usize = 20;
 /// The most versions an item keeps: the newest, then one a day.
 pub const MAX_VERSIONS: usize = 100;
-/// The most an item's versions take together, encrypted.
+/// The most each of an item's two kinds of versions take, encrypted: its
+/// newest, and its one a day. Each kind has a budget of its own, so the
+/// newest, however big, never push out the days before them.
 pub const MAX_HISTORY_BYTES: i64 = 4 * 1024 * 1024;
+/// A version this big or smaller is kept even when its organization's history
+/// is full: real items are a few KB, and a note is at most 10,000
+/// characters, so filling an organization's history with big saves can't
+/// stop a normal item's history.
+pub const ALWAYS_KEPT_BYTES: i32 = 64 * 1024;
 /// The largest item the server saves, encrypted and without attachments,
 /// which are stored apart. Real items are a few KB; a note is at most
 /// 10,000 characters.
@@ -195,7 +202,9 @@ impl CipherVersion {
                         version.saved_by = saved_by.flatten();
                         version.replaced_by = Some(by.clone());
                         version.replaced_at = cipher.updated_at;
-                        if usize::try_from(version.size).unwrap_or(usize::MAX) <= MAX_ITEM_BYTES {
+                        if usize::try_from(version.size).unwrap_or(usize::MAX) <= MAX_ITEM_BYTES
+                            && !org_history_full(cipher, version.size, conn)?
+                        {
                             diesel::insert_into(keykeeper_cipher_versions::table).values(&*version).execute(conn)?;
                             trim(&cipher.uuid, conn)?;
                         }
@@ -346,6 +355,42 @@ impl CipherVersion {
     }
 }
 
+/// Whether keeping a version of this size would take an organization's item
+/// history past ORG_ITEM_HISTORY_LIMIT. Versions of ALWAYS_KEPT_BYTES or less
+/// are kept anyway, and personal items have no such limit.
+fn org_history_full(
+    cipher: &Cipher,
+    size: i32,
+    conn: &mut crate::db::DbConnInner,
+) -> Result<bool, diesel::result::Error> {
+    let Some(org) = &cipher.organization_uuid else {
+        return Ok(false);
+    };
+    if size <= ALWAYS_KEPT_BYTES {
+        return Ok(false);
+    }
+    let limit = crate::CONFIG.org_item_history_limit().saturating_mul(1024);
+    // Only big saves get here, so this rarely runs.
+    let items: Vec<CipherId> =
+        ciphers::table.filter(ciphers::organization_uuid.eq(org)).select(ciphers::uuid).load(conn)?;
+    let mut used = 0i64;
+    for chunk in items.chunks(500) {
+        let sum: Option<i64> = keykeeper_cipher_versions::table
+            .filter(keykeeper_cipher_versions::cipher_uuid.eq_any(chunk))
+            .select(diesel::dsl::sum(keykeeper_cipher_versions::size))
+            .first(conn)?;
+        used = used.saturating_add(sum.unwrap_or(0));
+    }
+    let full = used.saturating_add(i64::from(size)) > limit;
+    if full {
+        warn!(
+            "Item history of organization {org} is full (ORG_ITEM_HISTORY_LIMIT): an edit of item {} kept no version of {size} bytes",
+            cipher.uuid
+        );
+    }
+    Ok(full)
+}
+
 /// Forgets the versions an item no longer keeps (see `to_forget`).
 fn trim(cipher: &CipherId, conn: &mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> {
     let kept: Vec<(String, NaiveDateTime, i32)> = keykeeper_cipher_versions::table
@@ -366,36 +411,32 @@ fn trim(cipher: &CipherId, conn: &mut crate::db::DbConnInner) -> Result<(), dies
 }
 
 /// Of an item's versions newest first (id, when replaced, size), the ones to
-/// forget. An item keeps its newest KEEP_NEWEST versions, every one; before
-/// those, one a day (UTC): the first that day's edits replaced, so the item
-/// as it was before them. Then at most MAX_VERSIONS and MAX_HISTORY_BYTES,
-/// newest first. A burst of saves, however many, can push out only the
-/// newest tier, never the days before it.
+/// forget. An item keeps two kinds of versions, each within a budget of its
+/// own: its newest KEEP_NEWEST versions, every one, within MAX_HISTORY_BYTES;
+/// and before those, one a day (UTC), the first that day's edits replaced, so
+/// the item as it was before them, at most MAX_VERSIONS in all and within
+/// MAX_HISTORY_BYTES of their own, newest first. A burst of saves, however
+/// many and however big, can push out only the newest, never the days before
+/// them: those make room only for later days.
 fn to_forget(newest_first: &[(String, NaiveDateTime, i32)]) -> Vec<String> {
-    let mut keep = vec![false; newest_first.len()];
-    for k in keep.iter_mut().take(KEEP_NEWEST) {
-        *k = true;
-    }
+    let newest: Vec<usize> = (0..newest_first.len().min(KEEP_NEWEST)).collect();
     // Newest first, so the last one seen of each day is its first replaced.
     let mut first_of_day: HashMap<NaiveDate, usize> = HashMap::new();
     for (i, (_, replaced_at, _)) in newest_first.iter().enumerate().skip(KEEP_NEWEST) {
         first_of_day.insert(replaced_at.date(), i);
     }
-    for i in first_of_day.into_values() {
-        keep[i] = true;
-    }
+    let mut days: Vec<usize> = first_of_day.into_values().collect();
+    days.sort_unstable();
 
-    let (mut count, mut bytes, mut full) = (0usize, 0i64, false);
-    for (i, (_, _, size)) in newest_first.iter().enumerate() {
-        if !keep[i] {
-            continue;
-        }
-        if full || count + 1 > MAX_VERSIONS || bytes + i64::from(*size) > MAX_HISTORY_BYTES {
-            full = true;
-            keep[i] = false;
-        } else {
-            count += 1;
-            bytes += i64::from(*size);
+    let mut keep = vec![false; newest_first.len()];
+    for (kind, most) in [(newest, KEEP_NEWEST), (days, MAX_VERSIONS - KEEP_NEWEST)] {
+        let mut bytes = 0i64;
+        for (count, i) in kind.into_iter().enumerate() {
+            bytes += i64::from(newest_first[i].2);
+            if count >= most || bytes > MAX_HISTORY_BYTES {
+                break;
+            }
+            keep[i] = true;
         }
     }
     newest_first.iter().zip(keep).filter(|(_, k)| !k).map(|((id, _, _), _)| id.clone()).collect()
@@ -487,6 +528,32 @@ mod tests {
         let mut expected: Vec<String> = (40..60).rev().map(|m| format!("burst-{m}")).collect();
         expected.extend(["burst-0", "21-early", "20-only"].map(String::from));
         assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn big_saves_cant_push_out_the_days_before_them() {
+        // An editor who can't delete or see history saves a big item over
+        // and over: the newest versions fill their budget, but the item as it
+        // was on each earlier day stays, and so does the item before the burst.
+        let big = i32::try_from(MAX_ITEM_BYTES).unwrap();
+        let mut list: Vec<(String, NaiveDateTime, i32)> =
+            (0..40).rev().map(|m| (format!("big-{m}"), at(23, m), big)).collect();
+        list.extend(versions(&[("before", at(23, -5), 900), ("21", at(21, 0), 900), ("20", at(20, 0), 900)]));
+        let forget = to_forget(&list);
+        let kept: Vec<&str> =
+            list.iter().map(|(id, _, _)| id.as_str()).filter(|id| !forget.iter().any(|f| f == id)).collect();
+        // The newest 8 big ones fit their 4 MB; the first of the 23rd (the
+        // item before the burst) and each earlier day are kept apart.
+        let mut expected: Vec<String> = (32..40).rev().map(|m| format!("big-{m}")).collect();
+        expected.extend(["before", "21", "20"].map(String::from));
+        assert_eq!(kept, expected);
+
+        // Big ones only make room for later days, one a day.
+        let mut list: Vec<(String, NaiveDateTime, i32)> =
+            (0..20).map(|m| (format!("new-{m}"), at(28, 0) - TimeDelta::minutes(m), 100)).collect();
+        list.extend((0..10).map(|d| (format!("day-{d}"), at(27, 0) - TimeDelta::days(d), big)));
+        let forget = to_forget(&list);
+        assert_eq!(forget, (8..10).map(|d| format!("day-{d}")).collect::<Vec<_>>());
     }
 
     #[test]

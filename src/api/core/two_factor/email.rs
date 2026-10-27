@@ -380,7 +380,7 @@ pub async fn activate_email_2fa(user: &User, conn: &DbConn) -> EmptyResult {
 pub fn obscure_email(email: &str) -> String {
     let split: Vec<&str> = email.rsplitn(2, '@').collect();
 
-    let mut name = split[1].to_owned();
+    let name = split[1];
     let domain = &split[0];
 
     let name_size = name.chars().count();
@@ -389,8 +389,10 @@ pub fn obscure_email(email: &str) -> String {
         "*".repeat(name_size)
     } else {
         let stars = "*".repeat(name_size - 2);
-        name.truncate(2);
-        format!("{name}{stars}")
+        // Keykeeper: the first two characters, not bytes: truncating at byte 2
+        // panics when a character of several bytes spans it.
+        let visible: String = name.chars().take(2).collect();
+        format!("{visible}{stars}")
     };
 
     format!("{new_name}@{domain}")
@@ -426,5 +428,11 @@ mod tests {
 
         // If it's smaller than 3 characters it should only show asterisks.
         assert_eq!(result, "***@example.ext");
+    }
+
+    #[test]
+    fn test_obscure_email_multibyte() {
+        assert_eq!(obscure_email("éèça@example.ext"), "éè**@example.ext");
+        assert_eq!(obscure_email("€€€€€@example.ext"), "€€***@example.ext");
     }
 }

@@ -294,6 +294,7 @@ pub fn static_files(filename: &str) -> Result<(ContentType, &'static [u8]), Erro
         "admin_organizations.js" => {
             Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin_organizations.js")))
         }
+        "admin_sites.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin_sites.js"))),
         "admin_diagnostics.js" => {
             Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin_diagnostics.js")))
         }

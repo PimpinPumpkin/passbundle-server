@@ -5,14 +5,14 @@
 // it on the device, so asking doesn't say which sites someone visits. See
 // DESIGN.md, "Site fixes (opt-in)".
 
-use std::collections::HashSet;
+use std::{collections::HashSet, num::NonZeroU32, sync::LazyLock, time::Duration};
 
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
 use rocket::{Route, serde::json::Json};
 use serde_json::{Value, json};
 
 use super::keykeeper_msp::{Audit, require_admin};
 use crate::{
-    CONFIG,
     api::{EmptyResult, JsonResult},
     auth::Headers,
     db::{
@@ -42,17 +42,51 @@ impl FixData {
     }
 }
 
+/// What one account may send: a burst, then one every so often. Problem
+/// reports and fixes are kept without the account, so this is the only
+/// limit per person.
+type PerAccount = RateLimiter<String, DashMapStateStore<String>, DefaultClock>;
+fn per_account(burst: u32, every: Duration) -> PerAccount {
+    RateLimiter::keyed(
+        Quota::with_period(every).expect("non-zero").allow_burst(NonZeroU32::new(burst).expect("non-zero")),
+    )
+}
+/// Fixes: 30 at once, then one every 2 minutes.
+static SHARES: LazyLock<PerAccount> = LazyLock::new(|| per_account(30, Duration::from_secs(120)));
+/// Problem reports: 10 at once, then one every 6 minutes.
+static REPORTS: LazyLock<PerAccount> = LazyLock::new(|| per_account(10, Duration::from_secs(360)));
+static CHECKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn allowed(limiter: &PerAccount, headers: &Headers) -> bool {
+    if CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1024 == 1023 {
+        for l in [&*SHARES, &*REPORTS] {
+            l.retain_recent();
+            l.shrink_to_fit();
+        }
+    }
+    limiter.check_key(headers.user.uuid.as_ref()).is_ok()
+}
+
 /// Someone shares a fix they made with the fill picker. Counted once per
-/// person; their MSPs' consoles see it with who sent it.
+/// person, and only for someone who verified their email address, so a few
+/// accounts made for it can't make a fix apply to everyone; their MSPs'
+/// consoles see it with who sent it either way.
 #[post("/keykeeper/site-fixes", data = "<data>")]
 async fn share_fix(data: Json<FixData>, headers: Headers, conn: DbConn) -> JsonResult {
     let fix = data.checked()?;
-    let reporters = SiteFix::record(&fix, &headers.user.uuid, &conn).await?;
+    if !allowed(&SHARES, &headers) {
+        err_code!("Too many fixes at once. Try again later.", 429)
+    }
+    let counted = headers.user.verified_at.is_some();
+    let applies = if counted {
+        SiteFix::record(&fix, &headers.user.uuid, &conn).await?
+    } else {
+        false
+    };
     for staff in MspStaff::find_by_user(&headers.user.uuid, &conn).await {
         MspSiteFixReport::record(&staff.msp_uuid, &fix, &headers.user.email, &conn).await?;
     }
-    let threshold = i32::try_from(CONFIG.site_fix_reporters()).unwrap_or(i32::MAX);
-    Ok(Json(json!({ "applies": reporters >= threshold })))
+    Ok(Json(json!({ "applies": applies, "counted": counted })))
 }
 
 /// The MSPs whose site rules reach someone: the ones they're staff of, and
@@ -76,8 +110,7 @@ async fn msps_of(headers: &Headers, conn: &DbConn) -> Vec<MspId> {
 /// their MSPs' rules. The whole list, to match on the device.
 #[get("/keykeeper/site-fixes")]
 async fn list_fixes(headers: Headers, conn: DbConn) -> Json<Value> {
-    let threshold = i32::try_from(CONFIG.site_fix_reporters()).unwrap_or(i32::MAX);
-    let confirmed: Vec<Value> = SiteFix::confirmed(threshold, &conn).await.iter().map(Fix::to_json).collect();
+    let confirmed: Vec<Value> = SiteFix::confirmed(&conn).await.iter().map(Fix::to_json).collect();
     let mut rules = Vec::new();
     for msp in msps_of(&headers, &conn).await {
         rules.extend(MspSiteRule::find_by_msp(&msp, &conn).await.iter().map(|r| r.fix().to_json()));
@@ -97,7 +130,10 @@ struct ProblemData {
 /// "Report a problem with this site": the host and the shape of its sign-in
 /// fields, with an optional note. Kept without an account.
 #[post("/keykeeper/site-problems", data = "<data>")]
-async fn report_problem(data: Json<ProblemData>, _headers: Headers, conn: DbConn) -> JsonResult {
+async fn report_problem(data: Json<ProblemData>, headers: Headers, conn: DbConn) -> JsonResult {
+    if !allowed(&REPORTS, &headers) {
+        err_code!("Too many reports at once. Try again later.", 429)
+    }
     let data = data.into_inner();
     let report =
         SiteProblem::checked(&data.host, &data.fields, data.note.as_deref()).map_err(crate::error::Error::new_msg)?;

@@ -305,6 +305,9 @@ macro_rules! make_config {
                     config.$name = make_config! { @build self.$name.clone(), &config, $none_action, $($default)? };
                 )+)+
                 config.domain_set = _domain_set;
+                // Keykeeper: whether the server's operator chose the client IP header.
+                config._ip_header_set = self.ip_header.is_some();
+                hosted_defaults(&mut config, self);
 
                 config.domain = config.domain.trim_end_matches('/').to_string();
 
@@ -573,13 +576,17 @@ make_config! {
     settings {
         /// Domain URL |> This needs to be set to the URL used to access the server, including 'http[s]://'
         /// and port, if it's different than the default. Some server functions don't work correctly without this value
-        domain:                 String, true,   def,    "http://localhost".to_owned();
+        domain:                 String, false,  def,    "http://localhost".to_owned();
         /// Domain Set |> Indicates if the domain is set by the admin. Otherwise the default will be used.
         domain_set:             bool,   false,  def,    false;
         /// Domain origin |> Domain URL origin (in https://example.com:8443/path, https://example.com:8443 is the origin)
         domain_origin:          String, false,  auto,   |c| extract_url_origin(&c.domain);
         /// Domain path |> Domain URL path (in https://example.com:8443/path, /path is the path)
         domain_path:            String, false,  auto,   |c| extract_url_path(&c.domain);
+        /// Domain is public |> PassBundle: whether DOMAIN names a host on the public internet (a global IP address, or a name that isn't localhost, a single label, or reserved for local networks or testing)
+        _domain_public:         bool,   false,  generated, |c| domain_is_public(&c.domain);
+        /// Domain is public https |> PassBundle: DOMAIN is a public host over https, as the hosted service is. Settings left unset there get safer defaults (DESIGN.md, "Defaults on a public server")
+        _domain_public_https:   bool,   false,  generated, |c| c._domain_public && c.domain.to_ascii_lowercase().starts_with("https://");
         /// Enable web vault
         web_vault_enabled:      bool,   false,  def,    true;
 
@@ -590,12 +597,14 @@ make_config! {
         /// HIBP Api Key |> HaveIBeenPwned API Key, request it here: https://haveibeenpwned.com/API/Key
         hibp_api_key:           Pass,   true,   option;
 
-        /// Per-user attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per user. When this limit is reached, the user will not be allowed to upload further attachments.
+        /// Per-user attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per user. When this limit is reached, the user will not be allowed to upload further attachments. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit.
         user_attachment_limit:  i64,    true,   option;
-        /// Per-organization attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per org. When this limit is reached, org members will not be allowed to upload further attachments for ciphers owned by that org.
+        /// Per-organization attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per org. When this limit is reached, org members will not be allowed to upload further attachments for ciphers owned by that org. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit.
         org_attachment_limit:   i64,    true,   option;
-        /// Per-user send storage limit (KB) |> Max kilobytes of sends storage allowed per user. When this limit is reached, the user will not be allowed to upload further sends.
+        /// Per-user send storage limit (KB) |> Max kilobytes of sends storage allowed per user. When this limit is reached, the user will not be allowed to upload further sends. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit.
         user_send_limit:   i64,    true,   option;
+        /// Per-organization item history limit (KB) |> PassBundle: the most an organization's item history (earlier versions of its items) may take, encrypted. Past it, an edit keeps a version only if it's 64 KB or less, as real items are, so nobody can fill it with big saves to stop a normal item's history. 1048576 (1 GB) by default.
+        org_item_history_limit: i64, true, def, 1_048_576;
 
         /// Trash auto-delete days |> Number of days to wait before auto-deleting a trashed item.
         /// If unset, trashed items are not auto-deleted. This setting applies globally, so make
@@ -617,7 +626,7 @@ make_config! {
         /// Allow new signups |> Controls whether new users can register. Users can be invited by the vaultwarden admin even if this is disabled
         signups_allowed:        bool,   true,   def,    true;
         /// Require email verification on signups. On new client versions, this will require verification at signup time. On older clients,
-        /// this will prevent logins from succeeding until the address has been verified
+        /// this will prevent logins from succeeding until the address has been verified. PassBundle: on by default on a public https DOMAIN.
         signups_verify:         bool,   true,   def,    false;
         /// If signups require email verification, automatically re-send verification email if it hasn't been sent for a while (in seconds)
         signups_verify_resend_time: u64, true,  def,    3_600;
@@ -634,7 +643,7 @@ make_config! {
         /// Allow creating MSPs |> PassBundle: whether users can create an MSP, which manages client organizations. Off by default on self-hosted servers.
         msp_signups_allowed:    bool,   true,   def,    false;
         /// Private networks events may go to |> PassBundle: private networks, addresses, or host names that organizations may send their events to, separated by commas, each with an optional port, for a self-hosted server whose security tools share its network: 10.0.0.0/8, 192.168.1.20:6514, [fd00::5]:443, siem.corp.example:443. Loopback only when a loopback address or network is listed itself (127.0.0.1). Link-local addresses and cloud metadata services are refused anyway. Empty: public addresses only.
-        event_streaming_allowed_networks: String, true, def, String::new();
+        event_streaming_allowed_networks: String, false, def, String::new();
         /// Microsoft Entra sign-in for Sentinel |> PassBundle: where Sentinel destinations get their tokens, set only in the environment. https://login.microsoftonline.us for Azure Government, https://login.chinacloudapi.cn for Azure in China.
         event_streaming_azure_login_url: String, false, def, "https://login.microsoftonline.com".to_owned();
         /// Token scope for Sentinel |> PassBundle: set only in the environment. https://monitor.azure.us//.default for Azure Government, https://monitor.azure.cn//.default for Azure in China.
@@ -647,6 +656,8 @@ make_config! {
         event_streaming_azure_ca_file: String, false, option;
         /// Allow invitations |> Controls whether users can be invited by organization admins, even when signups are otherwise disabled
         invitations_allowed:    bool,   true,   def,    true;
+        /// Invitations let people in without email |> PassBundle: on a server that sends no email, whether an invitation still lets the person invited in without anyone approving them. Nothing proves they own the address, so whoever signs up with it first would get in: only for a server nobody else can reach, such as a test machine. Off, an owner or admin approves each join there. Set only in the environment.
+        invite_joins_without_email: bool, false, def, false;
         /// Invitation token expiration time (in hours) |> The number of hours after which an organization invite token, emergency access invite token,
         /// email verification token and deletion request token will expire (must be at least 1)
         invitation_expiration_hours: u32, false, def, 120;
@@ -682,17 +693,23 @@ make_config! {
     /// Advanced settings
     advanced {
         /// Client IP header |> If not present, the remote IP is used.
-        /// Set to the string "none" (without quotes), to disable any headers and just use the remote IP
-        ip_header:              String, true,   def,    "X-Real-IP".to_owned();
+        /// Set to the string "none" (without quotes), to disable any headers and just use the remote IP.
+        /// PassBundle: set only in the environment. On a public DOMAIN the server doesn't start until it's set:
+        /// CF-Connecting-IP behind Cloudflare (a tunnel included), X-Real-IP behind a reverse proxy that
+        /// overwrites it with the address it got the request from, or none with nothing in front.
+        ip_header:              String, false,  def,    "X-Real-IP".to_owned();
         /// Internal IP header property, used to avoid recomputing each time
         _ip_header_enabled:     bool,   false,  generated,    |c| &c.ip_header.trim().to_lowercase() != "none";
+        /// Client IP header set |> PassBundle: whether IP_HEADER was set, rather than left at its default
+        _ip_header_set:         bool,   false,  def,    false;
         /// Trusted proxies |> Which addresses the client IP header is accepted from. Requests from any
         /// other address use the remote IP instead, so a client can't spoof the header.
         /// Either the string "local" (the default, any non-global address, which covers a reverse proxy
         /// running on the same host or container network), the string "all" to accept it from anywhere,
         /// or a comma separated list of IPs and CIDR ranges. For a list header like X-Forwarded-For, the
         /// client IP is the rightmost address that isn't a trusted proxy, so list every proxy in the chain.
-        ip_header_trusted_proxies: String, true, def,    "local".to_owned();
+        /// PassBundle: set only in the environment. Behind a proxy, list its exact address.
+        ip_header_trusted_proxies: String, false, def,    "local".to_owned();
         /// Icon service |> The predefined icon services are: internal, bitwarden, duckduckgo, google.
         /// To specify a custom icon service, set a URL template with exactly one instance of `{}`,
         /// which is replaced with the domain. For example: `https://icon.example.com/domain/{}`.
@@ -723,11 +740,13 @@ make_config! {
         icon_blacklist_non_global_ips:  bool,   false,   def, true;
 
         /// Block HTTP domains/IPs by Regex |> Any domains or IPs that match this regex won't be fetched by the internal HTTP client.
-        /// Useful to hide other servers in the local network. Check the WIKI for more details
-        http_request_block_regex:   String, true,   option;
+        /// Useful to hide other servers in the local network. Check the WIKI for more details. PassBundle: set only in the environment
+        http_request_block_regex:   String, false,  option;
         /// Block non global IPs |> Enabling this will cause the internal HTTP client to refuse to connect to any non global IP address.
-        /// Useful to secure your internal environment: See https://en.wikipedia.org/wiki/Reserved_IP_addresses for a list of IPs which it will block
-        http_request_block_non_global_ips:  bool,   true,   auto, |c| c.icon_blacklist_non_global_ips;
+        /// Useful to secure your internal environment: See https://en.wikipedia.org/wiki/Reserved_IP_addresses for a list of IPs which it will block.
+        /// PassBundle: set only in the environment. Cloud metadata services, link-local addresses, and IPv4 written as IPv6 are refused either way.
+        /// With HTTP_PROXY, HTTPS_PROXY, or ALL_PROXY set, the proxy looks up names, so these checks see only addresses written in URLs: the proxy must refuse the rest
+        http_request_block_non_global_ips:  bool,   false,  auto, |c| c.icon_blacklist_non_global_ips;
 
         /// Disable Two-Factor remember |> Enabling this would force the users to use a second factor to login every time.
         /// Note that the checkbox would still be present, but ignored.
@@ -805,8 +824,10 @@ make_config! {
         login_ratelimit_account_anywhere_seconds:   u64, false, def, 36;
         /// Max burst size for login requests for one account from anywhere |> Allow a burst of requests for one email address, from any address, of up to this size
         login_ratelimit_account_anywhere_max_burst: u32, false, def, 100;
-        /// People who share the same site fix before it applies to everyone |> A fix made with the fill picker and shared fills for everyone on this server once this many different people sent it (Keykeeper: DESIGN.md, "Site fixes")
+        /// People who share the same site fix before it applies to everyone |> A fix made with the fill picker and shared fills for everyone on this server once this many different people with verified email addresses sent it (Keykeeper: DESIGN.md, "Site fixes")
         site_fix_reporters: u32, true, def, 3;
+        /// Site fixes need approval |> PassBundle: a shared fix fills for everyone only once the server's operator also approves it on the admin page's Sites list. People who share fixes are counted only once they've verified their email address
+        site_fixes_need_approval: bool, true, def, false;
 
         /// Seconds between unauthenticated requests |> Number of seconds, on average, between requests from the same IP address to any of the rate limited unauthenticated endpoints
         unauthenticated_ratelimit_seconds:   u64, false, def, 60;
@@ -892,7 +913,7 @@ make_config! {
         /// Secret Key
         yubico_secret_key:      Pass,   true,   option;
         /// Server
-        yubico_server:          String, true,   option;
+        yubico_server:          String, false,  option;
     },
 
     /// Global Duo settings (Note that users can override them)
@@ -904,51 +925,54 @@ make_config! {
         /// Client Secret
         duo_skey:               Pass,   true,   option;
         /// Host
-        duo_host:               String, true,   option;
+        duo_host:               String, false,  option;
     },
 
     /// SMTP Email Settings
     smtp: _enable_smtp {
+        // Keykeeper: every email setting is set only in the environment, so
+        // someone with the admin page can't send the server's email, with its
+        // sign-in codes and links, somewhere else (DESIGN.md, "The admin page").
         /// Enabled
-        _enable_smtp:                  bool,   true,   def,     true;
+        _enable_smtp:                  bool,   false,   def,     true;
         /// Use Sendmail |> Whether to send mail via the `sendmail` command
-        use_sendmail:                  bool,   true,   def,     false;
+        use_sendmail:                  bool,   false,   def,     false;
         /// Sendmail Command |> Which sendmail command to use. The one found in the $PATH is used if not specified.
         sendmail_command:              String, false,  option;
         /// Host
-        smtp_host:                     String, true,   option;
+        smtp_host:                     String, false,   option;
         /// DEPRECATED smtp_ssl |> DEPRECATED - Please use SMTP_SECURITY
         smtp_ssl:                      bool,   false,  option;
         /// DEPRECATED smtp_explicit_tls |> DEPRECATED - Please use SMTP_SECURITY
         smtp_explicit_tls:             bool,   false,  option;
         /// Secure SMTP |> ("starttls", "force_tls", "off") Enable a secure connection. Default is "starttls" (Explicit - ports 587 or 25), "force_tls" (Implicit - port 465) or "off", no encryption
-        smtp_security:                 String, true,   auto,    |c| smtp_convert_deprecated_ssl_options(c.smtp_ssl, c.smtp_explicit_tls); // TODO: After deprecation make it `def, "starttls".to_string()`
+        smtp_security:                 String, false,   auto,    |c| smtp_convert_deprecated_ssl_options(c.smtp_ssl, c.smtp_explicit_tls); // TODO: After deprecation make it `def, "starttls".to_string()`
         /// Port
-        smtp_port:                     u16,    true,   auto,    |c| if c.smtp_security == *"force_tls" {465} else if c.smtp_security == *"starttls" {587} else {25};
+        smtp_port:                     u16,    false,   auto,    |c| if c.smtp_security == *"force_tls" {465} else if c.smtp_security == *"starttls" {587} else {25};
         /// From Address
-        smtp_from:                     String, true,   def,     String::new();
+        smtp_from:                     String, false,   def,     String::new();
         /// From Name
-        smtp_from_name:                String, true,   def,     "Vaultwarden".to_owned();
+        smtp_from_name:                String, false,   def,     "Vaultwarden".to_owned();
         /// Username
-        smtp_username:                 String, true,   option;
+        smtp_username:                 String, false,   option;
         /// Password
-        smtp_password:                 Pass,   true,   option;
+        smtp_password:                 Pass,   false,   option;
         /// SMTP Auth mechanism |> Defaults for SSL is "Plain" and "Login" and nothing for Non-SSL connections. Possible values: ["Plain", "Login", "Xoauth2"]. Multiple options need to be separated by a comma ','.
-        smtp_auth_mechanism:           String, true,   option;
+        smtp_auth_mechanism:           String, false,   option;
         /// SMTP connection timeout |> Number of seconds when to stop trying to connect to the SMTP server
-        smtp_timeout:                  u64,    true,   def,     15;
+        smtp_timeout:                  u64,    false,   def,     15;
         /// Server name sent during HELO |> By default this value should be the machine's hostname, but might need to be changed in case it trips some anti-spam filters
-        helo_name:                     String, true,   option;
+        helo_name:                     String, false,   option;
         /// Embed images as email attachments.
-        smtp_embed_images:             bool, true, def, true;
+        smtp_embed_images:             bool, false, def, true;
         /// _smtp_img_src
         _smtp_img_src:                 String, false, generated, |c| generate_smtp_img_src(c.smtp_embed_images, &c.domain);
         /// Enable SMTP debugging (Know the risks!) |> DANGEROUS: Enabling this will output very detailed SMTP messages. This could contain sensitive information like passwords and usernames! Only enable this during troubleshooting!
         smtp_debug:                    bool,   false,  def,     false;
         /// Accept Invalid Certs (Know the risks!) |> DANGEROUS: Allow invalid certificates. This option introduces significant vulnerabilities to man-in-the-middle attacks!
-        smtp_accept_invalid_certs:     bool,   true,   def,     false;
+        smtp_accept_invalid_certs:     bool,   false,   def,     false;
         /// Accept Invalid Hostnames (Know the risks!) |> DANGEROUS: Allow invalid hostnames. This option introduces significant vulnerabilities to man-in-the-middle attacks!
-        smtp_accept_invalid_hostnames: bool,   true,   def,     false;
+        smtp_accept_invalid_hostnames: bool,   false,   def,     false;
     },
 
     /// Email 2FA Settings
@@ -1055,7 +1079,19 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         }
     }
 
+    // Keykeeper: a public server doesn't start until its client IP header is
+    // chosen (DESIGN.md, "The client's address").
+    if let Some(problem) = ip_header_problem(cfg) {
+        err!(problem)
+    }
     let trusted_proxies = cfg.ip_header_trusted_proxies.trim();
+    if cfg._domain_public && cfg._ip_header_enabled && trusted_proxies.eq_ignore_ascii_case("all") {
+        println!(
+            "[WARNING] IP_HEADER_TRUSTED_PROXIES is `all`: anyone who reaches this server can set {} and choose the \
+             address that login limits, allowed networks, and logs see. List your proxy's address instead.\n",
+            cfg.ip_header
+        );
+    }
     if !trusted_proxies.eq_ignore_ascii_case("all") && !trusted_proxies.eq_ignore_ascii_case("local") {
         for entry in trusted_proxies.split(',').filter(|e| !e.trim().is_empty()) {
             if crate::auth::parse_trusted_proxy(entry).is_none() {
@@ -1463,6 +1499,87 @@ fn extract_url_origin(url: &str) -> String {
 
 /// Extracts the path from a URL.
 /// All trailing '/' chars are trimmed, even if the path is a lone '/'.
+/// Keykeeper: whether DOMAIN names a host on the public internet: a global IP
+/// address, or a host name that isn't localhost, a single label, or a name
+/// reserved for local networks or testing (.local, .test, .internal,
+/// .home.arpa, and the like).
+fn domain_is_public(domain: &str) -> bool {
+    const LOCAL: [&str; 12] = [
+        "localhost",
+        "local",
+        "localdomain",
+        "test",
+        "example",
+        "invalid",
+        "internal",
+        "lan",
+        "home",
+        "corp",
+        "intranet",
+        "private",
+    ];
+    let Ok(url) = Url::parse(domain) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            match name.rsplit_once('.') {
+                Some((_, last)) => !LOCAL.contains(&last) && !name.ends_with(".home.arpa"),
+                None => false,
+            }
+        }
+        Some(url::Host::Ipv4(ip)) => crate::util::is_global(ip.into()),
+        Some(url::Host::Ipv6(ip)) => crate::util::is_global(ip.into()),
+        None => false,
+    }
+}
+
+/// Keykeeper: the attachment and Send storage a person or organization gets
+/// on a public https server unless its operator chose otherwise, in KB.
+const HOSTED_STORAGE_KB: i64 = 1024 * 1024;
+
+/// Keykeeper: safer defaults for what the operator of a server on a public
+/// https address left unset (DESIGN.md, "Defaults on a public server"):
+/// signups verify their email address, and each person and each organization
+/// gets 1 GB for attachments, and each person 1 GB for Send files. A storage
+/// limit of -1 means none, on any server.
+fn hosted_defaults(config: &mut ConfigItems, set: &ConfigBuilder) {
+    let public = config._domain_public_https;
+    if public && set.signups_verify.is_none() {
+        config.signups_verify = true;
+    }
+    for (limit, chosen) in [
+        (&mut config.user_attachment_limit, set.user_attachment_limit),
+        (&mut config.org_attachment_limit, set.org_attachment_limit),
+        (&mut config.user_send_limit, set.user_send_limit),
+    ] {
+        if public && chosen.is_none() {
+            *limit = Some(HOSTED_STORAGE_KB);
+        }
+        if limit.is_some_and(|l| l < 0) {
+            *limit = None;
+        }
+    }
+}
+
+/// Keykeeper: why the server mustn't start with the client IP header it has,
+/// if it mustn't. On a public DOMAIN the header has to be chosen: the default,
+/// X-Real-IP, passes through Cloudflare and some proxies as the client sent
+/// it, so anyone could choose the address that login limits, script tokens'
+/// allowed networks, and logs see.
+fn ip_header_problem(cfg: &ConfigItems) -> Option<String> {
+    (cfg._domain_public && cfg._ip_header_enabled && !cfg._ip_header_set).then(|| {
+        format!(
+            "DOMAIN ({}) is a public address, so set IP_HEADER to the header your proxy puts the visitor's address in: \
+             CF-Connecting-IP behind Cloudflare (a Cloudflare tunnel included), X-Real-IP behind a reverse proxy that \
+             overwrites it with the address it got the request from, or none when nothing is in front of the server. \
+             Set IP_HEADER_TRUSTED_PROXIES to the proxy's address too.",
+            cfg.domain
+        )
+    })
+}
+
 fn extract_url_path(url: &str) -> String {
     match Url::parse(url) {
         Ok(u) => u.path().trim_end_matches('/').to_owned(),
@@ -1969,3 +2086,91 @@ handlebars::handlebars_helper!(webver: | web_vault_version: String |
 handlebars::handlebars_helper!(vwver: | vw_version: String |
     semver::VersionReq::parse(&vw_version).expect("Invalid Vaultwarden version compare string").matches(&VW_VERSION)
 );
+
+// Keykeeper: the defaults and checks that depend on DOMAIN.
+#[cfg(test)]
+mod keykeeper_tests {
+    use super::*;
+
+    fn built(domain: &str, more: impl FnOnce(&mut ConfigBuilder)) -> ConfigItems {
+        let mut builder = ConfigBuilder {
+            domain: Some(domain.to_owned()),
+            ..ConfigBuilder::default()
+        };
+        more(&mut builder);
+        builder.build()
+    }
+
+    #[test]
+    fn a_public_domain_is_a_global_address_or_a_real_host_name() {
+        for public in ["https://vault.passbundle.com", "https://vault.example.com:8443/path", "http://203.0.113.1"] {
+            // 203.0.113.0/24 is for documentation, so not global: only the names count here.
+            assert_eq!(domain_is_public(public), !public.contains("203.0.113"), "{public}");
+        }
+        assert!(domain_is_public("https://8.8.8.8"));
+        assert!(domain_is_public("https://[2606:4700:4700::1111]"));
+        for local in [
+            "http://localhost",
+            "https://localhost:8443",
+            "https://127.0.0.1:8000",
+            "https://192.168.1.20",
+            "https://[::1]",
+            "https://dell.local",
+            "https://vault.test",
+            "https://pb.home.arpa",
+            "https://vault.corp.internal",
+            "https://intranet",
+            "https://vault.example.",
+            "not a url",
+        ] {
+            assert!(!domain_is_public(local), "{local}");
+        }
+    }
+
+    #[test]
+    fn a_public_https_server_gets_safer_defaults() {
+        let hosted = built("https://vault.passbundle.com", |_| {});
+        assert!(hosted._domain_public_https);
+        assert!(hosted.signups_verify);
+        assert_eq!(hosted.user_attachment_limit, Some(HOSTED_STORAGE_KB));
+        assert_eq!(hosted.org_attachment_limit, Some(HOSTED_STORAGE_KB));
+        assert_eq!(hosted.user_send_limit, Some(HOSTED_STORAGE_KB));
+
+        // What the operator chose stays, and -1 means no limit.
+        let chosen = built("https://vault.passbundle.com", |b| {
+            b.signups_verify = Some(false);
+            b.user_attachment_limit = Some(5);
+            b.org_attachment_limit = Some(-1);
+        });
+        assert!(!chosen.signups_verify);
+        assert_eq!(chosen.user_attachment_limit, Some(5));
+        assert_eq!(chosen.org_attachment_limit, None);
+        assert_eq!(chosen.user_send_limit, Some(HOSTED_STORAGE_KB));
+
+        // A local server keeps upstream's defaults.
+        for local in ["https://127.0.0.1:8000", "http://vault.passbundle.com", "https://dell.local"] {
+            let config = built(local, |_| {});
+            assert!(!config._domain_public_https, "{local}");
+            assert!(!config.signups_verify);
+            assert_eq!(config.user_attachment_limit, None);
+        }
+        assert_eq!(built("http://localhost", |b| b.user_send_limit = Some(-1)).user_send_limit, None);
+    }
+
+    #[test]
+    fn a_public_server_doesnt_start_until_its_ip_header_is_chosen() {
+        // The default header on a public address: refused.
+        let problem = ip_header_problem(&built("https://vault.passbundle.com", |_| {})).unwrap();
+        assert!(problem.contains("CF-Connecting-IP"), "{problem}");
+        assert!(ip_header_problem(&built("http://vault.passbundle.com", |_| {})).is_some());
+        // Chosen, even the default's name, or turned off: fine.
+        for header in ["CF-Connecting-IP", "X-Real-IP", "none"] {
+            let config = built("https://vault.passbundle.com", |b| b.ip_header = Some(header.to_owned()));
+            assert!(ip_header_problem(&config).is_none(), "{header}");
+        }
+        // A server on this machine or a private network keeps the default.
+        for local in ["http://localhost", "https://127.0.0.1:8000", "https://dell.local"] {
+            assert!(ip_header_problem(&built(local, |_| {})).is_none(), "{local}");
+        }
+    }
+}

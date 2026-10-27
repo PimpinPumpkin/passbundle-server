@@ -2566,6 +2566,9 @@ async fn revoke_member_impl(
 
             member.revoke();
             member.save(conn).await?;
+            // Keykeeper: provisioning can't turn them back on (DESIGN.md,
+            // "Provisioning from Entra ID").
+            crate::db::models::ScimUser::admin_decided(&member.uuid, conn).await?;
 
             log_event(
                 EventType::OrganizationUserRevoked,
@@ -2672,6 +2675,8 @@ async fn restore_member_impl(
             // This check need to be done after restoring to work with the correct status
             OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
             member.save(conn).await?;
+            // Keykeeper: so a later revoke here stays one provisioning can't undo.
+            crate::db::models::ScimUser::admin_decided(&member.uuid, conn).await?;
 
             log_event(
                 EventType::OrganizationUserRestored,

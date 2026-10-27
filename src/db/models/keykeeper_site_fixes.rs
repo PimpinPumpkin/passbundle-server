@@ -3,19 +3,23 @@
 // field on a site and which kind of value goes there (username, password,
 // one-time code, or never), never a value. No stored row says which account
 // sent it: a person is counted once per fix by a keyed hash only this server
-// can make. See DESIGN.md, "Site fixes (opt-in)".
+// can make, with a key derived from the server's RSA key, never kept in the
+// database, so a copy of the database can't tell who sent what. The tables
+// are bounded: so many problem reports at most, and fixes nobody confirmed
+// are forgotten. See DESIGN.md, "Site fixes (opt-in)".
 
-use chrono::{NaiveDateTime, Utc};
+use std::sync::OnceLock;
+
+use chrono::{NaiveDateTime, TimeDelta, Utc};
 use diesel::prelude::*;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::{
     api::EmptyResult,
     db::{
         DbConn,
-        keykeeper_schema::{
-            keykeeper_secrets, msp_site_fix_reports, msp_site_rules, site_fix_reporters, site_fixes, site_problems,
-        },
+        keykeeper_schema::{msp_site_fix_reports, msp_site_rules, site_fix_reporters, site_fixes, site_problems},
     },
     error::MapResult,
     util::get_uuid,
@@ -95,34 +99,45 @@ impl Fix {
     }
 }
 
-/// The key for reporters' hashes, made the first time it's needed.
-async fn reporter_key(conn: &DbConn) -> Result<String, crate::error::Error> {
-    const NAME: &str = "site_fix_reporters";
-    let fresh = crate::crypto::encode_random_bytes::<32>(&data_encoding::BASE64);
-    conn.run(move |conn| {
-        // Two requests at once both try; the first one's key stays, and the
-        // other's insert fails on the name, which is fine.
-        drop(
-            diesel::insert_into(keykeeper_secrets::table)
-                .values((keykeeper_secrets::name.eq(NAME), keykeeper_secrets::value.eq(fresh)))
-                .execute(conn),
-        );
-        keykeeper_secrets::table
-            .filter(keykeeper_secrets::name.eq(NAME))
-            .select(keykeeper_secrets::value)
-            .first::<String>(conn)
-            .map_res("Error reading a server secret")
-    })
-    .await
+/// The key for reporters' hashes: HMAC-SHA256 keyed with the server's
+/// private RSA key (PKCS#1 DER) over this label, as event streaming derives
+/// its key over its own. Test vectors: docs/vectors/server-derived-keys-v1.json
+/// in the meta repo (a copy is in vectors/ here).
+const REPORTER_LABEL: &[u8] = b"passbundle site fix reporters v1";
+static REPORTER_KEY: OnceLock<Zeroizing<[u8; 32]>> = OnceLock::new();
+
+/// Derives and keeps the reporters' key. Called once at startup, by
+/// auth::initialize_keys.
+pub fn init_reporter_key(rsa_private_der: &[u8]) {
+    // A second call (tests) keeps the first key.
+    drop(REPORTER_KEY.set(crate::keykeeper_streaming::secrets::derive_key_for(REPORTER_LABEL, rsa_private_der)));
+}
+
+fn reporter_key() -> Result<&'static [u8; 32], crate::error::Error> {
+    let Some(key) = REPORTER_KEY.get() else {
+        err!("The server's keys aren't loaded yet")
+    };
+    Ok(key)
 }
 
 /// A person, for one fix: the same person sending it twice gives the same
 /// hash, and nothing links it to them or to their other fixes without the key.
-fn reporter_hash(key: &str, user: &UserId, fix_uuid: &str) -> String {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.as_bytes());
+fn reporter_hash(key: &[u8; 32], user: &UserId, fix_uuid: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
     let tag = ring::hmac::sign(&key, format!("{user}\u{0}{fix_uuid}").as_bytes());
     data_encoding::BASE64.encode(tag.as_ref())
 }
+
+/// Fixes nobody else confirmed are forgotten after this long without anyone
+/// sending them again.
+const UNCONFIRMED_DAYS: i64 = 180;
+/// The most fixes kept that don't apply yet; past it, the ones sent longest
+/// ago go first.
+const MAX_UNCONFIRMED: i64 = 20_000;
+/// The most problem reports kept; past it, the oldest go first.
+pub const MAX_PROBLEMS: i64 = 5_000;
+/// Problem reports are kept this long.
+const PROBLEM_DAYS: i64 = 90;
 
 #[derive(Identifiable, Queryable, Insertable)]
 #[diesel(table_name = site_fixes)]
@@ -137,6 +152,16 @@ pub struct SiteFix {
     pub reporters: i32,
     pub first_seen: NaiveDateTime,
     pub last_seen: NaiveDateTime,
+    /// When the server's operator approved it, where SITE_FIXES_NEED_APPROVAL
+    /// asks for that.
+    pub approved_at: Option<NaiveDateTime>,
+}
+
+/// Whether a fix applies to everyone: enough different people sent it, and
+/// the server's operator approved it where they must.
+pub fn fix_applies(reporters: i32, approved: bool) -> bool {
+    let threshold = i32::try_from(crate::CONFIG.site_fix_reporters()).unwrap_or(i32::MAX);
+    reporters >= threshold && (approved || !crate::CONFIG.site_fixes_need_approval())
 }
 
 impl SiteFix {
@@ -152,10 +177,10 @@ impl SiteFix {
         }
     }
 
-    /// Records that someone sent a fix, counting each person once. Returns how
-    /// many different people have sent it.
-    pub async fn record(fix: &Fix, user: &UserId, conn: &DbConn) -> Result<i32, crate::error::Error> {
-        let key = reporter_key(conn).await?;
+    /// Records that someone sent a fix, counting each person once. Returns
+    /// whether it applies to everyone now.
+    pub async fn record(fix: &Fix, user: &UserId, conn: &DbConn) -> Result<bool, crate::error::Error> {
+        let key = reporter_key()?;
         let fix = fix.clone();
         let user = user.clone();
         conn.run(move |conn| {
@@ -182,11 +207,13 @@ impl SiteFix {
                         reporters: 0,
                         first_seen: now,
                         last_seen: now,
+                        approved_at: None,
                     };
                     diesel::insert_into(site_fixes::table).values(&row).execute(conn)?;
+                    forget_unconfirmed(conn)?;
                     row.uuid
                 };
-                let hash = reporter_hash(&key, &user, &uuid);
+                let hash = reporter_hash(key, &user, &uuid);
                 let seen = site_fix_reporters::table
                     .filter(site_fix_reporters::fix_uuid.eq(&uuid))
                     .filter(site_fix_reporters::reporter_hash.eq(&hash))
@@ -200,15 +227,20 @@ impl SiteFix {
                         .set((site_fixes::reporters.eq(site_fixes::reporters + 1), site_fixes::last_seen.eq(now)))
                         .execute(conn)?;
                 }
-                site_fixes::table.filter(site_fixes::uuid.eq(&uuid)).select(site_fixes::reporters).first::<i32>(conn)
+                site_fixes::table
+                    .filter(site_fixes::uuid.eq(&uuid))
+                    .select((site_fixes::reporters, site_fixes::approved_at))
+                    .first::<(i32, Option<NaiveDateTime>)>(conn)
             })
+            .map(|(reporters, approved_at)| fix_applies(reporters, approved_at.is_some()))
             .map_res("Error recording a site fix")
         })
         .await
     }
 
-    /// The fixes enough different people sent, for every app on the server.
-    pub async fn confirmed(threshold: i32, conn: &DbConn) -> Vec<Fix> {
+    /// The fixes that apply to everyone, for every app on the server.
+    pub async fn confirmed(conn: &DbConn) -> Vec<Fix> {
+        let threshold = i32::try_from(crate::CONFIG.site_fix_reporters()).unwrap_or(i32::MAX);
         conn.run(move |conn| {
             site_fixes::table
                 .filter(site_fixes::reporters.ge(threshold))
@@ -218,8 +250,24 @@ impl SiteFix {
         })
         .await
         .iter()
+        .filter(|row| fix_applies(row.reporters, row.approved_at.is_some()))
         .map(SiteFix::fix)
         .collect()
+    }
+
+    /// The server's operator approves a fix, or takes the approval back.
+    /// False when there's no such fix.
+    pub async fn set_approved(uuid: &str, approved: bool, conn: &DbConn) -> Result<bool, crate::error::Error> {
+        let uuid = uuid.to_owned();
+        let at = approved.then(|| Utc::now().naive_utc());
+        conn.run(move |conn| {
+            diesel::update(site_fixes::table.filter(site_fixes::uuid.eq(uuid)))
+                .set(site_fixes::approved_at.eq(at))
+                .execute(conn)
+                .map(|n| n > 0)
+                .map_res("Error approving a site fix")
+        })
+        .await
     }
 
     /// Every fix with its count, newest first, for the server's admin page.
@@ -231,12 +279,44 @@ impl SiteFix {
         .iter()
         .map(|row| {
             let mut json = row.fix().to_json();
+            json["id"] = json!(row.uuid);
             json["reporters"] = json!(row.reporters);
             json["lastSeen"] = json!(crate::util::format_date(&row.last_seen));
+            json["approved"] = json!(row.approved_at.is_some());
+            json["applies"] = json!(fix_applies(row.reporters, row.approved_at.is_some()));
             json
         })
         .collect()
     }
+}
+
+/// Forgets fixes that don't apply yet and nobody sent for UNCONFIRMED_DAYS,
+/// and past MAX_UNCONFIRMED of them, the ones sent longest ago, with their
+/// reporters' hashes. A fix the operator approved stays.
+fn forget_unconfirmed(conn: &mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> {
+    let threshold = i32::try_from(crate::CONFIG.site_fix_reporters()).unwrap_or(i32::MAX);
+    let unconfirmed =
+        || site_fixes::table.filter(site_fixes::reporters.lt(threshold)).filter(site_fixes::approved_at.is_null());
+    let since = Utc::now().naive_utc() - TimeDelta::days(UNCONFIRMED_DAYS);
+    let mut forget: Vec<String> =
+        unconfirmed().filter(site_fixes::last_seen.lt(since)).select(site_fixes::uuid).load(conn)?;
+    let count: i64 = unconfirmed().count().get_result(conn)?;
+    let over = count - i64::try_from(forget.len()).unwrap_or(0) - MAX_UNCONFIRMED;
+    if over > 0 {
+        forget.extend(
+            unconfirmed()
+                .filter(site_fixes::last_seen.ge(since))
+                .order(site_fixes::last_seen.asc())
+                .limit(over)
+                .select(site_fixes::uuid)
+                .load::<String>(conn)?,
+        );
+    }
+    for chunk in forget.chunks(500) {
+        diesel::delete(site_fix_reporters::table.filter(site_fix_reporters::fix_uuid.eq_any(chunk))).execute(conn)?;
+        diesel::delete(site_fixes::table.filter(site_fixes::uuid.eq_any(chunk))).execute(conn)?;
+    }
+    Ok(())
 }
 
 /// At most this many problem reports per site a day are kept.
@@ -297,10 +377,12 @@ impl SiteProblem {
     }
 
     /// Keeps the report, unless the site already has today's share. Returns
-    /// whether it was kept.
+    /// whether it was kept. Reports older than PROBLEM_DAYS go, and past
+    /// MAX_PROBLEMS, the oldest.
     pub async fn save(self, conn: &DbConn) -> Result<bool, crate::error::Error> {
         conn.run(move |conn| {
-            let since = Utc::now().naive_utc() - chrono::TimeDelta::days(1);
+            let now = Utc::now().naive_utc();
+            let since = now - TimeDelta::days(1);
             let today = site_problems::table
                 .filter(site_problems::host.eq(&self.host))
                 .filter(site_problems::created_at.gt(since))
@@ -308,9 +390,25 @@ impl SiteProblem {
                 .get_result::<i64>(conn)
                 .unwrap_or(0);
             if today >= PROBLEMS_PER_SITE_PER_DAY {
-                return Ok(false);
+                return Ok::<_, diesel::result::Error>(false);
             }
-            diesel::insert_into(site_problems::table).values(&self).execute(conn).map(|_| true)
+            diesel::insert_into(site_problems::table).values(&self).execute(conn)?;
+            diesel::delete(
+                site_problems::table.filter(site_problems::created_at.lt(now - TimeDelta::days(PROBLEM_DAYS))),
+            )
+            .execute(conn)?;
+            let count: i64 = site_problems::table.count().get_result(conn)?;
+            if count > MAX_PROBLEMS {
+                let oldest: Vec<String> = site_problems::table
+                    .order(site_problems::created_at.asc())
+                    .limit(count - MAX_PROBLEMS)
+                    .select(site_problems::uuid)
+                    .load(conn)?;
+                for chunk in oldest.chunks(500) {
+                    diesel::delete(site_problems::table.filter(site_problems::uuid.eq_any(chunk))).execute(conn)?;
+                }
+            }
+            Ok(true)
         })
         .await
         .map_res("Error saving a site problem report")
@@ -551,10 +649,25 @@ mod tests {
     #[test]
     fn a_person_is_the_same_hash_for_one_fix_and_unlinkable_across_fixes() {
         let user: UserId = "user-1".to_string().into();
-        let a = reporter_hash("key", &user, "fix-a");
-        assert_eq!(a, reporter_hash("key", &user, "fix-a"));
-        assert_ne!(a, reporter_hash("key", &user, "fix-b"));
-        assert_ne!(a, reporter_hash("another key", &user, "fix-a"));
+        let a = reporter_hash(&[1; 32], &user, "fix-a");
+        assert_eq!(a, reporter_hash(&[1; 32], &user, "fix-a"));
+        assert_ne!(a, reporter_hash(&[1; 32], &user, "fix-b"));
+        assert_ne!(a, reporter_hash(&[2; 32], &user, "fix-a"));
+    }
+
+    /// docs/vectors/server-derived-keys-v1.json, made with Node's crypto.
+    #[test]
+    fn the_reporters_key_and_hashes_match_the_test_vectors() {
+        let v: Value = serde_json::from_str(include_str!("vectors/server-derived-keys-v1.json")).unwrap();
+        let der = data_encoding::BASE64.decode(v["rsaPkcs1Der"].as_str().unwrap().as_bytes()).unwrap();
+        let r = &v["siteFixReporters"];
+        assert_eq!(r["label"].as_str().unwrap().as_bytes(), REPORTER_LABEL);
+        let key = crate::keykeeper_streaming::secrets::derive_key_for(REPORTER_LABEL, &der);
+        assert_eq!(data_encoding::HEXLOWER.encode(key.as_ref()), r["key"].as_str().unwrap());
+        for case in r["cases"].as_array().unwrap() {
+            let user: UserId = case["user"].as_str().unwrap().to_owned().into();
+            assert_eq!(reporter_hash(&key, &user, case["fix"].as_str().unwrap()), case["hash"].as_str().unwrap());
+        }
     }
 
     #[test]

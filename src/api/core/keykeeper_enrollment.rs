@@ -61,7 +61,7 @@ async fn msp_client(msp_id: &MspId, org_id: &OrganizationId, conn: &DbConn) -> R
 async fn enrollment_json(client: &MspClient, conn: &DbConn) -> serde_json::Value {
     install_json(
         &client.org_uuid,
-        client.enrollment_token.as_ref(),
+        client.enrollment_token(),
         client.enrollment_token_created_at.as_ref(),
         client.enrollment_secret.as_ref(),
         conn,
@@ -72,7 +72,7 @@ async fn enrollment_json(client: &MspClient, conn: &DbConn) -> serde_json::Value
 async fn setup_json(setup: &OrgSetup, conn: &DbConn) -> serde_json::Value {
     install_json(
         &setup.org_uuid,
-        setup.enrollment_token.as_ref(),
+        setup.enrollment_token(),
         setup.enrollment_token_created_at.as_ref(),
         setup.enrollment_secret.as_ref(),
         conn,
@@ -82,10 +82,12 @@ async fn setup_json(setup: &OrgSetup, conn: &DbConn) -> serde_json::Value {
 
 /// The install command's parts: the token, the join secret (encrypted with the
 /// organization's key, for the browser to show in the command), the email
-/// domains, and how many joined with it.
+/// domains, and how many joined with it. The token is kept sealed and opened
+/// here; one that can't be opened (the server's keys changed) shows as none,
+/// and admins make a new command.
 async fn install_json(
     org_id: &OrganizationId,
-    token: Option<&String>,
+    token: Option<String>,
     created_at: Option<&chrono::NaiveDateTime>,
     secret: Option<&String>,
     conn: &DbConn,
@@ -236,7 +238,7 @@ async fn own_org_admin(
     }
     Ok(match OrgSetup::find_by_org(org_id, conn).await {
         Some(setup) => OrgSetupOrNew::Saved(setup),
-        None => OrgSetupOrNew::New(OrgSetup::new(org_id.clone(), None, None, false)),
+        None => OrgSetupOrNew::New(OrgSetup::new(org_id.clone(), None, None, false)?),
     })
 }
 
@@ -275,7 +277,7 @@ async fn get_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbCo
     Ok(Json(
         install_json(
             &org_id,
-            setup.and_then(|s| s.enrollment_token.as_ref()),
+            setup.and_then(OrgSetup::enrollment_token),
             setup.and_then(|s| s.enrollment_token_created_at.as_ref()),
             setup.and_then(|s| s.enrollment_secret.as_ref()),
             &conn,
@@ -300,7 +302,7 @@ async fn replace_org_enrollment(
             setup
         }
         OrgSetupOrNew::New(_) => {
-            let mut setup = OrgSetup::new(org_id.clone(), None, None, true);
+            let mut setup = OrgSetup::new(org_id.clone(), None, None, true)?;
             setup.enrollment_secret = secret;
             setup.insert(&conn).await?;
             setup
