@@ -593,27 +593,40 @@ impl EventDestination {
 
     /// Sets when it next has something to send: its earliest waiting event,
     /// but not before it's no longer held back.
+    ///
+    /// An event queued while this runs, after the queue is read but before
+    /// the time is written, finds the old time (still due) and leaves it, so
+    /// the time written here, from a queue read without that event, would
+    /// hide it until another event is queued. So the queue is read again
+    /// after writing, and the time is written again while something sooner
+    /// than what it was set from is waiting. An event queued after the write
+    /// finds the new time and sets its own, as enqueue does.
     pub async fn refresh_due(uuid: &str, conn: &DbConn) {
         let uuid = uuid.to_owned();
         conn.run(move |conn| {
-            let next: Option<NaiveDateTime> = event_deliveries::table
-                .filter(event_deliveries::destination_uuid.eq(&uuid))
-                .select(diesel::dsl::min(event_deliveries::next_attempt_at))
-                .first(conn)
-                .unwrap_or(None);
-            let retry_at: Option<NaiveDateTime> = event_destinations::table
-                .filter(event_destinations::uuid.eq(&uuid))
-                .select(event_destinations::retry_at)
-                .first(conn)
-                .unwrap_or(None);
-            let next = match (next, retry_at) {
-                (Some(next), Some(retry)) => Some(next.max(retry)),
-                (next, _) => next,
-            };
-            diesel::update(event_destinations::table.filter(event_destinations::uuid.eq(&uuid)))
-                .set(event_destinations::next_due_at.eq(next))
-                .execute(conn)
-                .ok();
+            let mut earliest = earliest_waiting(&uuid, conn);
+            // Again only when an event came meanwhile, so twice at most in
+            // practice: events queued later are due later.
+            for _ in 0..5 {
+                let retry_at: Option<NaiveDateTime> = event_destinations::table
+                    .filter(event_destinations::uuid.eq(&uuid))
+                    .select(event_destinations::retry_at)
+                    .first(conn)
+                    .unwrap_or(None);
+                let next = match (earliest, retry_at) {
+                    (Some(next), Some(retry)) => Some(next.max(retry)),
+                    (next, _) => next,
+                };
+                diesel::update(event_destinations::table.filter(event_destinations::uuid.eq(&uuid)))
+                    .set(event_destinations::next_due_at.eq(next))
+                    .execute(conn)
+                    .ok();
+                let now = earliest_waiting(&uuid, conn);
+                if !sooner(now, earliest) {
+                    break;
+                }
+                earliest = now;
+            }
         })
         .await;
     }
@@ -784,6 +797,25 @@ pub fn merges(code: i32) -> bool {
 /// When a paused destination's events are due: not until it's turned on again.
 fn held() -> NaiveDateTime {
     Utc::now().naive_utc() + TimeDelta::days(3650)
+}
+
+/// When a destination's earliest waiting event is due, if any is waiting.
+fn earliest_waiting(destination: &str, conn: &mut crate::db::DbConnInner) -> Option<NaiveDateTime> {
+    event_deliveries::table
+        .filter(event_deliveries::destination_uuid.eq(destination))
+        .select(diesel::dsl::min(event_deliveries::next_attempt_at))
+        .first(conn)
+        .unwrap_or(None)
+}
+
+/// Whether the queue, read again, has an event due sooner than it had (or
+/// one, where it had none). Fewer events (some sent) isn't sooner.
+fn sooner(now: Option<NaiveDateTime>, before: Option<NaiveDateTime>) -> bool {
+    match (now, before) {
+        (Some(now), Some(before)) => now < before,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// How long an event keeps being retried before it's dropped: three days, as
@@ -1608,6 +1640,20 @@ mod tests {
             assert!(wait >= last && wait <= last + last / 5, "{attempts}: {wait}");
         }
         assert!(backoff(50) <= TimeDelta::seconds(3600 + 720));
+    }
+
+    /// What makes refresh_due write the time again: an event that came while
+    /// it ran, into an empty queue or due before the rest.
+    #[test]
+    fn an_event_queued_while_the_due_time_is_written_is_seen() {
+        let t = |s: i64| chrono::DateTime::from_timestamp(1_800_000_000 + s, 0).unwrap().naive_utc();
+        assert!(sooner(Some(t(5)), None));
+        assert!(sooner(Some(t(5)), Some(t(9))));
+        // Later events, or fewer (some were sent), change nothing.
+        assert!(!sooner(Some(t(9)), Some(t(9))));
+        assert!(!sooner(Some(t(12)), Some(t(9))));
+        assert!(!sooner(None, Some(t(9))));
+        assert!(!sooner(None, None));
     }
 
     #[test]
