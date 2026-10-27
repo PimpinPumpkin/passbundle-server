@@ -171,12 +171,19 @@ async fn activate_duo(data: Json<EnableDuoData>, headers: SetupHeaders, conn: Db
     .await?;
 
     // Keykeeper: two-step login for admins counts Duo only with this
-    // server's own Duo account, so a setup session can't set up another; and
+    // server's own Duo account, so a setup session sets up no other; and
     // replacing it with one's own may take someone's last method that counts.
-    if headers.session.is_some() && check_duo_fields_custom(&data) {
-        err!(
-            "Two-step login for your role counts Duo only with this server's own Duo account. Leave the Duo fields empty to use it."
-        )
+    if headers.session.is_some() {
+        if check_duo_fields_custom(&data) {
+            err!(
+                "Two-step login for your role counts Duo only with this server's own Duo account. Leave the Duo fields empty to use it."
+            )
+        }
+        if !super::has_global_duo_credentials() {
+            err!(
+                "This server has no Duo account of its own, so Duo doesn't count for your role. Choose another method."
+            )
+        }
     }
     let watch = crate::api::core::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
 

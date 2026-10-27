@@ -578,13 +578,6 @@ impl<'r> FromRequest<'r> for SetupHeaders {
     }
 }
 
-impl SetupHeaders {
-    /// Whether this is a setup session, not a signed-in one.
-    pub fn is_setup_session(&self) -> bool {
-        self.session.is_some()
-    }
-}
-
 /// After a method was set up. For someone the rule covers, devices
 /// remembered for two-step login are forgotten: they may have been remembered
 /// with an email code, so each proves the new method once. A setup session
@@ -614,16 +607,17 @@ pub async fn finish_setup(
 }
 
 /// What the web vault's setup page shows: whose rule it is, the account, and
-/// which methods this server can set up. Only for a setup session.
+/// which methods this server can set up. And whether the person has a method
+/// that counts, which the web vault also asks a signed-in session before
+/// someone takes on a role that requires it (creating a Business organization
+/// or an MSP).
 #[get("/keykeeper/two-step-setup")]
 async fn setup_info(headers: SetupHeaders, conn: DbConn) -> JsonResult {
-    if !headers.is_setup_session() {
-        err_code!("Not found", Status::NotFound.code)
-    }
     let unmet = unmet(&headers.user.uuid, &[], &conn).await?;
     Ok(Json(json!({
         "email": headers.user.email,
         "requiredBy": requirer_names(&unmet),
+        "qualifying": has_qualifying(&headers.user.uuid, &conn).await,
         "hasMasterPassword": !headers.user.password_hash.is_empty(),
         "methods": {
             "authenticator": true,
