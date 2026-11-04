@@ -259,8 +259,7 @@ fn fixed_by(filter: &Filter, into: &mut Map<String, Value>) {
 /// "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User", names a
 /// schema rather than an attribute in one.
 fn names_schema(key: &str) -> bool {
-    key.len() > 4
-        && key[..4].eq_ignore_ascii_case("urn:")
+    filter::names_urn(key)
         && (key.eq_ignore_ascii_case(ENTERPRISE_USER_SCHEMA)
             || key
                 .rsplit(':')
@@ -513,6 +512,22 @@ mod tests {
         let mut resource = start.as_object().unwrap().clone();
         apply(&mut resource, &parse_request(&request).unwrap()).unwrap();
         Value::Object(resource)
+    }
+
+    #[test]
+    fn keys_and_paths_of_several_bytes_are_refused_without_a_crash() {
+        assert!(!names_schema("€€x"));
+        assert!(!names_schema("urn€:User"));
+        assert!(parse_path("€€x").is_err());
+        // A value whose object has such a key names an attribute that isn't
+        // one: refused, as any other.
+        let mut resource = created().as_object().unwrap().clone();
+        let refused = parse_request(&json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{ "op": "add", "value": { "€€x": "1" } }]
+        }))
+        .and_then(|ops| apply(&mut resource, &ops));
+        assert!(refused.is_err());
     }
 
     fn created() -> Value {

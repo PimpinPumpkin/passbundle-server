@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "rsaPkcs1Der": "MIIEowIBAAKCAQEAjbgs5xJqgE/ETAZxoclSM2YNg0G9pbkL3GLUDsI7G5wf2EUViYYdMtxLUI7sp83klRu7ochUgm3+5DN/7VA4p9wrQcQERJfvJ9vbASz545XaJ3OtppwXxNxrr8glj2KCB1xtp7dHsHIvLQzZxem/NokCUBw3wB0VOtvqAXaXW0hpQNhW60uDeFzavb8WVtO60LhlLMfkMqYu8c56h99Z+mIPKkR84Pybj6EYbMpxs48kBa0DvAXqfgzFJUX5kNwsYJcf2Iuf0q2mMVL9XzSOJgq40Zz4d0ww4KS90SQwK1F/EVDzrGL7+wdSq21/8iX8Dc/u9zGCnq+0J0kNwr+0AQIDAQABAoIBAAHuG4Xy4DKSy4oLxyvIeLMwoU/bowolE9hWu/u+uVR8Hwqob7V3lzGWcpvkc2yKY0Hk3pyCpISBfCCGY0hTkK74Epp+4X4/6brbrZ8VqkpXQ9EoXBnGG9SDej+60IikM0BHieqIJmy8tF/nIjbl4uPasDZwOPHnz36FiNmH4II2rEAZopsyCrwS1ag9LyVf68MPc2kAHEXA/XYycDn9n5QV6CaNRgF8Lkk9A6Bc9VI7+noHZ9rQeL+Ccv3qsLYnWCum7NrHycheGK7Tm1kQmZjgV8vvQA8LtgLqqgzK9Ydljjtpg/R6JBxIL67RlX5U0XNnOP7p0iPAt+XiVrGnxwECgYEAw8aFG6fkqxGUmMY+tG5rwrawAaOmqE3sTlu/EELG+8Uvc6HnJqa8HM3hwaxyM6NEC5ZkJST7XcbC/yRkPBCKGU9fAixrNABMefJDr04OvMw9NUW/Lk7d76BlGAA+BkbC/3Bl5Bc7lfiBQNJCRJ4GgQpjEofPY7TdpkNGiGAQ48ECgYEAuVCyt6n3mWUGCTE29H01N7C19LtMbcjLPUyTHu4AGCpEYEgM3miE28eYQ2ib4LjRjQ8AoCUL27iKSdVOMOrNa1p5D0E2HII7TH/L+pvEDqDcQMzexwsm6UmpwsLAv+cBlPOlotQHRJ42/ZvJJCgiDXnwAAz8m+hWaW1FvR5t4EECgYAkGRKqCscLE+7GTKd7NXEBMhY59ybfmZ6cxCXypZ1zBuS8+XlZkxzUYtHhmB5mjxAY4t4MS0ld/SwvR1KEELil+hCWogISUIvJYHZCeK4W+cG/dODPdRNO/9AkIMdO+PUzjFH9QJtoB64teZdmd4zTdkrWO9xtkgfchEMZGj2DAQKBgQCkSIEXR0ukJiYSshmI5xLtmu/D1ONtlAtw/ViTm+Rjh9z0Cgu2g6v8dtZqM+u0bcP/rCQe1JjNoayexcW6of2XxS37MxF4do+BQu4e7kYBveNkYvrANAe72rzvVt2vgmgpl1HoptUGpMgVTi0jq5x8m/QC54Bt6qvobKHdhYNcwQKBgAqSgdwya4mkNYmsnym7+buTQPbGwyaWJGeXCq3F9TQcT/7f5M4eownOwr2QaV7O89lZyYztUGkjpjw47uX1CtCBgXBq/CXZ9zobKcFI5ZAop+dat8BWB7cUEenmRTTp5XZ70AxOnIUhHkT5dMZnSgc1zCQksat8ELYxczJQRQ8C",
+  "siteFixReporters": {
+    "label": "passbundle site fix reporters v1",
+    "key": "a77780ad97fd71b8a775ca747b3d2830b84563cbb8db37bfa58dbe0f35837d67",
+    "cases": [
+      {
+        "user": "5b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
+        "fix": "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d",
+        "hash": "bGDYtNqwoPIHfIl44aDkj+Ze2hhUEVvzWCT4nXKF0Aw="
+      },
+      {
+        "user": "5b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
+        "fix": "0f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f",
+        "hash": "FVDhWkGmXePS7hhXdeM1zBReIbr9SW0BZN05IcODR8U="
+      },
+      {
+        "user": "6c2d3e4f-5061-4b7c-9d8e-0f1a2b3c4d5e",
+        "fix": "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d",
+        "hash": "MwAjtRatrPArPFh1qtqZ199EjIZ7bNaRzze6uo1dmpg="
+      }
+    ]
+  },
+  "installTokens": {
+    "label": "passbundle install command tokens v1",
+    "key": "e8baf970ec63ed946f74d2ae7689ebe29ae66f0a14e48f927e50e90941a2099b",
+    "cases": [
+      {
+        "organization": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "aad": "install command token\u0000organization 0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "nonce": "b0b1b2b3b4b5b6b7b8b9babb",
+        "token": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+        "sealed": "v1.sLGys7S1tre4ubq77YmAx3HXNXY6U+1lyXEEjcnW6MxXnu+3qAauikKFtZlj4MToFULDogX1ktO3GYgJBtSFQISkzmxtCbs=",
+        "hash": "3Ev4DHdHPRMPoN6GukAY/pi7IUAF5qWJHRK6kURvnoE="
+      },
+      {
+        "organization": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+        "aad": "install command token\u0000organization 3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+        "nonce": "1f1e1d1c1b1a191817161514",
+        "token": "bm90IGEgcmVhbCBpbnN0YWxsIGNvbW1hbmQgdG9rZW4",
+        "sealed": "v1.Hx4dHBsaGRgXFhUU1Aea4cGaaPo8intCgCS6hMpwaDE7/bUei9AQl9AjvxhroxWoZ8OiNBNS1uTBzc+pbjHZP5tqZNnt72w=",
+        "hash": "Ygoh5iF7pbE/+8pA5hoj8VIkZSWUSvCmxKHpj+uV6qg="
+      }
+    ],
+    "wrongOrganizations": [
+      "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4e",
+      "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"
+    ]
+  }
+}

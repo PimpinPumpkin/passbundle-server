@@ -67,6 +67,7 @@ pub fn routes() -> Vec<Route> {
         users_overview,
         organizations_overview,
         sites_overview,
+        approve_site_fix,
         delete_organization,
         diagnostics,
         get_diagnostics_config,
@@ -405,11 +406,28 @@ async fn sites_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<Stri
     use crate::db::models::{SiteFix, SiteProblem};
     let data = json!({
         "threshold": CONFIG.site_fix_reporters(),
+        "need_approval": CONFIG.site_fixes_need_approval(),
         "problems": SiteProblem::recent(&conn).await,
         "fixes": SiteFix::all(&conn).await,
     });
     let text = AdminTemplateData::new("admin/sites", data).render()?;
     Ok(Html(text))
+}
+
+#[derive(Deserialize)]
+struct SiteFixApproval {
+    approved: bool,
+}
+
+/// Keykeeper: approves a shared fix, or takes the approval back. With
+/// SITE_FIXES_NEED_APPROVAL on, a fix fills for everyone only once it's
+/// approved here, as well as sent by enough people.
+#[post("/sites/fixes/<fix_id>/approval", format = "application/json", data = "<data>")]
+async fn approve_site_fix(fix_id: &str, data: Json<SiteFixApproval>, _token: AdminToken, conn: DbConn) -> EmptyResult {
+    if !crate::db::models::SiteFix::set_approved(fix_id, data.approved, &conn).await? {
+        err_code!("Site fix not found", Status::NotFound.code)
+    }
+    Ok(())
 }
 
 #[get("/users/by-mail/<mail>")]

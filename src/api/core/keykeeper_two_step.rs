@@ -53,7 +53,7 @@ use super::{
 };
 use crate::{
     CONFIG,
-    api::{ApiResult, EmptyResult, JsonResult, WS_USERS},
+    api::{ApiResult, EmptyResult, JsonResult, PasswordOrOtpData, WS_USERS},
     auth::{ClientIp, Headers, decode_login},
     db::{
         DbConn,
@@ -762,6 +762,10 @@ async fn get_org_setting(org_id: OrganizationId, headers: Headers, conn: DbConn)
 #[serde(rename_all = "camelCase")]
 struct OrgSettingData {
     required: bool,
+    /// The caller's master password or a one-time code (DESIGN.md,
+    /// "Confirming sensitive changes").
+    #[serde(flatten)]
+    verification: PasswordOrOtpData,
 }
 
 /// Turns the organization's setting on or off. For an MSP's client, the
@@ -778,10 +782,14 @@ async fn put_org_setting(
     if !is_token_admin(&org_id, &headers.user.uuid, &conn).await {
         err_code!("Organization not found", Status::NotFound.code)
     }
-    let required = data.into_inner().required;
+    let data = data.into_inner();
+    let required = data.required;
     if !required && OrgAdminTwoStep::required(&org_id, &conn).await? {
         require_caller_meets(&headers.user, &session, &conn).await?;
     }
+    // Keykeeper: and the caller confirms it with their master password or a
+    // one-time code (DESIGN.md, "Confirming sensitive changes").
+    data.verification.confirm_change(&headers.user, &conn).await?;
     let changed =
         set_org_required(&org_id, required, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn).await?;
     if changed && let Some(client) = MspClient::find_by_org(&org_id, &conn).await {
@@ -850,6 +858,10 @@ async fn msp_view(msp_id: &MspId, caller: &MspStaff, conn: &DbConn) -> ApiResult
 #[serde(rename_all = "camelCase")]
 struct MspSettingData {
     staff_required: bool,
+    /// The caller's master password or a one-time code (DESIGN.md,
+    /// "Confirming sensitive changes").
+    #[serde(flatten)]
+    verification: PasswordOrOtpData,
 }
 
 /// Turns the MSP's requirement for its staff on or off. MSP admins only, and
@@ -866,11 +878,15 @@ async fn put_msp_setting(
 ) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let caller = staff_member(&msp_id, &headers.user.uuid, &conn).await?;
-    let required = data.into_inner().staff_required;
+    let data = data.into_inner();
+    let required = data.staff_required;
     if MspStaffTwoStep::required(&msp_id, &conn).await? != required {
         if !required {
             require_caller_meets(&headers.user, &session, &conn).await?;
         }
+        // Keykeeper: and the caller confirms it with their master password or
+        // a one-time code (DESIGN.md, "Confirming sensitive changes").
+        data.verification.confirm_change(&headers.user, &conn).await?;
         let staff = if required {
             MspStaff::find_by_msp(&msp_id, &conn).await.into_iter().map(|s| s.user_uuid).collect()
         } else {

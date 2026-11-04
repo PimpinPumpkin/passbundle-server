@@ -31,7 +31,7 @@
     </div>
     <div id="fixes-block" class="my-3 p-3 rounded shadow">
         <h6 class="border-bottom pb-2 mb-3">Fixes people shared</h6>
-        <p class="small text-body-secondary">From people who turned on sharing: how to recognize a field and which kind of value goes there. A fix fills for everyone on this server once {{page_data.threshold}} different people sent it.</p>
+        <p class="small text-body-secondary">From people who turned on sharing: how to recognize a field and which kind of value goes there. A fix fills for everyone on this server once {{page_data.threshold}} different people with verified email addresses sent it{{#if page_data.need_approval}}, and you approved it here (SITE_FIXES_NEED_APPROVAL){{/if}}.</p>
         <div class="table-responsive-xl small">
             <table id="fixes-table" class="table table-sm table-striped table-hover">
                 <thead>
@@ -41,6 +41,8 @@
                         <th>Fills</th>
                         <th>People</th>
                         <th>Last sent</th>
+                        <th>Fills for everyone</th>
+                        <th>Approved</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -51,6 +53,14 @@
                         <td>{{fill}}</td>
                         <td>{{reporters}}</td>
                         <td>{{lastSeen}}</td>
+                        <td>{{#if applies}}Yes{{else}}No{{/if}}</td>
+                        <td data-vw-site-fix="{{id}}">
+                            {{#if approved}}
+                            Yes <button type="button" class="btn btn-sm btn-link p-0 ms-1" vw-site-fix-approve="false">Take back</button>
+                            {{else}}
+                            <button type="button" class="btn btn-sm btn-outline-primary py-0" vw-site-fix-approve="true">Approve</button>
+                            {{/if}}
+                        </td>
                     </tr>
                     {{/each}}
                 </tbody>
@@ -58,3 +68,5 @@
         </div>
     </div>
 </main>
+
+<script src="{{urlpath}}/vw_static/admin_sites.js"></script>

@@ -96,6 +96,10 @@ async fn main() -> Result<(), Error> {
     schedule_jobs(pool.clone());
     // Keykeeper: sends queued events to organizations' security tools.
     keykeeper_streaming::start(pool.clone());
+    // Keykeeper: install command tokens kept the old way get sealed and hashed.
+    if let Err(e) = db::models::upgrade_install_tokens(&pool.get().await.unwrap()).await {
+        error!("Couldn't seal install command tokens: {e:?}");
+    }
     db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().await.unwrap()).await.unwrap();
     db::models::TwoFactor::migrate_credential_to_passkey(&pool.get().await.unwrap()).await.unwrap();
 
@@ -260,6 +264,22 @@ fn launch_info() {
     );
 }
 
+/// Keykeeper: the libraries whose detailed logs carry secrets stay quiet
+/// whatever LOG_LEVEL says, its per-module overrides included: Rocket's form
+/// parser logs every form field at trace (passwords, codes, and tokens sent
+/// to /identity/connect/token), and Handlebars logs the data it renders
+/// (emails' links and codes). See DESIGN.md, "Logs".
+const PINNED_LOG_LEVELS: [(&str, log::LevelFilter); 2] =
+    [("rocket::form", log::LevelFilter::Off), ("handlebars", log::LevelFilter::Warn)];
+
+fn pin_secret_logging(levels: &mut HashMap<&str, log::LevelFilter>) {
+    // A more specific override would win over the pin, so those go.
+    levels.retain(|path, _| {
+        !PINNED_LOG_LEVELS.iter().any(|(pinned, _)| path == pinned || path.starts_with(&format!("{pinned}::")))
+    });
+    levels.extend(PINNED_LOG_LEVELS);
+}
+
 fn init_logging() -> Result<log::LevelFilter, Error> {
     let levels = log::LevelFilter::iter().map(|lvl| lvl.as_str().to_lowercase()).collect::<Vec<String>>().join("|");
     let log_level_rgx_str = format!("^({levels})((,[^,=]+=({levels}))*)$");
@@ -308,13 +328,6 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
         log::LevelFilter::Off
     };
 
-    // Only show handlebar logs when the level is Trace
-    let handlebars_level = if level >= log::LevelFilter::Trace {
-        log::LevelFilter::Trace
-    } else {
-        log::LevelFilter::Warn
-    };
-
     // Enable smtp debug logging only specifically for smtp when need.
     // This can contain sensitive information we do not want in the default debug/trace logging.
     let smtp_log_level = if CONFIG.smtp_debug() {
@@ -343,8 +356,6 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
         ("rocket::shield::shield", log::LevelFilter::Warn),
         ("hyper::proto", log::LevelFilter::Off),
         ("hyper::client", log::LevelFilter::Off),
-        // Filter handlebars logs
-        ("handlebars::render", handlebars_level),
         // Prevent cookie_store logs
         ("cookie_store", log::LevelFilter::Off),
         // Variable level for hickory used by reqwest
@@ -364,6 +375,7 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
     for (path, level) in levels_override {
         let _ = default_levels.insert(path, level);
     }
+    pin_secret_logging(&mut default_levels);
 
     if Some(&log::LevelFilter::Debug) == default_levels.get("lettre::transport::smtp") {
         println!(
@@ -788,4 +800,53 @@ fn schedule_jobs(pool: db::DbPool) {
             }
         })
         .expect("Error spawning job scheduler thread");
+}
+
+// Keykeeper: logging that must stay quiet whatever LOG_LEVEL says.
+#[cfg(test)]
+mod keykeeper_tests {
+    use std::collections::HashMap;
+
+    use super::pin_secret_logging;
+
+    /// The level fern uses for a log target: the most specific module path
+    /// with a level of its own, else the global one.
+    fn level_for(levels: &HashMap<&str, log::LevelFilter>, target: &str, global: log::LevelFilter) -> log::LevelFilter {
+        let mut path = target;
+        loop {
+            if let Some(level) = levels.get(path) {
+                return *level;
+            }
+            match path.rsplit_once("::") {
+                Some((parent, _)) => path = parent,
+                None => return global,
+            }
+        }
+    }
+
+    #[test]
+    fn form_fields_and_rendered_templates_never_reach_the_log() {
+        // LOG_LEVEL=trace,rocket::form::parser=trace,handlebars::render=trace,handlebars=debug,vaultwarden=trace
+        let mut levels = HashMap::from([
+            ("rocket::form::parser", log::LevelFilter::Trace),
+            ("rocket::form", log::LevelFilter::Debug),
+            ("handlebars::render", log::LevelFilter::Trace),
+            ("handlebars", log::LevelFilter::Debug),
+            ("vaultwarden", log::LevelFilter::Trace),
+            ("rocket::server", log::LevelFilter::Warn),
+        ]);
+        pin_secret_logging(&mut levels);
+        let trace = log::LevelFilter::Trace;
+        // Rocket's form parser logs as rocket::form::parser::_ (its indented targets).
+        for target in ["rocket::form::parser::_", "rocket::form::parser", "rocket::form"] {
+            assert_eq!(level_for(&levels, target, trace), log::LevelFilter::Off, "{target}");
+        }
+        for target in ["handlebars::render", "handlebars::template", "handlebars"] {
+            assert_eq!(level_for(&levels, target, trace), log::LevelFilter::Warn, "{target}");
+        }
+        // Everything else keeps what was asked for.
+        assert_eq!(level_for(&levels, "vaultwarden::api", trace), trace);
+        assert_eq!(level_for(&levels, "rocket::server", trace), log::LevelFilter::Warn);
+        assert_eq!(level_for(&levels, "rocket::formatter", trace), trace);
+    }
 }

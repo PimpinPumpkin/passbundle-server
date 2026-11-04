@@ -48,6 +48,55 @@ static LIMITER_LOGIN_ACCOUNT_ANYWHERE: LazyLock<Limiter<AccountKey>> = LazyLock:
 });
 static ACCOUNT_CHECKS: AtomicU32 = AtomicU32::new(0);
 
+// Keykeeper: a device already signed in to an account skips the strict
+// per-network limit, so its owner's own devices always get through. Device
+// ids aren't secret, though, so those logins still count against a limit
+// across the whole account, with the same allowance as the one across every
+// network, but counted apart from it: guesses from unknown devices can't use
+// it up. See DESIGN.md, "Login limits".
+static LIMITER_LOGIN_ACCOUNT_KNOWN_DEVICE: LazyLock<Limiter<AccountKey>> = LazyLock::new(|| {
+    let seconds = Duration::from_secs(CONFIG.login_ratelimit_account_anywhere_seconds());
+    let burst = NonZeroU32::new(CONFIG.login_ratelimit_account_anywhere_max_burst())
+        .expect("Non-zero account login ratelimit burst");
+    RateLimiter::keyed(
+        Quota::with_period(seconds).expect("Non-zero account login ratelimit seconds").allow_burst(burst),
+    )
+});
+
+// Keykeeper: the limiters keyed by address count each IPv6 /64 as one
+// address (a single home or office gets a whole /64, so per address would let
+// one person through 2^64 times), and forget the addresses whose limits have
+// filled back up now and then, so requests from many addresses can't grow
+// them without bound.
+static ADDRESS_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+/// The key for an address: IPv4 as it is (an IPv4-mapped IPv6 address as its
+/// IPv4 address), IPv6 as its /64.
+pub fn ip_key(ip: &IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => *ip,
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let mut network = [0u8; 16];
+            network[..8].copy_from_slice(&v6.octets()[..8]);
+            IpAddr::V6(std::net::Ipv6Addr::from(network))
+        }
+    }
+}
+
+/// Checks an address against one of the limiters keyed by address.
+fn check_address(limiter: &Limiter, ip: &IpAddr) -> bool {
+    if ADDRESS_CHECKS.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {
+        for l in [&*LIMITER_LOGIN, &*LIMITER_PRELOGIN, &*LIMITER_ADMIN, &*LIMITER_UNAUTHENTICATED] {
+            l.retain_recent();
+            l.shrink_to_fit();
+        }
+    }
+    limiter.check_key(&ip_key(ip)).is_ok()
+}
+
 // Keykeeper: pre-login, which every login starts with, gets an address's login
 // allowance, counted on its own, instead of the shared unauthenticated one: it
 // only says how to derive the key, the same way for an email without an
@@ -101,29 +150,26 @@ static LIMITER_UNAUTHENTICATED: LazyLock<Limiter> = LazyLock::new(|| {
 });
 
 pub fn check_limit_unauthenticated(ip: &IpAddr) -> Result<(), Error> {
-    match LIMITER_UNAUTHENTICATED.check_key(ip) {
-        Ok(()) => Ok(()),
-        Err(_e) => {
-            err_code!("Too many requests", 429);
-        }
+    if check_address(&LIMITER_UNAUTHENTICATED, ip) {
+        Ok(())
+    } else {
+        err_code!("Too many requests", 429);
     }
 }
 
 pub fn check_limit_login(ip: &IpAddr) -> Result<(), Error> {
-    match LIMITER_LOGIN.check_key(ip) {
-        Ok(()) => Ok(()),
-        Err(_e) => {
-            err_code!("Too many login requests", 429);
-        }
+    if check_address(&LIMITER_LOGIN, ip) {
+        Ok(())
+    } else {
+        err_code!("Too many login requests", 429);
     }
 }
 
 pub fn check_limit_prelogin(ip: &IpAddr) -> Result<(), Error> {
-    match LIMITER_PRELOGIN.check_key(ip) {
-        Ok(()) => Ok(()),
-        Err(_e) => {
-            err_code!("Too many requests", 429);
-        }
+    if check_address(&LIMITER_PRELOGIN, ip) {
+        Ok(())
+    } else {
+        err_code!("Too many requests", 429);
     }
 }
 
@@ -173,14 +219,19 @@ fn account_allowed(
         && anywhere.check_key(&account_key(username, None)).is_ok()
 }
 
-pub fn check_limit_login_account(username: &str, ip: &IpAddr) -> Result<(), Error> {
-    // Now and then, forget the keys whose limits have filled back up.
+/// Now and then, forgets the account keys whose limits have filled back up.
+fn tidy_account_limiters() {
     if ACCOUNT_CHECKS.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {
-        for limiter in [&*LIMITER_LOGIN_ACCOUNT, &*LIMITER_LOGIN_ACCOUNT_ANYWHERE] {
+        for limiter in [&*LIMITER_LOGIN_ACCOUNT, &*LIMITER_LOGIN_ACCOUNT_ANYWHERE, &*LIMITER_LOGIN_ACCOUNT_KNOWN_DEVICE]
+        {
             limiter.retain_recent();
             limiter.shrink_to_fit();
         }
     }
+}
+
+pub fn check_limit_login_account(username: &str, ip: &IpAddr) -> Result<(), Error> {
+    tidy_account_limiters();
     if account_allowed(&LIMITER_LOGIN_ACCOUNT, &LIMITER_LOGIN_ACCOUNT_ANYWHERE, username, ip) {
         Ok(())
     } else {
@@ -188,12 +239,22 @@ pub fn check_limit_login_account(username: &str, ip: &IpAddr) -> Result<(), Erro
     }
 }
 
+/// Keykeeper: a login from a device already signed in to the account: the
+/// account's own limit for such devices (see LIMITER_LOGIN_ACCOUNT_KNOWN_DEVICE).
+pub fn check_limit_login_known_device(username: &str) -> Result<(), Error> {
+    tidy_account_limiters();
+    if LIMITER_LOGIN_ACCOUNT_KNOWN_DEVICE.check_key(&account_key(username, None)).is_ok() {
+        Ok(())
+    } else {
+        err_code!("Too many login attempts for this account. Wait a minute and try again.", 429);
+    }
+}
+
 pub fn check_limit_admin(ip: &IpAddr) -> Result<(), Error> {
-    match LIMITER_ADMIN.check_key(ip) {
-        Ok(()) => Ok(()),
-        Err(_e) => {
-            err_code!("Too many admin requests", 429);
-        }
+    if check_address(&LIMITER_ADMIN, ip) {
+        Ok(())
+    } else {
+        err_code!("Too many admin requests", 429);
     }
 }
 
@@ -203,7 +264,7 @@ mod tests {
 
     use governor::{Quota, RateLimiter};
 
-    use super::{AccountKey, Limiter, account_allowed};
+    use super::{AccountKey, Limiter, account_allowed, ip_key};
 
     fn limiter(burst: u32) -> Limiter<AccountKey> {
         RateLimiter::keyed(
@@ -248,6 +309,25 @@ mod tests {
         assert!(account_allowed(&per_network, &anywhere, "dana@acme.test", &ip("2001:db8:1:3::1")));
         assert!(account_allowed(&per_network, &anywhere, "dana@acme.test", &ip("192.0.2.1")));
         assert!(!account_allowed(&per_network, &anywhere, "dana@acme.test", &ip("::ffff:192.0.2.9")));
+    }
+
+    #[test]
+    fn addresses_count_ipv6_by_64_and_mapped_ipv4_as_ipv4() {
+        assert_eq!(ip_key(&ip("203.0.113.7")), ip("203.0.113.7"));
+        assert_eq!(ip_key(&ip("::ffff:203.0.113.7")), ip("203.0.113.7"));
+        assert_eq!(ip_key(&ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")), ip("2001:db8:1:2::"));
+        assert_eq!(ip_key(&ip("2001:db8:1:2::1")), ip_key(&ip("2001:db8:1:2:ffff::9")));
+        assert_ne!(ip_key(&ip("2001:db8:1:2::1")), ip_key(&ip("2001:db8:1:3::1")));
+
+        // So one /64 shares one allowance, however many addresses it uses.
+        let limiter: Limiter = RateLimiter::keyed(
+            Quota::with_period(Duration::from_secs(3600)).unwrap().allow_burst(NonZeroU32::new(2).unwrap()),
+        );
+        for n in 1..=2 {
+            assert!(limiter.check_key(&ip_key(&ip(&format!("2001:db8:1:2::{n}")))).is_ok());
+        }
+        assert!(limiter.check_key(&ip_key(&ip("2001:db8:1:2:dead:beef::1"))).is_err());
+        assert!(limiter.check_key(&ip_key(&ip("2001:db8:1:3::1"))).is_ok());
     }
 
     #[test]
