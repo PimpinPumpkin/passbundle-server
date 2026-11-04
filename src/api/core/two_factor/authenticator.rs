@@ -47,6 +47,7 @@ async fn generate_authenticator(data: Json<PasswordOrOtpData>, headers: SetupHea
     Ok(Json(json!({
         "enabled": enabled,
         "key": key,
+        "authenticator": { "enabled": enabled, "key": key },
         "userVerificationToken": keykeeper_verification::token(&user),
         "object": "twoFactorAuthenticator"
     })))
@@ -103,6 +104,8 @@ async fn activate_authenticator(
     let mut answer = json!({
         "enabled": true,
         "key": key,
+        // Keykeeper: as upstream's clients read it, too.
+        "authenticator": { "enabled": true, "key": key },
         "object": "twoFactorAuthenticator"
     });
     // Keykeeper: a setup session ends here.

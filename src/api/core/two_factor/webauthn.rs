@@ -129,10 +129,12 @@ async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn
     let registrations_json: Vec<Value> = registrations.iter().map(WebauthnRegistration::to_json).collect();
 
     // Keykeeper: with the token "Read key" and saving send instead of the
-    // password (keykeeper_verification.rs), as upstream's clients expect.
+    // password (keykeeper_verification.rs), and the details under
+    // "webAuthn" too, as upstream's clients read them.
     Ok(Json(json!({
         "enabled": enabled,
         "keys": registrations_json,
+        "webAuthn": { "enabled": enabled, "keys": registrations_json },
         "userVerificationToken": super::keykeeper_verification::token(&user),
         "object": "twoFactorWebAuthn"
     })))
@@ -174,6 +176,8 @@ async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: Set
     }
 
     let mut challenge_value = serde_json::to_value(challenge.public_key)?;
+    // Keykeeper: and under "options", as upstream's clients read it.
+    challenge_value["options"] = challenge_value.clone();
     challenge_value["status"] = "ok".into();
     challenge_value["errorMessage"] = "".into();
     Ok(Json(challenge_value))
@@ -311,6 +315,8 @@ async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: SetupHeaders
     let mut answer = json!({
         "enabled": true,
         "keys": keys_json,
+        // Keykeeper: as upstream's clients read it, too.
+        "webAuthn": { "enabled": true, "keys": keys_json },
         "object": "twoFactorU2f"
     });
     // Keykeeper: a setup session ends here.
@@ -408,6 +414,8 @@ async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, conn: DbCo
     Ok(Json(json!({
         "enabled": !last_key,
         "keys": keys_json,
+        // Keykeeper: as upstream's clients read it, too.
+        "webAuthn": { "enabled": !last_key, "keys": keys_json },
         "object": "twoFactorU2f"
     })))
 }
