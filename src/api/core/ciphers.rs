@@ -478,6 +478,24 @@ pub async fn update_cipher_from_data(
         err!("Organization mismatch. Please resync the client before updating the cipher")
     }
 
+    // Keykeeper: someone who can't see an item's passwords can't change its
+    // websites, since autofill sends the password where they point. Our apps
+    // send them back exactly as stored, encrypted, so a change shows here
+    // even though the addresses don't (DESIGN.md, "Folders and permissions").
+    if matches!(save, ItemSave::Edit)
+        && ut != UpdateType::None
+        && data.r#type == 1
+        && let Some(org_id) = cipher.organization_uuid.clone()
+    {
+        let access = Access::in_org(&headers.user.uuid, &org_id, conn).await?;
+        let held = collections_of(&cipher.uuid, conn).await?;
+        let item = access.for_item(&org_id, &held).unwrap_or(Grid::NONE);
+        let stored: Value = serde_json::from_str(&cipher.data).unwrap_or(Value::Null);
+        if !item.see_passwords && websites(&stored) != websites(data.login.as_ref().unwrap_or(&Value::Null)) {
+            err!("You can't see this item's passwords, so you can't change its websites.")
+        }
+    }
+
     if let Some(note) = &data.notes {
         let max_note_size = CONFIG._max_note_size();
         if note.len() > max_note_size {
@@ -739,6 +757,26 @@ async fn post_cipher(
     nt: Notify<'_>,
 ) -> JsonResult {
     put_cipher(cipher_id, data, headers, conn, nt).await
+}
+
+/// Keykeeper: a login's websites as stored: each one's encrypted address and
+/// checksum, and how it's matched. Missing and empty are the same.
+fn websites(login: &Value) -> Vec<(Value, Value, Value)> {
+    let part = |uri: &Value, names: &[&str]| {
+        names.iter().find_map(|n| uri.get(*n)).cloned().filter(|v| !v.is_null()).unwrap_or(Value::Null)
+    };
+    login
+        .get("uris")
+        .or_else(|| login.get("Uris"))
+        .and_then(Value::as_array)
+        .map(|uris| {
+            uris.iter()
+                .map(|u| {
+                    (part(u, &["uri", "Uri"]), part(u, &["uriChecksum", "UriChecksum"]), part(u, &["match", "Match"]))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[put("/ciphers/<cipher_id>", data = "<data>")]

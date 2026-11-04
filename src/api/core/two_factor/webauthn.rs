@@ -128,9 +128,12 @@ async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn
     let (enabled, registrations) = get_webauthn_registrations(&user.uuid, &conn).await?;
     let registrations_json: Vec<Value> = registrations.iter().map(WebauthnRegistration::to_json).collect();
 
+    // Keykeeper: with the token "Read key" and saving send instead of the
+    // password (keykeeper_verification.rs), as upstream's clients expect.
     Ok(Json(json!({
         "enabled": enabled,
         "keys": registrations_json,
+        "userVerificationToken": super::keykeeper_verification::token(&user),
         "object": "twoFactorWebAuthn"
     })))
 }
@@ -140,7 +143,7 @@ async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: Set
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
-    data.validate(&user, false, &conn).await?;
+    data.validate_two_step(&user, false, &conn).await?;
 
     let registrations = get_webauthn_registrations(&user.uuid, &conn)
         .await?
@@ -184,6 +187,7 @@ struct EnableWebauthnData {
     device_response: RegisterPublicKeyCredentialCopy,
     master_password_hash: Option<String>,
     otp: Option<String>,
+    user_verification_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,8 +271,9 @@ async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: SetupHeaders
     PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
+        user_verification_token: data.user_verification_token,
     }
-    .validate(&user, true, &conn)
+    .validate_two_step(&user, true, &conn)
     .await?;
 
     // Retrieve and delete the saved challenge state
@@ -322,15 +327,22 @@ async fn activate_webauthn_put(data: Json<EnableWebauthnData>, headers: SetupHea
 #[serde(rename_all = "camelCase")]
 struct DeleteU2FData {
     id: NumberOrString,
-    master_password_hash: String,
+    master_password_hash: Option<String>,
+    user_verification_token: Option<String>,
 }
 
 #[delete("/two-factor/webauthn", data = "<data>")]
 async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, conn: DbConn) -> JsonResult {
+    let data = data.into_inner();
     let id = data.id.into_i32()?;
-    if !headers.user.check_valid_password(&data.master_password_hash) {
-        err!("Invalid password");
+    // Keykeeper: the password, or the dialog's token (keykeeper_verification.rs).
+    PasswordOrOtpData {
+        master_password_hash: data.master_password_hash,
+        otp: None,
+        user_verification_token: data.user_verification_token,
     }
+    .validate_two_step(&headers.user, false, &conn)
+    .await?;
     // Keykeeper: their last method that counts for two-step login for admins
     // may go, which ends their sessions.
     let watch = keykeeper_two_step::Watch::user(&headers.user.uuid, &conn).await?;

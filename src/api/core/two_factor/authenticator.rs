@@ -1,6 +1,7 @@
 use data_encoding::BASE32;
 use rocket::{Route, serde::json::Json};
 
+use super::keykeeper_verification;
 use crate::{
     api::{
         EmptyResult, JsonResult, PasswordOrOtpData,
@@ -41,13 +42,12 @@ async fn generate_authenticator(data: Json<PasswordOrOtpData>, headers: SetupHea
         _ => (false, crypto::encode_random_bytes::<20>(&BASE32)),
     };
 
-    // Upstream seems to also return `userVerificationToken`, but doesn't seem to be used at all.
-    // It should help prevent TOTP disclosure if someone keeps their vault unlocked.
-    // Since it doesn't seem to be used, and also does not cause any issues, lets leave it out of the response.
-    // See: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/Auth/Controllers/TwoFactorController.cs#L94
+    // Keykeeper: with the token the dialog sends next instead of the password
+    // (keykeeper_verification.rs), as upstream's clients expect.
     Ok(Json(json!({
         "enabled": enabled,
         "key": key,
+        "userVerificationToken": keykeeper_verification::token(&user),
         "object": "twoFactorAuthenticator"
     })))
 }
@@ -59,6 +59,7 @@ struct EnableAuthenticatorData {
     token: NumberOrString,
     master_password_hash: Option<String>,
     otp: Option<String>,
+    user_verification_token: Option<String>,
 }
 
 #[post("/two-factor/authenticator", data = "<data>")]
@@ -76,8 +77,9 @@ async fn activate_authenticator(
     PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
+        user_verification_token: data.user_verification_token,
     }
-    .validate(&user, true, &conn)
+    .validate_two_step(&user, true, &conn)
     .await?;
 
     // Validate key as base32 and 20 bytes length
@@ -203,21 +205,33 @@ pub async fn validate_totp_code(
 #[serde(rename_all = "camelCase")]
 struct DisableAuthenticatorData {
     key: String,
-    master_password_hash: String,
-    r#type: NumberOrString,
+    master_password_hash: Option<String>,
+    user_verification_token: Option<String>,
+    #[serde(default)]
+    r#type: Option<NumberOrString>,
 }
 
 #[delete("/two-factor/authenticator", data = "<data>")]
 async fn disable_authenticator(data: Json<DisableAuthenticatorData>, headers: Headers, conn: DbConn) -> JsonResult {
+    let data = data.into_inner();
     let user = headers.user;
-    let type_ = data.r#type.into_i32()?;
+    // Keykeeper: upstream's clients send no type here: it's the authenticator app.
+    let type_ = match data.r#type {
+        Some(t) => t.into_i32()?,
+        None => TwoFactorType::Authenticator as i32,
+    };
     // Keykeeper: their last method that counts for two-step login for admins
     // may go, which ends their sessions.
     let watch = crate::api::core::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
 
-    if !user.check_valid_password(&data.master_password_hash) {
-        err!("Invalid password");
+    // Keykeeper: the password, or the dialog's token (keykeeper_verification.rs).
+    PasswordOrOtpData {
+        master_password_hash: data.master_password_hash,
+        otp: None,
+        user_verification_token: data.user_verification_token,
     }
+    .validate_two_step(&user, false, &conn)
+    .await?;
 
     if let Some(twofactor) = TwoFactor::find_by_user_and_type(&user.uuid, type_, &conn).await {
         if twofactor.data == data.key {

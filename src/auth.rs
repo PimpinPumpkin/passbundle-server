@@ -110,6 +110,7 @@ pub async fn initialize_keys() -> Result<(), Error> {
     crate::api::core::keykeeper_sso::secret::init(&priv_key_der);
     crate::db::models::init_reporter_key(&priv_key_der);
     crate::db::models::init_install_token_key(&priv_key_der);
+    crate::api::core::two_factor::keykeeper_verification::init(&priv_key_der);
 
     // Derived from the RSA key, so it stays the same across restarts without storing another secret
     let prelogin_kdf_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &priv_key_buffer), b"prelogin-kdf");

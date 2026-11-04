@@ -3462,6 +3462,7 @@ async fn put_reset_password_enrollment(
         PasswordOrOtpData {
             master_password_hash: reset_request.master_password_hash,
             otp: reset_request.otp,
+            user_verification_token: None,
         }
         .validate(&headers.user, true, &conn)
         .await?;

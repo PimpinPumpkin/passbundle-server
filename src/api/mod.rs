@@ -56,6 +56,9 @@ struct PasswordOrOtpData {
     #[serde(alias = "MasterPasswordHash")]
     master_password_hash: Option<String>,
     otp: Option<String>,
+    /// Keykeeper: only two-step login's settings take it (`validate_two_step`).
+    #[serde(default, alias = "UserVerificationToken")]
+    user_verification_token: Option<String>,
 }
 
 impl PasswordOrOtpData {
@@ -77,6 +80,23 @@ impl PasswordOrOtpData {
             _ => err!("No validation provided"),
         }
         Ok(())
+    }
+
+    /// Keykeeper: for two-step login's settings only: the master password, a
+    /// one-time code, or the token the dialog's first answer gave once it had
+    /// one of those (two_factor/keykeeper_verification.rs), as upstream's
+    /// clients send it. Nothing else takes the token.
+    pub async fn validate_two_step(&self, user: &User, delete_if_valid: bool, conn: &DbConn) -> EmptyResult {
+        if self.master_password_hash.is_none()
+            && self.otp.is_none()
+            && let Some(token) = self.user_verification_token.as_deref()
+        {
+            if core::two_factor::keykeeper_verification::is_valid(token, user) {
+                return Ok(());
+            }
+            err!("This confirmation has expired. Close this and start again.")
+        }
+        self.validate(user, delete_if_valid, conn).await
     }
 
     /// Keykeeper: a change someone confirms with their master password or a

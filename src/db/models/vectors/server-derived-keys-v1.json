@@ -47,5 +47,29 @@
       "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4e",
       "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"
     ]
+  },
+  "twoStepSettings": {
+    "label": "passbundle two-step settings verification v1",
+    "key": "9f05e56ccf64064ca8d3873885162dd98fb91193ee0fc7c9811ee8ad829bae10",
+    "cases": [
+      {
+        "user": "5b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
+        "securityStamp": "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b",
+        "expires": 1800000600,
+        "token": "v1.AAAAAGtJ1FgvHYZ7q2jUh0KZV4JXZhNcUoWI5U2dnWsThZpKIiQQnQ"
+      },
+      {
+        "user": "5b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
+        "securityStamp": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+        "expires": 1800000600,
+        "token": "v1.AAAAAGtJ1FjaocgX6A0tcnCoTexKFcL831DxGa0hSmle5SHocAGNog"
+      },
+      {
+        "user": "6c2d3e4f-5061-4b7c-9d8e-0f1a2b3c4d5e",
+        "securityStamp": "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b",
+        "expires": 1900000000,
+        "token": "v1.AAAAAHE_swBBjoawGZnNTLPDxhiRUcvFbKMUEP6Ob_36-iiUob51iA"
+      }
+    ]
   }
 }
