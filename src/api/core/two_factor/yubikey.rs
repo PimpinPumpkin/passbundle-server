@@ -62,6 +62,7 @@ struct EnableYubikeyData {
     nfc: bool,
     master_password_hash: Option<String>,
     otp: Option<String>,
+    user_verification_token: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -137,11 +138,14 @@ async fn generate_yubikey(data: Json<PasswordOrOtpData>, headers: Headers, conn:
         result["enabled"] = Value::Bool(true);
         result["nfc"] = Value::Bool(yubikey_metadata.nfc);
         result["object"] = Value::String("twoFactorU2f".to_owned());
+        // Keykeeper: with the token the dialog sends next (keykeeper_verification.rs).
+        result["userVerificationToken"] = json!(super::keykeeper_verification::token(&user));
 
         Ok(Json(result))
     } else {
         Ok(Json(json!({
             "enabled": false,
+            "userVerificationToken": super::keykeeper_verification::token(&user),
             "object": "twoFactorU2f",
         })))
     }
@@ -155,8 +159,9 @@ async fn activate_yubikey(data: Json<EnableYubikeyData>, headers: Headers, conn:
     PasswordOrOtpData {
         master_password_hash: data.master_password_hash.clone(),
         otp: data.otp.clone(),
+        user_verification_token: data.user_verification_token.clone(),
     }
-    .validate(&user, true, &conn)
+    .validate_two_step(&user, true, &conn)
     .await?;
 
     // Check if we already have some data

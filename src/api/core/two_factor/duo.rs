@@ -114,6 +114,7 @@ async fn get_duo(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbC
             "host": data.host,
             "clientSecret": data.sk,
             "clientId": data.ik,
+            "userVerificationToken": super::keykeeper_verification::token(&user),
             "object": "twoFactorDuo"
         })
     } else {
@@ -122,6 +123,7 @@ async fn get_duo(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbC
             "host": null,
             "clientSecret": null,
             "clientId": null,
+            "userVerificationToken": super::keykeeper_verification::token(&user),
             "object": "twoFactorDuo"
         })
     };
@@ -137,6 +139,7 @@ struct EnableDuoData {
     client_id: String,
     master_password_hash: Option<String>,
     otp: Option<String>,
+    user_verification_token: Option<String>,
 }
 
 impl From<EnableDuoData> for DuoData {
@@ -166,8 +169,9 @@ async fn activate_duo(data: Json<EnableDuoData>, headers: SetupHeaders, conn: Db
     PasswordOrOtpData {
         master_password_hash: data.master_password_hash.clone(),
         otp: data.otp.clone(),
+        user_verification_token: data.user_verification_token.clone(),
     }
-    .validate(&user, true, &conn)
+    .validate_two_step(&user, true, &conn)
     .await?;
 
     // Keykeeper: two-step login for admins counts Duo only with this

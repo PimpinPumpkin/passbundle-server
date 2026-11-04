@@ -155,9 +155,11 @@ async fn get_email(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn
             _ => (false, serde_json::value::Value::Null),
         };
 
+    // Keykeeper: with the token the dialog sends next (keykeeper_verification.rs).
     Ok(Json(json!({
         "email": mfa_email,
         "enabled": enabled,
+        "userVerificationToken": super::keykeeper_verification::token(&user),
         "object": "twoFactorEmail"
     })))
 }
@@ -169,6 +171,7 @@ struct SendEmailData {
     email: String,
     master_password_hash: Option<String>,
     otp: Option<String>,
+    user_verification_token: Option<String>,
 }
 
 /// Send a verification email to the specified email address to check whether it exists/belongs to user.
@@ -180,8 +183,9 @@ async fn send_email(data: Json<SendEmailData>, headers: Headers, conn: DbConn) -
     PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
+        user_verification_token: data.user_verification_token,
     }
-    .validate(&user, false, &conn)
+    .validate_two_step(&user, false, &conn)
     .await?;
 
     if !CONFIG._enable_email_2fa() {
@@ -213,6 +217,8 @@ struct EmailData {
     token: String,
     master_password_hash: Option<String>,
     otp: Option<String>,
+    #[serde(default, skip_serializing)]
+    user_verification_token: Option<String>,
 }
 
 /// Verify email belongs to user and can be used for 2FA email codes.
@@ -225,8 +231,9 @@ async fn email(data: Json<EmailData>, headers: Headers, conn: DbConn) -> JsonRes
     PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
+        user_verification_token: data.user_verification_token,
     }
-    .validate(&user, true, &conn)
+    .validate_two_step(&user, true, &conn)
     .await?;
 
     let type_ = TwoFactorType::EmailVerificationChallenge as i32;

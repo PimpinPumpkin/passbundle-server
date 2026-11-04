@@ -28,6 +28,7 @@ pub mod authenticator;
 pub mod duo;
 pub mod duo_oidc;
 pub mod email;
+pub mod keykeeper_verification;
 pub mod protected_actions;
 pub mod webauthn;
 pub mod yubikey;
@@ -140,6 +141,7 @@ async fn disable_twofactor(data: Json<DisableTwoFactorData>, headers: Headers, c
     PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
+        user_verification_token: None,
     }
     .validate(&user, true, &conn)
     .await?;
