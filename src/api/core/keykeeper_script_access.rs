@@ -731,6 +731,21 @@ mod tests {
     }
 
     #[test]
+    fn takes_version_3_seals_as_apps_make_them() {
+        // docs/vectors/script-grants-v3.json in the meta repo (a copy is in
+        // db/models/vectors here): the server can't open the seals, which now
+        // carry when the token ends, and keeps them as they come, within its
+        // limits; the apps decide what they open to.
+        let v: Value = serde_json::from_str(include_str!("../../db/models/vectors/script-grants-v3.json")).unwrap();
+        assert!(valid_encrypted_secret(v["sealedTokenKey"]["encString"].as_str().unwrap()));
+        assert!(valid_enc_string(v["sealedSpec"]["encString"].as_str().unwrap(), MAX_SPEC));
+        for c in v["checks"].as_array().unwrap() {
+            assert!(valid_encrypted_secret(c["sealedKey"].as_str().unwrap()), "{}", c["why"]);
+            assert!(valid_enc_string(c["sealedSpec"].as_str().unwrap(), MAX_SPEC), "{}", c["why"]);
+        }
+    }
+
+    #[test]
     fn reads_the_vectors_authorization_header() {
         // docs/vectors/script-access-v1.json in the meta repo.
         let (id, secret) = parse_authorization(

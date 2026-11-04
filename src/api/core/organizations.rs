@@ -300,6 +300,9 @@ async fn leave_organization(org_id: OrganizationId, headers: OrgMemberHeaders, c
     )
     .await;
 
+    // Keykeeper: leaving is remembered as a removal is, so an install command
+    // they kept only lets them ask to join again (keykeeper_offboarding.rs).
+    super::keykeeper_offboarding::before_leaving(&membership, &conn).await?;
     membership.delete(&conn).await
 }
 
@@ -1089,6 +1092,11 @@ async fn send_invite(
     if new_type != MembershipType::User && headers.membership_type != MembershipType::Owner {
         err!("Only Owners can invite Managers, Admins or Owners")
     }
+    // Keykeeper: once the organization has an owner of its own, only its own
+    // owners invite owners (keykeeper_offboarding.rs).
+    if new_type == MembershipType::Owner {
+        super::keykeeper_offboarding::check_owner_grant(&org_id, &headers.user, &conn).await?;
+    }
 
     // HACK: This converts the Custom role which has the `Manage all collections` box checked into an access_all flag
     // Since the parent checkbox is not sent to the server we need to check and verify the child checkboxes
@@ -1542,6 +1550,9 @@ async fn confirm_invite_impl(
     if member_to_confirm.status != MembershipStatus::Accepted as i32 {
         err!("User in invalid state")
     }
+    // Keykeeper: a role the server accepted for its person waits for them to
+    // accept it, where two-step login for admins covers it (keykeeper_two_step.rs).
+    super::keykeeper_two_step::require_accepted_to_confirm(&member_to_confirm, conn).await?;
 
     member_to_confirm.status = MembershipStatus::Confirmed as i32;
     member_to_confirm.akey = key.to_owned();

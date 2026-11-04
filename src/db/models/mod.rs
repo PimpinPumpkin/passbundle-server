@@ -73,7 +73,8 @@ pub use self::keykeeper_scim::{
 };
 pub use self::keykeeper_script_access::{ScriptGrant, ScriptRead, ScriptToken, parse_networks};
 pub use self::keykeeper_seals::{
-    JoinSeal, JoiningSeal, SealKind, valid_encrypted_secret, valid_expiring_seal, valid_seal,
+    JoinSeal, JoiningSeal, JoiningSealSource, SealKind, joining_seal_source, valid_encrypted_secret,
+    valid_expiring_seal, valid_seal,
 };
 pub use self::keykeeper_site_fixes::{
     Fix, FixField, MspSiteFixReport, MspSiteRule, ProblemField, SiteFix, SiteProblem, init_reporter_key,

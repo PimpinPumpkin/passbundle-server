@@ -11,7 +11,9 @@
 use rocket::{Route, serde::json::Json};
 use serde_json::json;
 
-use super::keykeeper_enrollment::{checked_expiring_seal, checked_seal, checked_secret};
+use super::keykeeper_enrollment::{
+    checked_expiring_seal, checked_joining_seal, checked_seal, checked_secret, joining_source,
+};
 use super::keykeeper_msp::require_admin;
 use super::keykeeper_offboarding::require_client_place;
 use crate::{
@@ -123,7 +125,7 @@ async fn set_msp_seals(msp_id: MspId, data: Json<MspSealsData>, headers: Headers
     }
     for s in &data.joining {
         ours(&s.organization_id)?;
-        checked_seal(Some(&s.seal))?;
+        checked_joining_seal(Some(&s.seal), Some(joining_source(&s.organization_id, &conn).await))?;
     }
     for s in &data.secrets {
         ours(&s.organization_id)?;
@@ -186,7 +188,7 @@ async fn set_org_seals(org_id: OrganizationId, data: Json<OrgSealsData>, headers
         )
     }
     let data = data.into_inner();
-    let seal = checked_seal(data.joining.as_ref())?;
+    let seal = checked_joining_seal(data.joining.as_ref(), Some(joining_source(&org_id, &conn).await))?;
     let secret = checked_secret(data.secret.as_ref())?;
     if seal.is_some() {
         JoiningSeal::set(&org_id, seal, &conn).await?;

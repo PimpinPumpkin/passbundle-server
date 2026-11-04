@@ -6,7 +6,9 @@
 // the apps and checks only that each looks like what it should be.
 // Invitation and staff seals end and carry a nonce (version 2), and the
 // server deletes them once the person they vouch for is confirmed, so each is
-// used once. See DESIGN.md, "Joins a hacked server can't forge".
+// used once. Joining seals say where the setting comes from (version 2): the
+// organization's own, or a default it follows. See DESIGN.md, "Joins a hacked
+// server can't forge".
 
 use diesel::prelude::*;
 
@@ -48,6 +50,34 @@ pub fn valid_expiring_seal(seal: &str, now: i64) -> bool {
         && decodes_to(nonce, 16)
         && mac.len() == 43
         && decodes_to(mac, 32)
+}
+
+/// Where an organization's joining setting comes from, as its joining seal
+/// says: its own setting, or a default it follows (its MSP's, or the
+/// server's outside an MSP).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoiningSealSource {
+    Own,
+    Default,
+}
+
+/// A joining seal, version 2: `v2.<source>.<mac>`, the source `own` or
+/// `default` and the HMAC-SHA256 in base64url without padding, with the
+/// source inside the MAC. The apps check the MAC; the server only checks the
+/// form, and reads the source. Version 1, which said nothing of where the
+/// setting comes from, isn't taken.
+pub fn joining_seal_source(seal: &str) -> Option<JoiningSealSource> {
+    let parts: Vec<&str> = seal.split('.').collect();
+    let ["v2", source, mac] = parts.as_slice() else {
+        return None;
+    };
+    let source = match *source {
+        "own" => JoiningSealSource::Own,
+        "default" => JoiningSealSource::Default,
+        _ => return None,
+    };
+    (mac.len() == 43 && data_encoding::BASE64URL_NOPAD.decode(mac.as_bytes()).is_ok_and(|bytes| bytes.len() == 32))
+        .then_some(source)
 }
 
 /// The install command's join secret, encrypted with the organization's key
@@ -269,6 +299,92 @@ mod tests {
             "",
         ] {
             assert!(!valid_expiring_seal(bad, made), "{bad}");
+        }
+    }
+
+    /// docs/vectors/joining-v2.json in the meta repo (a copy is in vectors/
+    /// here), made with Node's crypto: the server takes version 2 joining
+    /// seals and reads their source, and the vectors' MACs hold, checked here
+    /// with ring as the apps check them, so the vectors are what they say.
+    #[test]
+    fn joining_seals_say_where_the_setting_comes_from() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("vectors/joining-v2.json")).unwrap();
+        let join_key = data_encoding::BASE64.decode(v["joinKey"].as_str().unwrap().as_bytes()).unwrap();
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &join_key);
+        let org = v["inputs"]["organizationId"].as_str().unwrap();
+        let source_of = |name: &str| match name {
+            "own" => JoiningSealSource::Own,
+            "default" => JoiningSealSource::Default,
+            other => panic!("{other}"),
+        };
+        // What an app checks: the seal's form, the source it asks for (if
+        // any), and the MAC over the setting, its domains, and the source.
+        let vouches = |seal: &str, auto_confirm: bool, domains: &[&str], asked: Option<&str>| {
+            let Some(source) = joining_seal_source(seal) else {
+                return false;
+            };
+            if asked.is_some_and(|a| source_of(a) != source) {
+                return false;
+            }
+            let mut sorted = domains.to_vec();
+            sorted.sort_unstable();
+            let source = if source == JoiningSealSource::Own {
+                "own"
+            } else {
+                "default"
+            };
+            let data = [
+                "passbundle joining v2",
+                org,
+                if auto_confirm {
+                    "1"
+                } else {
+                    "0"
+                },
+                &sorted.join(","),
+                source,
+            ]
+            .join("\0");
+            let mac = data_encoding::BASE64URL_NOPAD.decode(seal.rsplit('.').next().unwrap().as_bytes()).unwrap();
+            ring::hmac::verify(&key, data.as_bytes(), &mac).is_ok()
+        };
+        let domains_of = |c: &serde_json::Value| -> Vec<String> {
+            c["domains"].as_array().unwrap().iter().map(|d| d.as_str().unwrap().to_owned()).collect()
+        };
+        for s in v["seals"].as_array().unwrap() {
+            let seal = s["seal"].as_str().unwrap();
+            assert_eq!(joining_seal_source(seal), Some(source_of(s["source"].as_str().unwrap())), "{seal}");
+            let domains = domains_of(s);
+            let domains: Vec<&str> = domains.iter().map(String::as_str).collect();
+            assert!(vouches(seal, s["autoConfirm"].as_bool().unwrap(), &domains, None), "{seal}");
+        }
+        for c in v["checks"].as_array().unwrap() {
+            let domains = domains_of(c);
+            let domains: Vec<&str> = domains.iter().map(String::as_str).collect();
+            assert_eq!(
+                vouches(
+                    c["seal"].as_str().unwrap(),
+                    c["autoConfirm"].as_bool().unwrap(),
+                    &domains,
+                    c["source"].as_str()
+                ),
+                c["vouches"].as_bool().unwrap(),
+                "{}",
+                c["why"]
+            );
+        }
+        // Version 1, and forms that aren't a seal, aren't taken.
+        for bad in [
+            "Lzxr28jrCFbS8FDbf7uxBHX4MyVhlz+g1h1WL/9m2SE=",
+            "v1.own.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYfY",
+            "v2.msp.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYfY",
+            "v2.own.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYf",
+            "v2.own.OKFnhDXt8AwYQaKfXtY+rRA21dE1T4S1ysMUVa-bYfY",
+            "v2.own.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYfY.x",
+            "v2.own",
+            "",
+        ] {
+            assert_eq!(joining_seal_source(bad), None, "{bad}");
         }
     }
 
