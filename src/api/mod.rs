@@ -83,8 +83,8 @@ impl PasswordOrOtpData {
     /// one-time code, as upstream asks before showing an organization's API
     /// key, so a session alone (one that single sign-on started, say) can't
     /// make it: provisioning tokens, single sign-on settings, event
-    /// destinations, and script tokens. See DESIGN.md, "Confirming sensitive
-    /// changes".
+    /// destinations, script tokens, and two-step login for admins and MSP
+    /// staff. See DESIGN.md, "Confirming sensitive changes".
     pub async fn confirm_change(&self, user: &User, conn: &DbConn) -> EmptyResult {
         if self.master_password_hash.is_none() && self.otp.is_none() {
             err!("Confirm this change with your master password")
