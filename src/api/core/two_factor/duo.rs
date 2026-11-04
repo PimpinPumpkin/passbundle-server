@@ -4,10 +4,11 @@ use rocket::{Route, serde::json::Json};
 use crate::{
     CONFIG,
     api::{
-        ApiResult, EmptyResult, JsonResult, PasswordOrOtpData, core::log_user_event,
+        ApiResult, EmptyResult, JsonResult, PasswordOrOtpData,
+        core::keykeeper_two_step::{SetupHeaders, finish_setup},
+        core::log_user_event,
         core::two_factor::generate_recover_code,
     },
-    auth::Headers,
     crypto,
     db::{
         DbConn,
@@ -88,8 +89,11 @@ impl DuoStatus {
 
 const DISABLED_MESSAGE_DEFAULT: &str = "<To use the global Duo keys, please leave these fields untouched>";
 
+// Keykeeper: the setup endpoints also take a setup session (SetupHeaders),
+// which a sign-in gets when the person's role requires two-step login and
+// they haven't set it up (DESIGN.md, "Two-step login for admins").
 #[post("/two-factor/get-duo", data = "<data>")]
-async fn get_duo(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn get_duo(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
@@ -155,7 +159,7 @@ fn check_duo_fields_custom(data: &EnableDuoData) -> bool {
 }
 
 #[post("/two-factor/duo", data = "<data>")]
-async fn activate_duo(data: Json<EnableDuoData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_duo(data: Json<EnableDuoData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     let data: EnableDuoData = data.into_inner();
     let mut user = headers.user;
 
@@ -165,6 +169,23 @@ async fn activate_duo(data: Json<EnableDuoData>, headers: Headers, conn: DbConn)
     }
     .validate(&user, true, &conn)
     .await?;
+
+    // Keykeeper: two-step login for admins counts Duo only with this
+    // server's own Duo account, so a setup session sets up no other; and
+    // replacing it with one's own may take someone's last method that counts.
+    if headers.session.is_some() {
+        if check_duo_fields_custom(&data) {
+            err!(
+                "Two-step login for your role counts Duo only with this server's own Duo account. Leave the Duo fields empty to use it."
+            )
+        }
+        if !super::has_global_duo_credentials() {
+            err!(
+                "This server has no Duo account of its own, so Duo doesn't count for your role. Choose another method."
+            )
+        }
+    }
+    let watch = crate::api::core::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
 
     let (data, data_str) = if check_duo_fields_custom(&data) {
         let data_req: DuoData = data.into();
@@ -181,19 +202,23 @@ async fn activate_duo(data: Json<EnableDuoData>, headers: Headers, conn: DbConn)
 
     generate_recover_code(&mut user, &conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device_type, &headers.ip.ip, &conn).await;
 
-    Ok(Json(json!({
+    let mut answer = json!({
         "enabled": true,
         "host": data.host,
         "clientSecret": data.sk,
         "clientId": data.ik,
         "object": "twoFactorDuo"
-    })))
+    });
+    // Keykeeper: a setup session ends here.
+    finish_setup(headers.session.as_ref(), &mut user, &mut answer, &conn).await?;
+    watch.settle(&conn).await?;
+    Ok(Json(answer))
 }
 
 #[put("/two-factor/duo", data = "<data>")]
-async fn activate_duo_put(data: Json<EnableDuoData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_duo_put(data: Json<EnableDuoData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
     activate_duo(data, headers, conn).await
 }
 

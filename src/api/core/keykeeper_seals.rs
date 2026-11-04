@@ -11,7 +11,7 @@
 use rocket::{Route, serde::json::Json};
 use serde_json::json;
 
-use super::keykeeper_enrollment::{checked_seal, checked_secret};
+use super::keykeeper_enrollment::{checked_expiring_seal, checked_seal, checked_secret};
 use super::keykeeper_msp::require_admin;
 use super::keykeeper_offboarding::require_client_place;
 use crate::{
@@ -79,12 +79,15 @@ struct MspSealsData {
     joining: Vec<OrgSeal>,
     #[serde(default)]
     secrets: Vec<OrgSecret>,
+    /// Client seals: that each organization is this MSP's client.
+    #[serde(default)]
+    clients: Vec<OrgSeal>,
 }
 
 /// An MSP admin's app seals staff members' places in its clients, clients'
-/// joining settings, and their install commands' join secrets. MSP admins
-/// only, for the MSP's own clients, and staff seals only for its staff or
-/// people it invited.
+/// joining settings, their install commands' join secrets, and that each is
+/// the MSP's client. MSP admins only, for the MSP's own clients, and staff
+/// seals only for its staff or people it invited.
 #[put("/keykeeper/msp/<msp_id>/seals", data = "<data>")]
 async fn set_msp_seals(msp_id: MspId, data: Json<MspSealsData>, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
@@ -109,10 +112,14 @@ async fn set_msp_seals(msp_id: MspId, data: Json<MspSealsData>, headers: Headers
     // Everything is checked before anything is saved.
     for s in &data.staff {
         ours(&s.organization_id)?;
-        checked_seal(Some(&s.seal))?;
+        checked_expiring_seal(Some(&s.seal))?;
         if !staff_emails.contains(&s.email.to_lowercase()) {
             err!("That person isn't on your staff or invited to it")
         }
+    }
+    for s in &data.clients {
+        ours(&s.organization_id)?;
+        checked_seal(Some(&s.seal))?;
     }
     for s in &data.joining {
         ours(&s.organization_id)?;
@@ -130,6 +137,7 @@ async fn set_msp_seals(msp_id: MspId, data: Json<MspSealsData>, headers: Headers
         .map(|s| &s.organization_id)
         .chain(data.joining.iter().map(|s| &s.organization_id))
         .chain(data.secrets.iter().map(|s| &s.organization_id))
+        .chain(data.clients.iter().map(|s| &s.organization_id))
         .collect();
     for org in touched {
         require_client_place(org, &headers.user.uuid, true, &conn).await?;
@@ -143,6 +151,11 @@ async fn set_msp_seals(msp_id: MspId, data: Json<MspSealsData>, headers: Headers
     for s in data.secrets {
         if let Some(mut client) = MspClient::find_by_org(&s.organization_id, &conn).await {
             client.set_enrollment_secret(Some(s.secret), &conn).await?;
+        }
+    }
+    for s in &data.clients {
+        if let Some(mut client) = MspClient::find_by_org(&s.organization_id, &conn).await {
+            client.set_client_seal(&s.seal, &conn).await?;
         }
     }
     Ok(Json(json!({})))

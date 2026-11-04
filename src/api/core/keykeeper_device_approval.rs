@@ -15,7 +15,10 @@ use rocket::{
 };
 
 use crate::{
-    api::{EmptyResult, core::keykeeper_sso},
+    api::{
+        EmptyResult,
+        core::{keykeeper_sso, keykeeper_two_step},
+    },
     auth::{AuthMethod, decode_login},
     db::{
         DbConn,
@@ -101,7 +104,10 @@ pub fn is_requesting_device(request: &AuthRequest, device_identifier: Option<&De
 ///   with its single sign-on does so, linked or not. The password grant
 ///   checks it for both kinds already (keykeeper_sso::password_requirement);
 ///   this holds it here too, so it can't come apart from this path.
-/// - An admin two-step rule, when there is one, belongs here too.
+/// - Two-step login for admins: someone it covers who has no method that
+///   counts is refused, with no setup session, since that takes a password
+///   (keykeeper_two_step::check_approved_sign_in). The password's path starts
+///   one instead (keykeeper_two_step::check_sign_in).
 pub async fn approved_sign_in_rules(user: &User, _device: &Device, conn: &DbConn) -> EmptyResult {
     if let Some(identifier) = keykeeper_sso::required_identifier(&user.uuid, conn).await {
         let message = "Your organization requires you to sign in with single sign-on.";
@@ -115,7 +121,7 @@ pub async fn approved_sign_in_rules(user: &User, _device: &Device, conn: &DbConn
             "Single sign-on required; a device's approval doesn't stand in for it."
         )
     }
-    Ok(())
+    keykeeper_two_step::check_approved_sign_in(user, conn).await
 }
 
 /// For the server's request log: a request's answer is read with its access

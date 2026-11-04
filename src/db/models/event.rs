@@ -149,6 +149,10 @@ pub enum EventType {
     // Keykeeper: the organization's single sign-on settings changed (its
     // tenant, app, secret, or identifier).
     KeykeeperSsoSettingsChanged = 1694,
+    // Keykeeper: the organization turned two-step login for its admins on or
+    // off (keykeeper_two_step).
+    KeykeeperAdminTwoStepOn = 1695,
+    KeykeeperAdminTwoStepOff = 1696,
     // OrganizationVaultAccessed = 1603,
     // Keykeeper: the organization's single sign-on turned on or off.
     OrganizationEnabledSso = 1604,

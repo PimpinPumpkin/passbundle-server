@@ -33,6 +33,7 @@ table! {
         templates_collection -> Nullable<Text>,
         enrollment_secret -> Nullable<Text>,
         enrollment_token_hash -> Nullable<Text>,
+        client_seal -> Nullable<Text>,
     }
 }
 
@@ -524,6 +525,35 @@ table! {
         user_uuid -> Text,
         org_uuid -> Text,
         created_at -> Timestamp,
+    }
+}
+
+table! {
+    org_admin_two_step (org_uuid) {
+        org_uuid -> Text,
+        required -> Bool,
+    }
+}
+
+table! {
+    msp_staff_two_step (msp_uuid) {
+        msp_uuid -> Text,
+        required -> Bool,
+    }
+}
+
+table! {
+    two_step_setup_sessions (session_hash) {
+        session_hash -> Text,
+        user_uuid -> Text,
+        device_type -> Integer,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
+    unaccepted_memberships (membership_uuid) {
+        membership_uuid -> Text,
     }
 }
 

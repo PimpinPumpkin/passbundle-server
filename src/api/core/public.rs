@@ -78,6 +78,8 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             }
         // If user is part of the organization, restore it
         } else if let Some(mut member) = Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await {
+            // Keykeeper: restored, they may come under two-step login for admins.
+            let watch = crate::api::core::keykeeper_two_step::Watch::user(&member.user_uuid, &conn).await?;
             let mut restored = member.atype != MembershipType::Owner && member.restore();
             let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
             // Enforce org policies as every other restore path does.
@@ -93,6 +95,7 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             if restored {
                 offboarding::after_restore(&member, offboarding::By::Directory, &conn).await?;
             }
+            watch.settle(&conn).await?;
         } else {
             // If user is not part of the organization
             let user = if let Some(user) = User::find_by_mail(&user_data.email, &conn).await {
@@ -127,6 +130,11 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             new_member.status = member_status;
 
             new_member.save(&conn).await?;
+            // Keykeeper: joined at once without email, so not by them.
+            if member_status == MembershipStatus::Accepted as i32 {
+                crate::api::core::keykeeper_two_step::accepted_without_them(vec![new_member.uuid.clone()], &conn)
+                    .await?;
+            }
 
             // Keykeeper: the organization's invitation lifetime.
             let hours = invite_hours(&org_id, &conn).await;

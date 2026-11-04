@@ -415,6 +415,7 @@ fn create_auth_tokens_impl(
         sub: AuthMethod::Sso,
         device_token: device.refresh_token.clone(),
         token: Some(token),
+        kk_sso_org: None,
     };
 
     Ok(AuthTokens {

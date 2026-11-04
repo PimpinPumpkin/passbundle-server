@@ -1049,7 +1049,7 @@ impl InviteData {
 
         // Keykeeper: seals are checked before anyone is invited.
         for seal in self.keykeeper_seals.values() {
-            super::keykeeper_enrollment::checked_seal(Some(seal))?;
+            super::keykeeper_enrollment::checked_expiring_seal(Some(seal))?;
         }
 
         Ok(())
@@ -1158,11 +1158,18 @@ async fn send_invite(
             }
         };
 
+        // Keykeeper: an account invited without email joins at once, and may
+        // come under two-step login for admins.
+        let watch = super::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
         let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(headers.user.email.clone()));
         new_member.access_all = access_all;
         new_member.atype = new_type;
         new_member.status = member_status;
         new_member.save(&conn).await?;
+        // Keykeeper: joined at once without email, so not by them.
+        if member_status == MembershipStatus::Accepted as i32 {
+            super::keykeeper_two_step::accepted_without_them(vec![new_member.uuid.clone()], &conn).await?;
+        }
         if custom_role.is_some() {
             crate::db::models::keykeeper_roles::set(&new_member.uuid, custom_role.as_ref(), &conn).await?;
         }
@@ -1172,7 +1179,7 @@ async fn send_invite(
             &org_id,
             email,
             crate::db::models::SealKind::Invite,
-            super::keykeeper_enrollment::checked_seal(seal)?,
+            super::keykeeper_enrollment::checked_expiring_seal(seal)?,
             &conn,
         )
         .await?;
@@ -1237,6 +1244,7 @@ async fn send_invite(
             let mut group_entry = GroupUser::new(group_id.clone(), new_member.uuid.clone());
             group_entry.save(&conn).await?;
         }
+        watch.settle(&conn).await?;
     }
 
     Ok(())
@@ -1353,9 +1361,14 @@ async fn reinvite_member_impl(
         invitation.save(conn).await?;
     } else {
         Invitation::take(&user.email, conn).await;
+        // Keykeeper: joining may bring them under two-step login for admins.
+        let watch = super::keykeeper_two_step::Watch::user(&user.uuid, conn).await?;
         let mut member = member;
         member.status = MembershipStatus::Accepted as i32;
         member.save(conn).await?;
+        // Keykeeper: joined at once without email, so not by them.
+        super::keykeeper_two_step::accepted_without_them(vec![member.uuid.clone()], conn).await?;
+        watch.settle(conn).await?;
     }
 
     Ok(())
@@ -1562,6 +1575,14 @@ async fn confirm_invite_impl(
     }
 
     let save_result = member_to_confirm.save(conn).await;
+
+    // Keykeeper: the seals that vouched for them are used up (DESIGN.md,
+    // "Joins a hacked server can't forge").
+    if save_result.is_ok()
+        && let Some(user) = User::find_by_uuid(&member_to_confirm.user_uuid, conn).await
+    {
+        crate::db::models::JoinSeal::used_up(org_id, &user.email, conn).await?;
+    }
 
     // Keykeeper: a client's own members get its Templates collection,
     // read-only, once they're in. Every way in ends here.
@@ -1771,6 +1792,8 @@ async fn edit_member(
         }
     }
 
+    // Keykeeper: a new role may bring them under two-step login for admins.
+    let watch = super::keykeeper_two_step::Watch::user(&member_to_edit.user_uuid, &conn).await?;
     member_to_edit.access_all = access_all;
     member_to_edit.atype = new_type as i32;
 
@@ -1826,7 +1849,8 @@ async fn edit_member(
 
     // Keykeeper: keep the custom role in step with the edit.
     crate::db::models::keykeeper_roles::set(&member_to_edit.uuid, custom_role.as_ref(), &conn).await?;
-    member_to_edit.save(&conn).await
+    member_to_edit.save(&conn).await?;
+    watch.settle(&conn).await
 }
 
 #[delete("/organizations/<org_id>/users", data = "<data>")]
@@ -2713,12 +2737,15 @@ async fn restore_member_impl(
             let by = super::keykeeper_offboarding::By::Member(&headers.user);
             super::keykeeper_offboarding::check_restore(&member, by, conn).await?;
 
+            // Keykeeper: restored, they may come under two-step login for admins.
+            let watch = super::keykeeper_two_step::Watch::user(&member.user_uuid, conn).await?;
             member.restore();
             // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
             // This check need to be done after restoring to work with the correct status
             OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
             member.save(conn).await?;
             super::keykeeper_offboarding::after_restore(&member, by, conn).await?;
+            watch.settle(conn).await?;
             // Keykeeper: so a later revoke here stays one provisioning can't undo.
             crate::db::models::ScimUser::admin_decided(&member.uuid, conn).await?;
 
@@ -3272,6 +3299,10 @@ async fn recover_account(
         }
     }
 
+    // Keykeeper: resetting two-step login may take the last method that counts
+    // from someone two-step login for admins covers, which ends their sessions
+    // (a new master password ends them anyway).
+    let watch = super::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
     if req.reset_two_factor {
         TwoFactor::delete_all_by_user(&user.uuid, &conn).await?;
         Device::clear_twofactor_remember_by_user(&user.uuid, &conn).await?;
@@ -3282,6 +3313,7 @@ async fn recover_account(
     }
 
     user.save(&conn).await?;
+    watch.settle(&conn).await?;
 
     nt.send_logout(&user, None, &conn).await;
 

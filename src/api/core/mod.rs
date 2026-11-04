@@ -23,6 +23,7 @@ mod keykeeper_script_access;
 mod keykeeper_seals;
 mod keykeeper_site_fixes;
 pub mod keykeeper_sso;
+pub mod keykeeper_two_step;
 mod keykeeper_user_settings;
 mod keykeeper_vault_lock;
 mod organizations;
@@ -82,6 +83,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_script_access::routes());
     routes.append(&mut keykeeper_site_fixes::routes());
     routes.append(&mut keykeeper_sso::routes());
+    routes.append(&mut keykeeper_two_step::routes());
     routes.append(&mut keykeeper_user_settings::routes());
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
@@ -338,6 +340,8 @@ async fn accept_org_invite(
             "MSP staff can't join an organization's account recovery. Ask its admins to turn off automatic enrollment for you, or join with another account."
         )
     }
+    // Keykeeper: joining may bring them under two-step login for admins.
+    let watch = keykeeper_two_step::Watch::user(&user.uuid, conn).await?;
     member.status = MembershipStatus::Accepted as i32;
     member.reset_password_key = reset_password_key;
 
@@ -345,6 +349,7 @@ async fn accept_org_invite(
     OrgPolicy::check_user_allowed(&member, "join", conn).await?;
 
     member.save(conn).await?;
+    watch.settle(conn).await?;
 
     if CONFIG.mail_enabled() && notify_inviter {
         let Some(org) = Organization::find_by_uuid(&member.org_uuid, conn).await else {
