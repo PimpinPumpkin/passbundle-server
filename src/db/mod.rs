@@ -231,6 +231,30 @@ impl DbPool {
         })
     }
 
+    /// Keykeeper: a database of its own for one unit test, a new SQLite file
+    /// in the temporary folder with every migration run, so a test can call
+    /// the server's own functions on real rows. Its one connection is the
+    /// test's.
+    #[cfg(all(test, sqlite))]
+    pub async fn for_test() -> DbConn {
+        let path = std::env::temp_dir().join(format!("keykeeper-test-{}.sqlite3", crate::util::get_uuid()));
+        let url = path.to_string_lossy().into_owned();
+        sqlite_migrations::run_migrations(&url).expect("the migrations run");
+        drop(ACTIVE_DB_TYPE.set(DbConnType::Sqlite));
+        let pool = Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(DbConnOptions {
+                init_stmts: DbConnType::Sqlite.default_init_stmts(),
+            }))
+            .build(DbConnManager::new(&url))
+            .expect("a pool for the test's database");
+        let pool = DbPool {
+            pool: Some(pool),
+            semaphore: Arc::new(Semaphore::new(1)),
+        };
+        pool.get().await.expect("a connection to the test's database")
+    }
+
     // Get a connection from the pool
     pub async fn get(&self) -> Result<DbConn, Error> {
         let duration = Duration::from_secs(CONFIG.database_timeout());

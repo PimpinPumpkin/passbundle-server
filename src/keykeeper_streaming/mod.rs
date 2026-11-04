@@ -1132,9 +1132,37 @@ async fn deliver_claimed(pool: &DbPool, uuid: &str) -> bool {
             EventKind::Syslog => (SYSLOG_BATCH, BULK_TURN),
             EventKind::Sentinel => (SENTINEL_BATCH, BULK_TURN),
         };
-        let due = EventDelivery::due(uuid, batch, &conn).await;
+        let fetched = EventDelivery::due(uuid, batch, &conn).await;
+        let fetched_all = fetched.len() >= usize::try_from(batch).unwrap_or(usize::MAX);
+        // Keykeeper: only what its maker may still see goes; the rest is
+        // dropped, checked on every delivery (DESIGN.md, "Offboarding").
+        let mut may_send: HashMap<Option<String>, bool> = HashMap::new();
+        let mut due = Vec::new();
+        let mut withheld = Vec::new();
+        for delivery in fetched {
+            let allowed = if let Some(allowed) = may_send.get(&delivery.source) {
+                *allowed
+            } else {
+                let allowed =
+                    crate::api::core::destination_may_send(&destination, delivery.source.as_deref(), &conn).await;
+                may_send.insert(delivery.source.clone(), allowed);
+                allowed
+            };
+            if allowed {
+                due.push(delivery);
+            } else {
+                withheld.push(delivery.event_uuid);
+            }
+        }
+        let withheld_any = !withheld.is_empty();
+        if withheld_any {
+            EventDelivery::done(uuid, withheld, &conn).await;
+        }
         drop(conn);
         if due.is_empty() {
+            if withheld_any && fetched_all {
+                continue;
+            }
             break End::Done;
         }
         let events: Vec<(String, String)> = due.iter().map(|d| (d.event_uuid.clone(), d.payload.clone())).collect();
@@ -1188,7 +1216,7 @@ async fn deliver_claimed(pool: &DbPool, uuid: &str) -> bool {
         if sent_total >= turn_events {
             break End::More;
         }
-        if due.len() < usize::try_from(batch).unwrap_or(usize::MAX) {
+        if !fetched_all {
             break End::Done;
         }
     };

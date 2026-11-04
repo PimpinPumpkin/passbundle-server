@@ -1787,13 +1787,15 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
     // Keykeeper: with the requesting device's identifier, as upstream's
     // answer has it, so the apps prompt once per device (a "Resend" replaces
     // the request in place).
+    // Keykeeper: a request that's gone (answered no, replaced, or cleaned up
+    // after it expired) and one that has expired but is still kept answer the
+    // same: 404, whenever the cleanup runs.
     let Some(auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
-        err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
+        err_code!("This sign-in request has expired or was answered", 404)
     };
-    // Keykeeper: an expired request is gone.
     if auth_request.is_expired() {
-        err_code!("This sign-in request has expired", 404)
+        err_code!("This sign-in request has expired or was answered", 404)
     }
 
     let response_date_utc = auth_request.response_date.map(|response_date| format_date(&response_date));
@@ -1836,18 +1838,18 @@ async fn put_auth_request(
     nt: Notify<'_>,
 ) -> JsonResult {
     let data = data.into_inner();
+    // Keykeeper: gone or expired, the same 404, whenever the cleanup runs.
     let Some(mut auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
-        err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
+        err_code!("This sign-in request has expired or was answered", 404)
     };
 
     if headers.device.uuid != data.device_identifier {
         err!("AuthRequest doesn't exist", "Device verification failed")
     }
 
-    // Keykeeper: an expired request is gone.
     if auth_request.is_expired() {
-        err_code!("This sign-in request has expired", 404)
+        err_code!("This sign-in request has expired or was answered", 404)
     }
 
     if auth_request.approved.is_some() {

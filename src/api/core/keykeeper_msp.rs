@@ -276,7 +276,7 @@ async fn add_msp_membership(
 /// client removed or revoked. Additions and role changes happen only in
 /// clients where `actor`, who made the change, has a place of their own
 /// (keykeeper_offboarding.rs); removals happen everywhere.
-async fn sync_staff_memberships(
+pub(super) async fn sync_staff_memberships(
     msp_id: &MspId,
     staff: &MspStaff,
     actor: Option<&UserId>,
@@ -680,8 +680,8 @@ async fn end_recovery_enrollments(user_id: &UserId, conn: &DbConn) -> EmptyResul
 
 /// Puts someone on the MSP's staff and adds them to the clients they reach,
 /// waiting for the org key: the clients where whoever invited them has a
-/// place of their own.
-async fn add_to_staff(
+/// place of their own, never one that removed or revoked whoever invited them.
+pub(super) async fn add_to_staff(
     msp_id: &MspId,
     user: &User,
     role: MspRole,
@@ -701,6 +701,11 @@ async fn add_to_staff(
         staff.set_access(access, conn).await?;
     }
     let inviter = User::find_by_mail(added_by, conn).await.map(|u| u.uuid);
+    // Keykeeper: and a client that removed or revoked whoever invited them
+    // keeps them out too, whoever makes the next staff change.
+    if let Some(inviter) = &inviter {
+        super::keykeeper_offboarding::carry_client_removals(msp_id, inviter, &user.uuid, conn).await?;
+    }
     sync_staff_memberships(msp_id, &staff, inviter.as_ref(), added_by, conn).await?;
     watch.settle(conn).await
 }
@@ -1149,7 +1154,8 @@ async fn pending_confirmations(msp_id: MspId, headers: Headers, conn: DbConn) ->
                 "name": user.name,
                 "publicKey": public_key,
                 "fromMsp": from_msp,
-                "autoConfirm": crate::db::models::confirms_automatically(auto_confirm, &member, &conn).await,
+                "autoConfirm": crate::db::models::confirms_automatically(auto_confirm, &member, &conn).await
+                    && !keykeeper_two_step::must_accept_first(&member, &conn).await,
                 "needsTwoStep": crate::db::models::OrgPolicy::waits_for_two_step(&member, &conn).await,
             });
             super::keykeeper_joining::extend(
@@ -1175,7 +1181,8 @@ fn parse_before(before: Option<&str>) -> Result<Option<chrono::NaiveDateTime>, c
 }
 
 /// The MSP's audit log, newest first. Any of its staff, though a technician
-/// limited to chosen clients doesn't see entries about other clients. Pages
+/// limited to chosen clients doesn't see entries about other clients, and
+/// nobody sees entries about a client that removed or revoked them. Pages
 /// with `before`, the time of the oldest entry already shown.
 #[get("/keykeeper/msp/<msp_id>/events?<before>&<limit>")]
 async fn list_events(
@@ -1186,34 +1193,38 @@ async fn list_events(
     conn: DbConn,
 ) -> JsonResult {
     let caller = staff_member(&msp_id, &headers.user.uuid, &conn).await?;
+    // Keykeeper: a client that removed or revoked them is out of their reach
+    // here too (keykeeper_offboarding.rs).
+    let closed = super::keykeeper_offboarding::clients_closed_to(&msp_id, &headers.user.uuid, &conn).await;
     let only = caller.reach(&conn).await.map(|r| r.into_iter().collect());
     let before_time = parse_before(before.as_deref())?;
     let limit = limit.unwrap_or(100).clamp(1, MAX_EVENTS);
     // Technicians see their clients' activity without where it came from,
     // and of the MSP's own changes to its staff, only their own.
     let technician = caller.role() != Some(MspRole::Admin);
-    let events: Vec<Value> = MspEvent::find_by_msp(&msp_id, before_time, only, limit, &conn)
-        .await
-        .into_iter()
-        .filter(|e| {
-            !technician
-                || !e.event.starts_with("staff_")
-                || e.target_email.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&headers.user.email))
-        })
-        .map(|e| {
-            json!({
-                "id": e.uuid,
-                "date": crate::util::format_date(&e.created_at),
-                "event": e.event,
-                "actorEmail": e.actor_email,
-                "organizationId": e.org_uuid,
-                "organizationName": e.org_name,
-                "targetEmail": e.target_email,
-                "detail": e.detail,
-                "ip": if technician { None } else { e.ip },
+    let events: Vec<Value> =
+        MspEvent::find_by_msp(&msp_id, before_time, only, closed.into_iter().collect(), limit, &conn)
+            .await
+            .into_iter()
+            .filter(|e| {
+                !technician
+                    || !e.event.starts_with("staff_")
+                    || e.target_email.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&headers.user.email))
             })
-        })
-        .collect();
+            .map(|e| {
+                json!({
+                    "id": e.uuid,
+                    "date": crate::util::format_date(&e.created_at),
+                    "event": e.event,
+                    "actorEmail": e.actor_email,
+                    "organizationId": e.org_uuid,
+                    "organizationName": e.org_name,
+                    "targetEmail": e.target_email,
+                    "detail": e.detail,
+                    "ip": if technician { None } else { e.ip },
+                })
+            })
+            .collect();
     Ok(Json(json!({ "data": events })))
 }
 

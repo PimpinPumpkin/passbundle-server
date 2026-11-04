@@ -34,6 +34,8 @@ pub use accounts::purge_auth_requests;
 pub use ciphers::{CipherData, CipherSyncData, CipherSyncType, purge_trashed_ciphers};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
+// Keykeeper: an event destination sends only while its maker has access.
+pub use keykeeper_offboarding::destination_may_send;
 // Keykeeper: a tab's reload key goes when its account's sessions do.
 pub use keykeeper_reload_keys::forget_user as forget_reload_keys;
 // Keykeeper: provisioning (SCIM), mounted at /scim.

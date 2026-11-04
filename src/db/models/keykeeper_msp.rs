@@ -1037,11 +1037,13 @@ impl MspEvent {
     }
 
     /// The newest events first, older than `before` if given. With `only`,
-    /// just the MSP-wide events and those about the clients listed.
+    /// just the MSP-wide events and those about the clients listed; never
+    /// those about the clients in `except`.
     pub async fn find_by_msp(
         msp_uuid: &MspId,
         before: Option<NaiveDateTime>,
         only: Option<Vec<OrganizationId>>,
+        except: Vec<OrganizationId>,
         limit: i64,
         conn: &DbConn,
     ) -> Vec<Self> {
@@ -1052,6 +1054,9 @@ impl MspEvent {
             }
             if let Some(only) = only {
                 query = query.filter(msp_events::org_uuid.is_null().or(msp_events::org_uuid.eq_any(only)));
+            }
+            if !except.is_empty() {
+                query = query.filter(msp_events::org_uuid.is_null().or(msp_events::org_uuid.ne_all(except)));
             }
             query.order(msp_events::created_at.desc()).limit(limit).load::<Self>(conn).unwrap_or_default()
         })

@@ -18,10 +18,10 @@ use crate::{
     db::{
         DbConn,
         models::{
-            EnrollmentDomains, INVITE_HOURS, JoinSeal, Joining, JoiningSeal, JoiningSource, Membership,
-            MembershipStatus, MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspJoining, MspMembership,
-            OrgJoining, OrgPolicy, OrgSetup, Organization, OrganizationId, SealKind, User, confirms_automatically,
-            effective_joining, msp_default,
+            EnrollmentDomains, INVITE_HOURS, JoinSeal, Joining, JoiningSeal, JoiningSealSource, JoiningSource,
+            Membership, MembershipStatus, MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspJoining,
+            MspMembership, OrgJoining, OrgPolicy, OrgSetup, Organization, OrganizationId, SealKind, User,
+            confirms_automatically, effective_joining, msp_default,
         },
     },
 };
@@ -162,7 +162,7 @@ async fn set_org_joining(
 ) -> JsonResult {
     require_owner_or_admin(&org_id, &headers, &conn).await?;
     let data = data.into_inner();
-    let seal = super::keykeeper_enrollment::checked_seal(data.seal.as_ref())?;
+    let seal = super::keykeeper_enrollment::checked_joining_seal(data.seal.as_ref(), Some(JoiningSealSource::Own))?;
     let joining = data.checked()?;
     OrgJoining::new(org_id.clone(), joining).save(&conn).await?;
     JoiningSeal::set(&org_id, seal, &conn).await?;
@@ -180,7 +180,7 @@ async fn reset_org_joining(
 ) -> JsonResult {
     require_owner_or_admin(&org_id, &headers, &conn).await?;
     let data = data.map(Json::into_inner).unwrap_or_default();
-    let seal = super::keykeeper_enrollment::checked_seal(data.seal.as_ref())?;
+    let seal = super::keykeeper_enrollment::checked_joining_seal(data.seal.as_ref(), Some(JoiningSealSource::Default))?;
     OrgJoining::delete(&org_id, &conn).await?;
     JoiningSeal::set(&org_id, seal, &conn).await?;
     record_for_msp(&org_id, "client_joining_default", String::new(), &headers, &conn).await?;
@@ -231,7 +231,7 @@ async fn set_msp_joining(msp_id: MspId, data: Json<JoiningData>, headers: Header
     let data = data.into_inner();
     let joining = data.checked()?;
     for seal in data.seals.values() {
-        super::keykeeper_enrollment::checked_seal(Some(seal))?;
+        super::keykeeper_enrollment::checked_joining_seal(Some(seal), Some(JoiningSealSource::Default))?;
     }
     // Keykeeper: a client following the default where the caller has no place
     // of their own (it may have revoked them) keeps how people join it now,
@@ -346,7 +346,8 @@ async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
                 "email": user.email,
                 "publicKey": public_key,
                 "fromMsp": from_msp,
-                "autoConfirm": confirms_automatically(joining.auto_confirm, &member, &conn).await,
+                "autoConfirm": confirms_automatically(joining.auto_confirm, &member, &conn).await
+                    && !super::keykeeper_two_step::must_accept_first(&member, &conn).await,
                 "needsTwoStep": OrgPolicy::waits_for_two_step(&member, &conn).await,
             });
             extend(&mut entry, vouching(&caller.org_uuid, &member, &user.email, from_msp, &conn).await);
