@@ -783,11 +783,13 @@ async fn put_org_setting(
         err_code!("Organization not found", Status::NotFound.code)
     }
     let data = data.into_inner();
-    data.verification.confirm_change(&headers.user, &conn).await?;
     let required = data.required;
     if !required && OrgAdminTwoStep::required(&org_id, &conn).await? {
         require_caller_meets(&headers.user, &session, &conn).await?;
     }
+    // Keykeeper: and the caller confirms it with their master password or a
+    // one-time code (DESIGN.md, "Confirming sensitive changes").
+    data.verification.confirm_change(&headers.user, &conn).await?;
     let changed =
         set_org_required(&org_id, required, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn).await?;
     if changed && let Some(client) = MspClient::find_by_org(&org_id, &conn).await {
@@ -877,12 +879,14 @@ async fn put_msp_setting(
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let caller = staff_member(&msp_id, &headers.user.uuid, &conn).await?;
     let data = data.into_inner();
-    data.verification.confirm_change(&headers.user, &conn).await?;
     let required = data.staff_required;
     if MspStaffTwoStep::required(&msp_id, &conn).await? != required {
         if !required {
             require_caller_meets(&headers.user, &session, &conn).await?;
         }
+        // Keykeeper: and the caller confirms it with their master password or
+        // a one-time code (DESIGN.md, "Confirming sensitive changes").
+        data.verification.confirm_change(&headers.user, &conn).await?;
         let staff = if required {
             MspStaff::find_by_msp(&msp_id, &conn).await.into_iter().map(|s| s.user_uuid).collect()
         } else {
