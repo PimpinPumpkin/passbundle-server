@@ -29,10 +29,11 @@ use crate::{
     db::{
         DbConn,
         models::{
-            CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, Membership, MembershipStatus, MembershipType,
-            Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgPolicy, OrgSetup, Organization,
-            OrganizationId, RemovedMember, ScimUser, User, effective_joining, email_in_domains,
-            parse_enrollment_domains, valid_encrypted_secret, valid_expiring_seal, valid_seal,
+            CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, JoiningSealSource, Membership,
+            MembershipStatus, MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole,
+            OrgJoining, OrgPolicy, OrgSetup, Organization, OrganizationId, RemovedMember, ScimUser, User,
+            effective_joining, email_in_domains, joining_seal_source, parse_enrollment_domains, valid_encrypted_secret,
+            valid_expiring_seal, valid_seal,
         },
     },
     mail,
@@ -130,6 +131,36 @@ pub(super) fn checked_seal(seal: Option<&String>) -> Result<Option<&str>, crate:
     }
 }
 
+/// A joining seal from an app, checked to look like one (version 2, which
+/// says where the setting comes from) and, with `from`, to say it comes from
+/// there, as the change it comes with makes it: an organization's own
+/// setting, or a default it follows. None when there isn't one.
+pub(super) fn checked_joining_seal(
+    seal: Option<&String>,
+    from: Option<JoiningSealSource>,
+) -> Result<Option<&str>, crate::error::Error> {
+    let Some(seal) = seal else {
+        return Ok(None);
+    };
+    match joining_seal_source(seal) {
+        None => err!("That seal isn't one. Reload and try again."),
+        Some(source) if from.is_some_and(|from| from != source) => {
+            err!("That seal says the setting comes from elsewhere. Reload and try again.")
+        }
+        Some(_) => Ok(Some(seal.as_str())),
+    }
+}
+
+/// Where an organization's joining setting comes from now: its own, or a
+/// default it follows.
+pub(super) async fn joining_source(org_id: &OrganizationId, conn: &DbConn) -> JoiningSealSource {
+    if OrgJoining::find(org_id, conn).await.is_some() {
+        JoiningSealSource::Own
+    } else {
+        JoiningSealSource::Default
+    }
+}
+
 /// An invitation's or staff member's seal from an app, checked to look like
 /// one (version 2, which ends) and not to have ended. None when there isn't one.
 pub(super) fn checked_expiring_seal(seal: Option<&String>) -> Result<Option<&str>, crate::error::Error> {
@@ -167,7 +198,9 @@ async fn save_domains(
     data: &DomainsData,
     conn: &DbConn,
 ) -> Result<Vec<String>, crate::error::Error> {
-    let seal = checked_seal(data.seal.as_ref())?;
+    // The app keeps where the setting comes from as the old seal says, or
+    // its own setting when that doesn't vouch, so either is taken here.
+    let seal = checked_joining_seal(data.seal.as_ref(), None)?;
     let domains = match parse_enrollment_domains(&data.domains) {
         Ok(domains) => domains,
         Err(e) => err!(e),

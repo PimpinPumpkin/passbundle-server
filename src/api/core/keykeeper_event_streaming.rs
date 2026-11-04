@@ -153,13 +153,21 @@ fn status(d: &EventDestination) -> &'static str {
 
 async fn view(d: &EventDestination, conn: &DbConn) -> Value {
     let settings = d.settings();
+    // Keykeeper: on, but sending nothing, since whoever set it up no longer
+    // has access (keykeeper_offboarding.rs).
+    let source = d.org_uuid.as_ref().map(ToString::to_string);
+    let stopped = d.enabled && !super::destination_may_send(d, source.as_deref(), conn).await;
     let mut out = json!({
         "id": d.uuid,
         "name": d.name,
         "kind": d.kind,
         "enabled": d.enabled,
         "target": d.shown_target,
-        "status": status(d),
+        "status": if stopped {
+            "stopped"
+        } else {
+            status(d)
+        },
         "pausedReason": d.paused_reason,
         "failures": d.failures,
         "failingSince": d.failing_since.as_ref().map(format_date),

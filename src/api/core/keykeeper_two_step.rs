@@ -921,6 +921,59 @@ pub async fn accepted_without_them(ids: Vec<crate::db::models::MembershipId>, co
     UnacceptedMembership::mark(ids, conn).await
 }
 
+/// Whether a membership waits for its person to accept it before it's let in
+/// or takes on a role the rule covers: the server accepted it for them (on a
+/// server that sends no email), its role is covered (`elevated`), and its
+/// organization requires two-step login for admins. The rule doesn't count it
+/// until they accept it, so holding that role first would mean holding it
+/// without two-step login. A database error counts as yes.
+async fn waits_to_accept(member: &Membership, elevated: bool, conn: &DbConn) -> bool {
+    elevated
+        && UnacceptedMembership::is(&member.uuid, conn).await
+        && OrgAdminTwoStep::required(&member.org_uuid, conn).await.unwrap_or(true)
+}
+
+/// Whether someone waiting to be let in must first accept their role
+/// themselves (`waits_to_accept`): the apps don't let them in on their own,
+/// and confirming them is refused until they do.
+pub async fn must_accept_first(member: &Membership, conn: &DbConn) -> bool {
+    waits_to_accept(member, covered_role(member, conn).await, conn).await
+}
+
+/// Refuses confirming someone whose role waits for them to accept it
+/// (`must_accept_first`), saying so.
+pub async fn require_accepted_to_confirm(member: &Membership, conn: &DbConn) -> EmptyResult {
+    if must_accept_first(member, conn).await {
+        let email = User::find_by_uuid(&member.user_uuid, conn).await.map(|u| u.email);
+        err!(format!(
+            "{} hasn't accepted their role yet. This server sends no email, so PassBundle asks them first, on their vault page, since the role requires two-step login. Confirm them once they accept it.",
+            email.unwrap_or_default().escape_debug()
+        ))
+    }
+    Ok(())
+}
+
+/// Refuses giving someone whose membership the server accepted for them, and
+/// who hasn't accepted it, a role the rule covers (`elevated`) where their
+/// organization requires it: they'd hold it without two-step login. They can
+/// be invited again in that role, and accept it on their vault page.
+pub async fn require_accepted_to_promote(member: &Membership, elevated: bool, conn: &DbConn) -> EmptyResult {
+    if !covered_role(member, conn).await && waits_to_accept(member, elevated, conn).await {
+        let email = User::find_by_uuid(&member.user_uuid, conn).await.map(|u| u.email);
+        err!(format!(
+            "{} hasn't accepted their place here yet (this server sends no email), so they can't take on a role that requires two-step login. Remove them and invite them in that role: they accept it on their vault page.",
+            email.unwrap_or_default().escape_debug()
+        ))
+    }
+    Ok(())
+}
+
+/// Whether a role is one the rule covers: an owner, an admin, or a custom
+/// role that manages members, policies, or account recovery.
+pub fn elevated_role(atype: MembershipType, custom: Option<&keykeeper_roles::CustomPermissions>) -> bool {
+    atype == MembershipType::Owner || atype == MembershipType::Admin || custom.is_some_and(elevated_permissions)
+}
+
 fn role_name(member: &Membership) -> &'static str {
     if member.atype == MembershipType::Owner as i32 {
         "owner"

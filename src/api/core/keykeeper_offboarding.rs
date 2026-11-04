@@ -17,6 +17,16 @@
 // - Removing an MSP revokes the script and provisioning tokens its people
 //   made, deletes the event destinations they set up and their staff seals,
 //   and tells the client's owner what went, and what to review.
+// - Leaving on one's own is remembered as a removal is, so rejoining with a
+//   kept install command waits for an admin.
+// - Once a client has an owner of its own, only its own owners invite or make
+//   owners, so an MSP's people can't add a second account of their own as one.
+// - An event destination sends only while whoever set it up still has access
+//   to the organization the event came from, checked on every delivery, as
+//   tokens are.
+// - A client's removal or revocation of an MSP admin holds against the MSP's
+//   staff changes: the staff that admin brings in afterward stay out of that
+//   client too, and the admin no longer sees that client's activity.
 //
 // See DESIGN.md, "Offboarding", in the meta repo.
 
@@ -29,8 +39,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            EventDestination, JoinSeal, Membership, MembershipStatus, MembershipType, MspId, MspMembership,
-            Organization, OrganizationId, RemovedMember, ScimToken, ScriptToken, SealKind, SsoConfig, User, UserId,
+            EventDestination, JoinSeal, Membership, MembershipStatus, MembershipType, MspClient, MspId, MspMembership,
+            MspRole, Organization, OrganizationId, RemovedMember, ScimToken, ScriptToken, SealKind, SsoConfig, User,
+            UserId,
         },
     },
     util::format_date,
@@ -80,6 +91,28 @@ pub(super) async fn protect_own_owner(target: &Membership, caller: &User, what: 
     Ok(())
 }
 
+/// Whether the organization has an owner of its own (`is_own_owner`).
+async fn has_own_owner(org_id: &OrganizationId, conn: &DbConn) -> bool {
+    for owner in Membership::find_by_org_and_type(org_id, MembershipType::Owner, conn).await {
+        if is_own_owner(&owner, conn).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Once an organization has an owner of its own, only its own owners invite
+/// owners or make someone one. Otherwise an MSP's person could add a second
+/// account of their own as an owner the MSP didn't add, which the client's
+/// protections would then cover, and remove or demote the client's real
+/// owners with it. A client with no owners of its own is the MSP's to run.
+pub(super) async fn check_owner_grant(org_id: &OrganizationId, caller: &User, conn: &DbConn) -> EmptyResult {
+    if is_msp_caller(org_id, &caller.uuid, conn).await && has_own_owner(org_id, conn).await {
+        err!("Only the organization's own owners can make someone an owner here, not its IT provider's staff.")
+    }
+    Ok(())
+}
+
 /// Deleting an organization needs one of its own owners while it has any.
 pub(super) async fn ensure_may_delete_org(org_id: &OrganizationId, caller: &User, conn: &DbConn) -> EmptyResult {
     if !is_msp_caller(org_id, &caller.uuid, conn).await {
@@ -107,7 +140,13 @@ pub(super) async fn check_role_change(
 ) -> EmptyResult {
     if new_type != MembershipType::Owner {
         protect_own_owner(target, caller, "change the role of", conn).await?;
+    } else if target.atype != MembershipType::Owner as i32 {
+        check_owner_grant(&target.org_uuid, caller, conn).await?;
     }
+    // Keykeeper: and a role two-step login for admins covers waits for its
+    // person to accept their place, where the server accepted it for them.
+    let elevated = super::keykeeper_two_step::elevated_role(new_type, custom);
+    super::keykeeper_two_step::require_accepted_to_promote(target, elevated, conn).await?;
     if MspMembership::find_by_membership(&target.uuid, conn).await.is_none()
         || is_msp_caller(&target.org_uuid, &caller.uuid, conn).await
     {
@@ -173,6 +212,21 @@ pub(super) async fn before_removal(member: &Membership, by: By<'_>, conn: &DbCon
         }
         None => RemovedMember::record(org, &member.user_uuid, None, false, conn).await,
     }
+}
+
+/// Before someone leaves an organization on their own: it remembers them as
+/// it remembers someone it removed, so an install command they kept only
+/// lets them ask to join again, and an admin approves them; and their
+/// invitation and staff seals go. One of its MSP's people who leaves stays out
+/// until someone there invites them again: the MSP's staff changes don't add
+/// them back.
+pub(super) async fn before_leaving(member: &Membership, conn: &DbConn) -> EmptyResult {
+    let org = &member.org_uuid;
+    if let Some(email) = email_of(&member.user_uuid, conn).await {
+        JoinSeal::set(org, &email, SealKind::Invite, None, conn).await?;
+        JoinSeal::set(org, &email, SealKind::Staff, None, conn).await?;
+    }
+    RemovedMember::record(org, &member.user_uuid, None, false, conn).await
 }
 
 /// Before the organization's own people revoke one of its MSP's people: the
@@ -273,6 +327,85 @@ pub(super) async fn client_place_refusal(org_id: &OrganizationId, conn: &DbConn)
     )
 }
 
+/// Whether an event destination may send an event that came from this
+/// organization (`source`; none for an MSP's own activity): only while
+/// whoever set it up still has access to it, checked on every delivery, as
+/// tokens are. An organization's destination needs its maker still a
+/// confirmed owner or admin there (for an MSP's person, still an admin of the
+/// MSP), as only they set one up; an MSP's needs its maker still one of the
+/// MSP's admins, and sends a client's events only while that client hasn't
+/// removed or revoked them. Their account must be on; once it's deleted, the
+/// destination sends nothing. A database error counts as no.
+pub async fn destination_may_send(destination: &EventDestination, source: Option<&str>, conn: &DbConn) -> bool {
+    let Some(maker) = &destination.created_by else {
+        return false;
+    };
+    if let Some(org) = &destination.org_uuid {
+        return source.is_none_or(|s| s == org.as_ref())
+            && super::keykeeper_script_access::creator_has_access(org, maker, conn).await;
+    }
+    let Some(msp) = &destination.msp_uuid else {
+        return false;
+    };
+    if !User::find_by_uuid(maker, conn).await.is_some_and(|u| u.enabled)
+        || !matches!(super::keykeeper_msp::staff_role(msp, maker, conn).await, Ok(MspRole::Admin))
+    {
+        return false;
+    }
+    match source {
+        None => true,
+        Some(org) => !closed_to(&OrganizationId::from(org.to_owned()), msp, maker, conn).await,
+    }
+}
+
+/// Whether a client removed or revoked one of its MSP's people itself. A
+/// database error counts as yes.
+async fn closed_to(org_id: &OrganizationId, msp: &MspId, user_id: &UserId, conn: &DbConn) -> bool {
+    match RemovedMember::try_find(org_id, user_id, conn).await {
+        Ok(record) => record.is_some_and(|r| r.msp_uuid.as_ref() == Some(msp)),
+        Err(_) => true,
+    }
+}
+
+/// The MSP's clients that removed or revoked this person themselves: their
+/// activity is no longer theirs to read in the MSP's log. A client that
+/// removed its MSP isn't one of its clients any more, and the MSP keeps its
+/// history of it.
+pub(super) async fn clients_closed_to(msp: &MspId, user_id: &UserId, conn: &DbConn) -> HashSet<OrganizationId> {
+    let clients: HashSet<OrganizationId> =
+        MspClient::find_by_msp(msp, conn).await.into_iter().map(|c| c.org_uuid).collect();
+    RemovedMember::find_by_msp(msp, conn)
+        .await
+        .into_iter()
+        .filter(|r| &r.user_uuid == user_id && clients.contains(&r.org_uuid))
+        .map(|r| r.org_uuid)
+        .collect()
+}
+
+/// When someone joins an MSP's staff: each client that removed or revoked
+/// whoever invited them keeps them out too, as removed by the client. A
+/// client's revocation of an MSP admin would otherwise give way: the admin
+/// invites a second account of their own, which joins only the clients where
+/// the admin has a place, but the next staff change another admin makes for
+/// it would add it everywhere. Only the client's own people can invite them
+/// there. A client where they already have a membership of their own is left
+/// alone.
+pub(super) async fn carry_client_removals(
+    msp: &MspId,
+    inviter: &UserId,
+    joining: &UserId,
+    conn: &DbConn,
+) -> EmptyResult {
+    for removal in RemovedMember::find_by_msp(msp, conn).await {
+        if &removal.user_uuid == inviter
+            && Membership::find_by_user_and_org(joining, &removal.org_uuid, conn).await.is_none()
+        {
+            RemovedMember::record(&removal.org_uuid, joining, Some(msp), false, conn).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Deletes the organization's event destinations these people set up.
 async fn delete_destinations(
     org_id: &OrganizationId,
@@ -352,4 +485,222 @@ pub(super) async fn cut_msp_out(
         "staffSealsDeleted": staff_seals,
         "singleSignOn": sso,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::keykeeper_two_step::{require_accepted_to_confirm, require_accepted_to_promote};
+    use super::*;
+    use crate::db::{
+        DbPool,
+        models::{EventKind, Msp, MspRole, MspStaff, OrgAdminTwoStep, UnacceptedMembership, confirms_automatically},
+    };
+
+    async fn person(name: &str, conn: &DbConn) -> User {
+        let mut user = User::new(&format!("{name}@example.test"), None);
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    async fn organization(name: &str, conn: &DbConn) -> Organization {
+        let org = Organization::new(name.to_owned(), "billing@example.test", None, None);
+        org.save(conn).await.unwrap();
+        org
+    }
+
+    async fn join(user: &User, org: &Organization, atype: MembershipType, conn: &DbConn) -> Membership {
+        let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
+        member.atype = atype as i32;
+        member.status = MembershipStatus::Confirmed as i32;
+        member.access_all = atype != MembershipType::User;
+        member.save(conn).await.unwrap();
+        member
+    }
+
+    /// An MSP, with these people as its admins.
+    async fn msp(admins: &[&User], conn: &DbConn) -> MspId {
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(conn).await.unwrap();
+        for admin in admins {
+            MspStaff::new(msp.uuid.clone(), admin.uuid.clone(), MspRole::Admin).insert(conn).await.unwrap();
+        }
+        msp.uuid
+    }
+
+    /// A client of the MSP, with its admins in it as the MSP's owners.
+    async fn client(name: &str, msp: &MspId, admins: &[&User], conn: &DbConn) -> Organization {
+        let org = organization(name, conn).await;
+        MspClient {
+            org_uuid: org.uuid.clone(),
+            msp_uuid: msp.clone(),
+            created_at: chrono::Utc::now().naive_utc(),
+            preset: None,
+            enrollment_token: None,
+            enrollment_token_created_at: None,
+            everyone_collection: None,
+            templates_collection: None,
+            enrollment_secret: None,
+            enrollment_token_hash: None,
+            client_seal: None,
+        }
+        .insert(conn)
+        .await
+        .unwrap();
+        for admin in admins {
+            let member = join(admin, &org, MembershipType::Owner, conn).await;
+            MspMembership::new(member.uuid.clone(), msp.clone()).insert(conn).await.unwrap();
+        }
+        org
+    }
+
+    #[rocket::async_test]
+    async fn leaving_is_remembered_so_rejoining_waits_for_an_admin() {
+        let conn = DbPool::for_test().await;
+        let org = organization("Contoso", &conn).await;
+        let ana = person("ana", &conn).await;
+        let member = join(&ana, &org, MembershipType::User, &conn).await;
+        JoinSeal::set(&org.uuid, &ana.email, SealKind::Invite, Some("seal"), &conn).await.unwrap();
+
+        before_leaving(&member, &conn).await.unwrap();
+        member.delete(&conn).await.unwrap();
+        assert!(RemovedMember::exists(&org.uuid, &ana.uuid, &conn).await);
+        assert_eq!(JoinSeal::find(&org.uuid, &ana.email, SealKind::Invite, &conn).await, None);
+
+        // She asks to join again, with the install command she kept: an admin
+        // approves her, however the organization lets people in.
+        let mut again = Membership::new(ana.uuid.clone(), org.uuid.clone(), None);
+        again.status = MembershipStatus::Accepted as i32;
+        again.save(&conn).await.unwrap();
+        assert!(!confirms_automatically(true, &again, &conn).await);
+    }
+
+    #[rocket::async_test]
+    async fn an_msp_admin_cant_make_another_account_an_owner_once_the_client_has_its_own() {
+        let conn = DbPool::for_test().await;
+        let mia = person("mia", &conn).await;
+        let msp = msp(&[&mia], &conn).await;
+        let acme = client("Acme Dental", &msp, &[&mia], &conn).await;
+        let own = person("owner", &conn).await;
+        join(&own, &acme, MembershipType::Owner, &conn).await;
+
+        // Inviting an owner, or making someone one: only the client's own owners.
+        assert!(check_owner_grant(&acme.uuid, &mia, &conn).await.is_err());
+        assert!(check_owner_grant(&acme.uuid, &own, &conn).await.is_ok());
+        let second = person("mia-again", &conn).await;
+        let admin = join(&second, &acme, MembershipType::Admin, &conn).await;
+        assert!(check_role_change(&admin, MembershipType::Owner, true, None, &mia, &conn).await.is_err());
+        assert!(check_role_change(&admin, MembershipType::Owner, true, None, &own, &conn).await.is_ok());
+
+        // A client with no owners of its own is the MSP's to run.
+        let solo = client("Solo Law", &msp, &[&mia], &conn).await;
+        assert!(check_owner_grant(&solo.uuid, &mia, &conn).await.is_ok());
+    }
+
+    #[rocket::async_test]
+    async fn an_event_destination_sends_only_while_its_maker_has_access() {
+        let conn = DbPool::for_test().await;
+        let org = organization("Contoso", &conn).await;
+        let owner = person("owner", &conn).await;
+        join(&owner, &org, MembershipType::Owner, &conn).await;
+        let maker = person("maker", &conn).await;
+        let mut member = join(&maker, &org, MembershipType::Admin, &conn).await;
+        let destination = EventDestination::new(
+            Some(org.uuid.clone()),
+            None,
+            "SIEM".to_owned(),
+            EventKind::Webhook,
+            maker.uuid.clone(),
+        );
+        let source = org.uuid.to_string();
+        assert!(destination_may_send(&destination, Some(&source), &conn).await);
+        // Another organization's events never go there.
+        assert!(!destination_may_send(&destination, Some("another-org"), &conn).await);
+
+        member.atype = MembershipType::User as i32;
+        member.save(&conn).await.unwrap();
+        assert!(!destination_may_send(&destination, Some(&source), &conn).await);
+        member.atype = MembershipType::Admin as i32;
+        member.save(&conn).await.unwrap();
+        assert!(destination_may_send(&destination, Some(&source), &conn).await);
+        member.delete(&conn).await.unwrap();
+        assert!(!destination_may_send(&destination, Some(&source), &conn).await);
+
+        // An MSP's: while its maker is an admin of the MSP, and not for a
+        // client that removed or revoked them.
+        let mia = person("mia", &conn).await;
+        let msp = msp(&[&mia], &conn).await;
+        let acme = client("Acme Dental", &msp, &[&mia], &conn).await;
+        let bayside = client("Bayside Law", &msp, &[&mia], &conn).await;
+        let feed =
+            EventDestination::new(None, Some(msp.clone()), "MDR".to_owned(), EventKind::Syslog, mia.uuid.clone());
+        assert!(destination_may_send(&feed, Some(&acme.uuid.to_string()), &conn).await);
+        RemovedMember::record(&acme.uuid, &mia.uuid, Some(&msp), true, &conn).await.unwrap();
+        assert!(!destination_may_send(&feed, Some(&acme.uuid.to_string()), &conn).await);
+        assert!(destination_may_send(&feed, Some(&bayside.uuid.to_string()), &conn).await);
+        assert!(destination_may_send(&feed, None, &conn).await);
+        MspStaff::find(&msp, &mia.uuid, &conn).await.unwrap().delete(&conn).await.unwrap();
+        assert!(!destination_may_send(&feed, Some(&bayside.uuid.to_string()), &conn).await);
+        assert!(!destination_may_send(&feed, None, &conn).await);
+    }
+
+    #[rocket::async_test]
+    async fn a_clients_revocation_of_an_msp_admin_holds_against_staff_changes_and_its_log() {
+        let conn = DbPool::for_test().await;
+        let mia = person("mia", &conn).await;
+        let bob = person("bob", &conn).await;
+        let msp = msp(&[&mia, &bob], &conn).await;
+        let acme = client("Acme Dental", &msp, &[&mia, &bob], &conn).await;
+        let bayside = client("Bayside Law", &msp, &[&mia, &bob], &conn).await;
+
+        // Acme revokes Mia.
+        let mut revoked = Membership::find_by_user_and_org(&mia.uuid, &acme.uuid, &conn).await.unwrap();
+        revoked.status = MembershipStatus::Revoked as i32;
+        revoked.save(&conn).await.unwrap();
+        RemovedMember::record(&acme.uuid, &mia.uuid, Some(&msp), true, &conn).await.unwrap();
+
+        // She invites a second account of hers; it joins Bayside only.
+        let second = person("mia-again", &conn).await;
+        super::super::keykeeper_msp::add_to_staff(&msp, &second, MspRole::Admin, None, &mia.email, &conn)
+            .await
+            .unwrap();
+        assert!(Membership::find_by_user_and_org(&second.uuid, &acme.uuid, &conn).await.is_none());
+        assert!(Membership::find_by_user_and_org(&second.uuid, &bayside.uuid, &conn).await.is_some());
+
+        // Bob's next change to it doesn't add it to Acme either.
+        let staff = MspStaff::find(&msp, &second.uuid, &conn).await.unwrap();
+        super::super::keykeeper_msp::sync_staff_memberships(&msp, &staff, Some(&bob.uuid), &bob.email, &conn)
+            .await
+            .unwrap();
+        assert!(Membership::find_by_user_and_org(&second.uuid, &acme.uuid, &conn).await.is_none());
+
+        // And Mia no longer reads Acme's activity; Bob does.
+        assert_eq!(clients_closed_to(&msp, &mia.uuid, &conn).await, HashSet::from([acme.uuid.clone()]));
+        assert!(clients_closed_to(&msp, &bob.uuid, &conn).await.is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn a_role_the_server_accepted_for_someone_waits_for_them_to_accept_it() {
+        let conn = DbPool::for_test().await;
+        let org = organization("Contoso", &conn).await;
+        OrgAdminTwoStep::set(&org.uuid, true, &conn).await.unwrap();
+        let ana = person("ana", &conn).await;
+        let mut admin = join(&ana, &org, MembershipType::Admin, &conn).await;
+        admin.status = MembershipStatus::Accepted as i32;
+        admin.save(&conn).await.unwrap();
+        UnacceptedMembership::mark(vec![admin.uuid.clone()], &conn).await.unwrap();
+        assert!(require_accepted_to_confirm(&admin, &conn).await.is_err());
+
+        // A regular member the server accepted for them isn't made an admin either.
+        let ben = person("ben", &conn).await;
+        let member = join(&ben, &org, MembershipType::User, &conn).await;
+        UnacceptedMembership::mark(vec![member.uuid.clone()], &conn).await.unwrap();
+        assert!(require_accepted_to_promote(&member, true, &conn).await.is_err());
+        assert!(require_accepted_to_promote(&member, false, &conn).await.is_ok());
+
+        // Once they accept, or where the organization doesn't require it, it goes ahead.
+        UnacceptedMembership::accept(&admin.uuid, &conn).await.unwrap();
+        assert!(require_accepted_to_confirm(&admin, &conn).await.is_ok());
+        OrgAdminTwoStep::set(&org.uuid, false, &conn).await.unwrap();
+        assert!(require_accepted_to_promote(&member, true, &conn).await.is_ok());
+    }
 }
