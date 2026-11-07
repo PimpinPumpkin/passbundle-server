@@ -2361,7 +2361,13 @@ async fn get_policy(org_id: OrganizationId, pol_type: i32, headers: AdminHeaders
         None => OrgPolicy::new(org_id.clone(), pol_type_enum, false, "null".to_owned()),
     };
 
-    Ok(Json(policy.to_json()))
+    // Keykeeper: one the organization's MSP requires for every client can't
+    // be changed here, so upstream's policy dialog doesn't offer to save it.
+    let mut policy = policy.to_json();
+    if super::keykeeper_msp_policies::is_locked(&org_id, pol_type, &conn).await {
+        policy["canToggleState"] = json!(false);
+    }
+    Ok(Json(policy))
 }
 
 // Keykeeper: visible to keykeeper_msp_policies, which builds one per default.
@@ -2396,6 +2402,11 @@ async fn put_policy(
     let Some(pol_type_enum) = OrgPolicyType::from_i32(pol_type) else {
         err!("Invalid or unsupported policy type")
     };
+
+    // Keykeeper: a policy the organization's MSP requires for every client
+    // changes only in the MSP's console, whoever asks here (DESIGN.md,
+    // "Required for every client"). A 400, which doesn't sign anyone out.
+    super::keykeeper_msp_policies::refuse_if_required(&org_id, pol_type, data.enabled, &conn).await?;
 
     // Keykeeper: the rest is set_policy, shared with MSP default policies so a
     // default reaches each client with the same checks and side effects.

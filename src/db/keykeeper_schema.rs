@@ -112,6 +112,15 @@ table! {
         atype -> Integer,
         enabled -> Bool,
         data -> Text,
+        required -> Bool,
+    }
+}
+
+table! {
+    msp_required_had_own (msp_uuid, atype, org_uuid) {
+        msp_uuid -> Text,
+        atype -> Integer,
+        org_uuid -> Text,
     }
 }
 
