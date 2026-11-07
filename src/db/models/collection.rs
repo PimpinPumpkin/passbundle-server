@@ -32,6 +32,10 @@ pub struct Collection {
     pub org_uuid: OrganizationId,
     pub name: String,
     pub external_id: Option<String>,
+    /// Keykeeper: the folder's icon and color, encrypted with the
+    /// organization's key by the apps as its name is, or none for the plain
+    /// folder (DESIGN.md, "Folder icons"). The server only keeps it.
+    pub keykeeper_look: Option<String>,
 }
 
 #[derive(Identifiable, Queryable, Insertable)]
@@ -61,6 +65,7 @@ impl Collection {
             org_uuid,
             name,
             external_id: None,
+            keykeeper_look: None,
         };
 
         new_model.set_external_id(external_id);
@@ -78,6 +83,8 @@ impl Collection {
             "type": 0,
             // This is only used together with MyItems/DefaultUserCollection, which we do not yet support.
             "defaultUserCollectionEmail": null,
+            // Keykeeper: encrypted, as the name is; upstream's apps ignore it.
+            "keykeeperLook": self.keykeeper_look,
             "object": "collection",
         })
     }
@@ -129,6 +136,21 @@ impl Collection {
         json_object["hidePasswords"] = json!(hide_passwords);
         json_object["manage"] = json!(manage);
         json_object["keykeeper"] = grid.to_json();
+        json_object
+    }
+
+    /// Keykeeper: the folder for the person who just saved it, with whether
+    /// they have it (`assigned`). Upstream's web vault reads a save's answer
+    /// as a folder's access details, and takes a folder whose answer doesn't
+    /// say `assigned` out of the person's own list until the next sync, so a
+    /// folder made or renamed in the web vault's menu went missing from it.
+    pub async fn to_json_saved(&self, user_uuid: &UserId, conn: &DbConn) -> Value {
+        let mut json_object = self.to_json_details(user_uuid, None, conn).await;
+        let assigned = match Membership::find_by_user_and_org(user_uuid, &self.org_uuid, conn).await {
+            Some(member) => Self::can_access_collection(&member, &self.uuid, conn).await,
+            None => false,
+        };
+        json_object["assigned"] = json!(assigned);
         json_object
     }
 
