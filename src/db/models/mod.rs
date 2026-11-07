@@ -64,7 +64,7 @@ pub use self::keykeeper_joining::{
 };
 pub use self::keykeeper_msp::{
     CustomRole, EnrollmentDomains, Msp, MspClient, MspEnrollmentJoin, MspEvent, MspId, MspInvite, MspMembership,
-    MspPolicy, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,
+    MspPolicy, MspRequiredHadOwn, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,
     exempt_from_member_policies, exempt_from_two_step_policy, parse_enrollment_domains,
 };
 pub use self::keykeeper_msp_seats::ClientSeats;
