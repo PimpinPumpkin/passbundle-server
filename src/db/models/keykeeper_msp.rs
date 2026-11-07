@@ -22,8 +22,8 @@ use crate::{
         DbConn,
         keykeeper_schema::{
             enrollment_domains, msp_clients, msp_enrollment_joins, msp_events, msp_invites, msp_memberships,
-            msp_policies, msp_staff, msp_staff_client_roles, msp_staff_clients, msp_template_clients,
-            msp_template_copies, msp_templates, msps,
+            msp_policies, msp_required_had_own, msp_staff, msp_staff_client_roles, msp_staff_clients,
+            msp_template_clients, msp_template_copies, msp_templates, msps,
         },
     },
     error::MapResult,
@@ -662,7 +662,8 @@ impl MspClient {
     }
 
     /// Ends the MSP's relationship with this client, including technicians'
-    /// choice of it and their roles there.
+    /// choice of it and their roles there, and the MSP's record of whether it
+    /// had its own setting before a requirement (it's no longer bound by one).
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         conn.run(move |conn| {
             diesel::delete(
@@ -685,6 +686,14 @@ impl MspClient {
                 msp_template_clients::table
                     .filter(msp_template_clients::msp_uuid.eq(&self.msp_uuid))
                     .filter(msp_template_clients::org_uuid.eq(&self.org_uuid)),
+            )
+            .execute(conn)
+            .map(|_| ())
+            .map_res("Error removing MSP client")?;
+            diesel::delete(
+                msp_required_had_own::table
+                    .filter(msp_required_had_own::msp_uuid.eq(&self.msp_uuid))
+                    .filter(msp_required_had_own::org_uuid.eq(&self.org_uuid)),
             )
             .execute(conn)
             .map(|_| ())
@@ -1205,7 +1214,9 @@ impl MspInvite {
 
 /// One of an MSP's default policies: an upstream policy type, on or off, with
 /// its options as upstream stores them. A type without a row is off. See
-/// DESIGN.md, "Default policies".
+/// DESIGN.md, "Default policies". A required default reaches every client,
+/// and no client can change that policy until it's no longer required
+/// (DESIGN.md, "Required for every client").
 #[derive(Identifiable, Queryable, Insertable)]
 #[diesel(table_name = msp_policies)]
 #[diesel(primary_key(msp_uuid, atype))]
@@ -1214,6 +1225,7 @@ pub struct MspPolicy {
     pub atype: i32,
     pub enabled: bool,
     pub data: String,
+    pub required: bool,
 }
 
 impl MspPolicy {
@@ -1223,6 +1235,7 @@ impl MspPolicy {
             atype,
             enabled,
             data,
+            required: false,
         }
     }
 
@@ -1249,6 +1262,75 @@ impl MspPolicy {
                 .order(msp_policies::atype.asc())
                 .load::<Self>(conn)
                 .unwrap_or_default()
+        })
+        .await
+    }
+}
+
+/// A client that had its own setting for a policy when the MSP's requirement
+/// changed it there, so the MSP can tell which clients might want to go back
+/// once it stops requiring it. Only the client's id: never what its policy
+/// was. See DESIGN.md, "Required for every client".
+#[derive(Insertable)]
+#[diesel(table_name = msp_required_had_own)]
+pub struct MspRequiredHadOwn {
+    pub msp_uuid: MspId,
+    pub atype: i32,
+    pub org_uuid: OrganizationId,
+}
+
+impl MspRequiredHadOwn {
+    /// Remembers one client, once.
+    pub async fn record(msp_uuid: &MspId, atype: i32, org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {
+        let row = Self {
+            msp_uuid: msp_uuid.clone(),
+            atype,
+            org_uuid: org_uuid.clone(),
+        };
+        conn.run(move |conn| {
+            let known = msp_required_had_own::table
+                .filter(msp_required_had_own::msp_uuid.eq(&row.msp_uuid))
+                .filter(msp_required_had_own::atype.eq(row.atype))
+                .filter(msp_required_had_own::org_uuid.eq(&row.org_uuid))
+                .count()
+                .get_result::<i64>(conn)
+                .unwrap_or(0);
+            if known > 0 {
+                return Ok(());
+            }
+            diesel::insert_into(msp_required_had_own::table)
+                .values(&row)
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error recording a client's own setting")
+        })
+        .await
+    }
+
+    /// The clients remembered for one of the MSP's policies.
+    pub async fn find(msp_uuid: &MspId, atype: i32, conn: &DbConn) -> Vec<OrganizationId> {
+        conn.run(move |conn| {
+            msp_required_had_own::table
+                .filter(msp_required_had_own::msp_uuid.eq(msp_uuid))
+                .filter(msp_required_had_own::atype.eq(atype))
+                .select(msp_required_had_own::org_uuid)
+                .load::<OrganizationId>(conn)
+                .unwrap_or_default()
+        })
+        .await
+    }
+
+    /// Forgets every client remembered for one of the MSP's policies.
+    pub async fn clear(msp_uuid: &MspId, atype: i32, conn: &DbConn) -> EmptyResult {
+        conn.run(move |conn| {
+            diesel::delete(
+                msp_required_had_own::table
+                    .filter(msp_required_had_own::msp_uuid.eq(msp_uuid))
+                    .filter(msp_required_had_own::atype.eq(atype)),
+            )
+            .execute(conn)
+            .map(|_| ())
+            .map_res("Error clearing clients' own settings")
         })
         .await
     }

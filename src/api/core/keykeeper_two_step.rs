@@ -742,6 +742,14 @@ async fn org_view(org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Value> {
     Ok(json!({
         "required": OrgAdminTwoStep::required(org_id, conn).await?,
         "msp": msp,
+        // Keykeeper: the MSP requires it for every client, so it can't be
+        // changed here (DESIGN.md, "Required for every client").
+        "requiredByMsp": super::keykeeper_msp_policies::is_locked(
+            org_id,
+            super::keykeeper_msp_policies::ADMIN_TWO_STEP,
+            conn,
+        )
+        .await,
         "notSetUp": not_set_up(org_id, false, conn).await,
     }))
 }
@@ -784,6 +792,15 @@ async fn put_org_setting(
     }
     let data = data.into_inner();
     let required = data.required;
+    // Keykeeper: not while the organization's MSP requires it for every
+    // client (DESIGN.md, "Required for every client").
+    super::keykeeper_msp_policies::refuse_if_required(
+        &org_id,
+        super::keykeeper_msp_policies::ADMIN_TWO_STEP,
+        required,
+        &conn,
+    )
+    .await?;
     if !required && OrgAdminTwoStep::required(&org_id, &conn).await? {
         require_caller_meets(&headers.user, &session, &conn).await?;
     }

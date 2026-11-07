@@ -1520,6 +1520,9 @@ fn msp_code(action: &str) -> (i32, &'static str, &'static str) {
         "client_joining_default" => (9126, "A client went back to the MSP's joining default", "low"),
         "default_policy_changed" => (9130, "Changed a default policy", "medium"),
         "client_policy_default" => (9131, "Put a client back on a default policy", "medium"),
+        // It overrides what clients chose, and locks it there.
+        "default_policy_required" => (9132, "Required a policy for every client", "high"),
+        "default_policy_unrequired" => (9133, "Stopped requiring a policy for every client", "medium"),
         "template_added" | "template_sent" => (9140, "Shared a template with clients", "low"),
         "template_changed" => (9141, "Changed a shared template", "low"),
         "template_stopped" => (9142, "Stopped sharing a template", "low"),
@@ -1721,6 +1724,14 @@ mod tests {
             assert_eq!((c, s), (code, severity), "{action}");
             assert_eq!(priority(c, s), KEPT, "{action}");
         }
+    }
+
+    #[test]
+    fn requiring_a_policy_for_every_client_is_high_and_kept() {
+        let (code, _, severity) = msp_code("default_policy_required");
+        assert_eq!((code, severity), (9132, "high"));
+        assert_eq!(priority(code, severity), KEPT);
+        assert_eq!(msp_code("default_policy_unrequired").0, 9133);
     }
 
     #[test]
