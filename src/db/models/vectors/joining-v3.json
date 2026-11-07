@@ -1,0 +1,373 @@
+{
+  "version": 3,
+  "inputs": {
+    "organizationId": "8f9a7c1e-3b2d-4e5f-9a8b-7c6d5e4f3a2b",
+    "organizationKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="
+  },
+  "joinKey": "LFzzcs5Tnezlm9K3xO7TTK8QZhE92mbN1RkoGXTTGtQ=",
+  "sources": [
+    "own",
+    "default"
+  ],
+  "seals": [
+    {
+      "note": "HMAC-SHA256(joinKey, 'passbundle joining v3' 0 organization id 0 '1' or '0' 0 domains sorted and joined with ',' 0 source 0 sealedAt 0 nonce), as v3.<source>.<sealedAt>.<nonce>.<mac>: follows a default that lets people in.",
+      "autoConfirm": true,
+      "domains": [],
+      "source": "default",
+      "sealedAt": 1793059200,
+      "nonce": "EBESExQVFhcYGRobHB0eHw",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y"
+    },
+    {
+      "note": "A day later, the organization's own setting: approval.",
+      "autoConfirm": false,
+      "domains": [],
+      "source": "own",
+      "sealedAt": 1793145600,
+      "nonce": "ICEiIyQlJicoKSorLC0uLw",
+      "seal": "v3.own.1793145600.ICEiIyQlJicoKSorLC0uLw.cdRkVZb9_JXOeiKi1_hDTu3pTZYc40Kvub5XeDiefC4"
+    },
+    {
+      "note": "Its own setting, letting people in, with email domains (sorted inside the MAC).",
+      "autoConfirm": true,
+      "domains": [
+        "contoso.example",
+        "acme.example"
+      ],
+      "source": "own",
+      "sealedAt": 1793232000,
+      "nonce": "MDEyMzQ1Njc4OTo7PD0-Pw",
+      "seal": "v3.own.1793232000.MDEyMzQ1Njc4OTo7PD0-Pw.hNwSP7UITUG8Irs5nAiRCj9FVcxAiuOxVmOMWUhwVEw"
+    },
+    {
+      "note": "Follows a default of approval.",
+      "autoConfirm": false,
+      "domains": [],
+      "source": "default",
+      "sealedAt": 1793145600,
+      "nonce": "MDEyMzQ1Njc4OTo7PD0-Pw",
+      "seal": "v3.default.1793145600.MDEyMzQ1Njc4OTo7PD0-Pw.lv04_F8rQl8YCyc_7LqWey8phT3soV9FZ8VWJYmnA9g"
+    }
+  ],
+  "checks": [
+    {
+      "why": "a seal that follows the default",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y",
+      "autoConfirm": true,
+      "domains": [],
+      "source": "default",
+      "vouches": true
+    },
+    {
+      "why": "the same, from either source",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": true
+    },
+    {
+      "why": "its own setting",
+      "seal": "v3.own.1793145600.ICEiIyQlJicoKSorLC0uLw.cdRkVZb9_JXOeiKi1_hDTu3pTZYc40Kvub5XeDiefC4",
+      "autoConfirm": false,
+      "domains": [],
+      "source": "own",
+      "vouches": true
+    },
+    {
+      "why": "the domains in another order",
+      "seal": "v3.own.1793232000.MDEyMzQ1Njc4OTo7PD0-Pw.hNwSP7UITUG8Irs5nAiRCj9FVcxAiuOxVmOMWUhwVEw",
+      "autoConfirm": true,
+      "domains": [
+        "acme.example",
+        "contoso.example"
+      ],
+      "source": null,
+      "vouches": true
+    },
+    {
+      "why": "an own setting of approval presented as following a default",
+      "seal": "v3.own.1793145600.ICEiIyQlJicoKSorLC0uLw.cdRkVZb9_JXOeiKi1_hDTu3pTZYc40Kvub5XeDiefC4",
+      "autoConfirm": false,
+      "domains": [],
+      "source": "default",
+      "vouches": false
+    },
+    {
+      "why": "following the default presented as its own setting",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y",
+      "autoConfirm": true,
+      "domains": [],
+      "source": "own",
+      "vouches": false
+    },
+    {
+      "why": "approval presented as letting people in",
+      "seal": "v3.own.1793145600.ICEiIyQlJicoKSorLC0uLw.cdRkVZb9_JXOeiKi1_hDTu3pTZYc40Kvub5XeDiefC4",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "another domain",
+      "seal": "v3.own.1793232000.MDEyMzQ1Njc4OTo7PD0-Pw.hNwSP7UITUG8Irs5nAiRCj9FVcxAiuOxVmOMWUhwVEw",
+      "autoConfirm": true,
+      "domains": [
+        "contoso.example"
+      ],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "the domains left out",
+      "seal": "v3.own.1793232000.MDEyMzQ1Njc4OTo7PD0-Pw.hNwSP7UITUG8Irs5nAiRCj9FVcxAiuOxVmOMWUhwVEw",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "the source changed in the seal's text",
+      "seal": "v3.default.1793145600.ICEiIyQlJicoKSorLC0uLw.cdRkVZb9_JXOeiKi1_hDTu3pTZYc40Kvub5XeDiefC4",
+      "autoConfirm": false,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "an old seal made to look newer: the time changed in its text",
+      "seal": "v3.default.1793318400.EBESExQVFhcYGRobHB0eHw.pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "the nonce changed in the seal's text",
+      "seal": "v3.default.1793059200.QEFCQ0RFRkdISUpLTE1OTw.pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a seal for another organization",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.ycmyFta3LNlX5ER2ymy0nh7a5dVoxfJDj8c3VnkMO0c",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "the MAC changed",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.Aqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a version 2 seal, which says nothing of when it was sealed",
+      "seal": "v2.default.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYfY",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a version 1 seal",
+      "seal": "ydktqO6t+AQUzK/S8BXkrOVGW+ieKiS8lCYoJgZJwa8=",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a version 3 MAC under version 2's label",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.ahxYaq_hpNZW9IorNsJGhPxOr307gtZq8edHf4syfUA",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a source the apps don't know",
+      "seal": "v3.msp.1793059200.EBESExQVFhcYGRobHB0eHw.LtCg7GCWAflT4849bie82w5DgFPOLWCeQeSdCuCDzpk",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a time with a leading zero",
+      "seal": "v3.default.01793059200.EBESExQVFhcYGRobHB0eHw.UXZnR6E3xhKS7ENG1d0iIdN-t_CaZCYMyJxx_x8H_Gw",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a time of 13 digits",
+      "seal": "v3.default.1000000000000.EBESExQVFhcYGRobHB0eHw.lYL3UWpMFTQsP6AI588bOt_kbq8OfTX3r1ILbL1UlTU",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a time that isn't a number",
+      "seal": "v3.default.17930592O0.EBESExQVFhcYGRobHB0eHw.Xm4MTiJutxPmEKAnsbr_cJPVl62oQYlwJlwKo1UP2Y0",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a nonce of 15 bytes",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0e.OLyFX27dhqZPNv96A9g-BC8IiVJrUvEkfJSraqp0yFg",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a nonce in standard base64",
+      "seal": "v3.default.1793059200.+/+/+/+/+/+/+/+/+/+/+/.nJZdlL4X9r26s2ndnK92ks-aRnHQ96sWcwoQ-QRJ79E",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    },
+    {
+      "why": "a part too many",
+      "seal": "v3.default.1793059200.EBESExQVFhcYGRobHB0eHw.pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y.x",
+      "autoConfirm": true,
+      "domains": [],
+      "source": null,
+      "vouches": false
+    }
+  ],
+  "current": [
+    {
+      "why": "nothing seen yet",
+      "newestSeen": null,
+      "seal": {
+        "sealedAt": 1793059200,
+        "nonce": "EBESExQVFhcYGRobHB0eHw"
+      },
+      "current": true
+    },
+    {
+      "why": "the seal it has seen",
+      "newestSeen": {
+        "sealedAt": 1793145600,
+        "nonce": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "seal": {
+        "sealedAt": 1793145600,
+        "nonce": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "current": true
+    },
+    {
+      "why": "a newer seal",
+      "newestSeen": {
+        "sealedAt": 1793059200,
+        "nonce": "EBESExQVFhcYGRobHB0eHw"
+      },
+      "seal": {
+        "sealedAt": 1793145600,
+        "nonce": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "current": true
+    },
+    {
+      "why": "an older seal: the setting the organization had before it chose approval, shown again",
+      "newestSeen": {
+        "sealedAt": 1793145600,
+        "nonce": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "seal": {
+        "sealedAt": 1793059200,
+        "nonce": "EBESExQVFhcYGRobHB0eHw"
+      },
+      "current": false
+    },
+    {
+      "why": "a second older, with a greater nonce",
+      "newestSeen": {
+        "sealedAt": 1793145600,
+        "nonce": "EBESExQVFhcYGRobHB0eHw"
+      },
+      "seal": {
+        "sealedAt": 1793145599,
+        "nonce": "MDEyMzQ1Njc4OTo7PD0-Pw"
+      },
+      "current": false
+    },
+    {
+      "why": "the same second, a smaller nonce",
+      "newestSeen": {
+        "sealedAt": 1793145600,
+        "nonce": "MDEyMzQ1Njc4OTo7PD0-Pw"
+      },
+      "seal": {
+        "sealedAt": 1793145600,
+        "nonce": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "current": false
+    },
+    {
+      "why": "the same second, a greater nonce",
+      "newestSeen": {
+        "sealedAt": 1793145600,
+        "nonce": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "seal": {
+        "sealedAt": 1793145600,
+        "nonce": "MDEyMzQ1Njc4OTo7PD0-Pw"
+      },
+      "current": true
+    },
+    {
+      "why": "nonces compare as text, by character code: '-' before digits before capitals before '_' before lower case",
+      "newestSeen": {
+        "sealedAt": 1793059200,
+        "nonce": "zzzzzzzzzzzzzzzzzzzzzw"
+      },
+      "seal": {
+        "sealedAt": 1793059200,
+        "nonce": "_AAAAAAAAAAAAAAAAAAAAA"
+      },
+      "current": false
+    }
+  ],
+  "sealedAt": [
+    {
+      "why": "nothing seen yet",
+      "now": 1793059200,
+      "newestSeen": null,
+      "sealedAt": 1793059200
+    },
+    {
+      "why": "the newest seen is older",
+      "now": 1793145600,
+      "newestSeen": 1793059200,
+      "sealedAt": 1793145600
+    },
+    {
+      "why": "the newest seen is from this same second",
+      "now": 1793059200,
+      "newestSeen": 1793059200,
+      "sealedAt": 1793059201
+    },
+    {
+      "why": "this device's clock is behind the one that sealed last",
+      "now": 1793059200,
+      "newestSeen": 1793062800,
+      "sealedAt": 1793062801
+    }
+  ]
+}

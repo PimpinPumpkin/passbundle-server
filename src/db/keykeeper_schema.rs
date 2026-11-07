@@ -558,6 +558,12 @@ table! {
 }
 
 table! {
+    revoked_until_accepted (membership_uuid) {
+        membership_uuid -> Text,
+    }
+}
+
+table! {
     removed_members (org_uuid, user_uuid) {
         org_uuid -> Text,
         user_uuid -> Text,
