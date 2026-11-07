@@ -13,6 +13,7 @@ mod keykeeper_event_streaming;
 mod keykeeper_joining;
 mod keykeeper_msp;
 mod keykeeper_msp_policies;
+mod keykeeper_msp_seats;
 mod keykeeper_msp_templates;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
@@ -36,6 +37,8 @@ pub use emergency_access::{emergency_notification_reminder_job, emergency_reques
 pub use events::{event_cleanup_job, log_event, log_user_event};
 // Keykeeper: an event destination sends only while its maker has access.
 pub use keykeeper_offboarding::destination_may_send;
+// Keykeeper: the daily reading of MSP clients' seats.
+pub use keykeeper_msp_seats::record_client_seats_job;
 // Keykeeper: a tab's reload key goes when its account's sessions do.
 pub use keykeeper_reload_keys::forget_user as forget_reload_keys;
 // Keykeeper: provisioning (SCIM), mounted at /scim.
@@ -76,6 +79,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_event_streaming::routes());
     routes.append(&mut keykeeper_msp::routes());
     routes.append(&mut keykeeper_msp_policies::routes());
+    routes.append(&mut keykeeper_msp_seats::routes());
     routes.append(&mut keykeeper_msp_templates::routes());
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
