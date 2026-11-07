@@ -279,7 +279,6 @@ pub(super) async fn vouching(
     from_msp: bool,
     conn: &DbConn,
 ) -> Value {
-    let (joining, _) = effective_joining(org_id, conn).await;
     let proof = MspEnrollmentJoin::proof_for(&member.uuid, conn).await;
     let secret = match &proof {
         None => None,
@@ -289,11 +288,7 @@ pub(super) async fn vouching(
         },
     };
     json!({
-        "joining": {
-            "autoConfirm": joining.auto_confirm,
-            "domains": EnrollmentDomains::for_org(org_id, conn).await,
-            "seal": JoiningSeal::find(org_id, conn).await,
-        },
+        "joining": sealed_joining(org_id, conn).await,
         "inviteSeal": if invitations_vouch() {
             JoinSeal::find(org_id, email, SealKind::Invite, conn).await
         } else {
@@ -312,19 +307,40 @@ pub(super) fn extend(entry: &mut Value, more: Value) {
     }
 }
 
+/// An organization's joining setting as it is now, its email domains, and
+/// the seal over them, for an app to check.
+async fn sealed_joining(org_id: &OrganizationId, conn: &DbConn) -> Value {
+    let (joining, _) = effective_joining(org_id, conn).await;
+    json!({
+        "autoConfirm": joining.auto_confirm,
+        "domains": EnrollmentDomains::for_org(org_id, conn).await,
+        "seal": JoiningSeal::find(org_id, conn).await,
+    })
+}
+
 /// Everyone waiting for an organization's key in organizations where the
 /// caller can confirm them, with whether each organization confirms
 /// automatically, and whether they first have to turn on two-step login
 /// (confirming them fails until they do). Upstream's rules: owners confirm
 /// anyone, admins only regular members.
+///
+/// And the joining setting with its seal of every organization where the
+/// caller is an owner or admin (`joining`), whether or not anyone is waiting
+/// there: their apps remember the newest seal of each, so the server can't
+/// show them an older setting later (DESIGN.md, "Joins a hacked server can't
+/// forge", version 3 joining seals).
 #[get("/keykeeper/organizations/pending")]
 async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
     let mut pending = Vec::new();
+    let mut organizations = Vec::new();
     for caller in Membership::find_confirmed_by_user(&headers.user.uuid, &conn).await {
         let is_owner = caller.atype == MembershipType::Owner as i32;
         if !is_owner && caller.atype != MembershipType::Admin as i32 {
             continue;
         }
+        let mut sealed = sealed_joining(&caller.org_uuid, &conn).await;
+        extend(&mut sealed, json!({ "organizationId": caller.org_uuid }));
+        organizations.push(sealed);
         let (joining, _) = effective_joining(&caller.org_uuid, &conn).await;
         for member in Membership::find_by_org(&caller.org_uuid, &conn).await {
             if member.status != MembershipStatus::Accepted as i32
@@ -354,7 +370,7 @@ async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
             pending.push(entry);
         }
     }
-    Ok(Json(json!({ "data": pending })))
+    Ok(Json(json!({ "data": pending, "joining": organizations })))
 }
 
 /// The caller's organizations that can't confirm them until they turn on

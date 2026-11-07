@@ -131,10 +131,11 @@ pub(super) fn checked_seal(seal: Option<&String>) -> Result<Option<&str>, crate:
     }
 }
 
-/// A joining seal from an app, checked to look like one (version 2, which
-/// says where the setting comes from) and, with `from`, to say it comes from
-/// there, as the change it comes with makes it: an organization's own
-/// setting, or a default it follows. None when there isn't one.
+/// A joining seal from an app, checked to look like one (version 3, which
+/// says where the setting comes from and when it was sealed) and, with
+/// `from`, to say it comes from there, as the change it comes with makes it:
+/// an organization's own setting, or a default it follows. None when there
+/// isn't one.
 pub(super) fn checked_joining_seal(
     seal: Option<&String>,
     from: Option<JoiningSealSource>,
