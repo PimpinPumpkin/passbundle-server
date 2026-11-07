@@ -40,6 +40,9 @@ table! {
         org_uuid -> Text,
         name -> Text,
         external_id -> Nullable<Text>,
+        // Keykeeper: the folder's icon and color, encrypted with the
+        // organization's key (DESIGN.md, "Folder icons").
+        keykeeper_look -> Nullable<Text>,
     }
 }
 
