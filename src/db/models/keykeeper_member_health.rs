@@ -77,45 +77,59 @@ impl MemberHealth {
     /// Replaces someone's numbers with a new report, already checked. A
     /// report without `exposed` keeps the last exposed count and when it was
     /// checked, so an app that doesn't check breaches doesn't erase what one
-    /// that does found.
+    /// that does found. It writes before it reads, so two of the person's
+    /// apps reporting at once never wait on each other's read (SQLite), and
+    /// the second of two first reports updates the row the first made.
     pub async fn report(user: &UserId, counts: OwnCounts, conn: &DbConn) -> Result<Self, crate::error::Error> {
         let user = user.clone();
         let now = Utc::now().naive_utc();
         conn.run(move |conn| {
-            conn.transaction(|conn| {
-                let before = keykeeper_member_health::table
-                    .filter(keykeeper_member_health::user_uuid.eq(&user))
-                    .first::<Self>(conn)
-                    .optional()?;
-                let (exposed, exposed_checked_at) = match counts.exposed {
-                    Some(exposed) => (Some(exposed), Some(now)),
-                    None => before.as_ref().map_or((None, None), |b| (b.exposed, b.exposed_checked_at)),
-                };
-                let row = Self {
-                    user_uuid: user.clone(),
-                    logins: counts.logins,
-                    weak: counts.weak,
-                    reused: counts.reused,
-                    exposed,
-                    exposed_checked_at,
-                    reported_at: now,
-                };
-                if before.is_some() {
-                    diesel::update(keykeeper_member_health::table.filter(keykeeper_member_health::user_uuid.eq(&user)))
-                        .set((
-                            keykeeper_member_health::logins.eq(row.logins),
-                            keykeeper_member_health::weak.eq(row.weak),
-                            keykeeper_member_health::reused.eq(row.reused),
-                            keykeeper_member_health::exposed.eq(row.exposed),
-                            keykeeper_member_health::exposed_checked_at.eq(row.exposed_checked_at),
-                            keykeeper_member_health::reported_at.eq(row.reported_at),
-                        ))
-                        .execute(conn)?;
-                } else {
-                    diesel::insert_into(keykeeper_member_health::table).values(&row).execute(conn)?;
+            let save = |conn: &mut crate::db::DbConnInner| {
+                conn.transaction(|conn| {
+                    let mine = || keykeeper_member_health::table.filter(keykeeper_member_health::user_uuid.eq(&user));
+                    let updated = match counts.exposed {
+                        Some(exposed) => diesel::update(mine())
+                            .set((
+                                keykeeper_member_health::logins.eq(counts.logins),
+                                keykeeper_member_health::weak.eq(counts.weak),
+                                keykeeper_member_health::reused.eq(counts.reused),
+                                keykeeper_member_health::exposed.eq(Some(exposed)),
+                                keykeeper_member_health::exposed_checked_at.eq(Some(now)),
+                                keykeeper_member_health::reported_at.eq(now),
+                            ))
+                            .execute(conn)?,
+                        // The last breach check stays as it was.
+                        None => diesel::update(mine())
+                            .set((
+                                keykeeper_member_health::logins.eq(counts.logins),
+                                keykeeper_member_health::weak.eq(counts.weak),
+                                keykeeper_member_health::reused.eq(counts.reused),
+                                keykeeper_member_health::reported_at.eq(now),
+                            ))
+                            .execute(conn)?,
+                    };
+                    if updated == 0 {
+                        let row = Self {
+                            user_uuid: user.clone(),
+                            logins: counts.logins,
+                            weak: counts.weak,
+                            reused: counts.reused,
+                            exposed: counts.exposed,
+                            exposed_checked_at: counts.exposed.map(|_| now),
+                            reported_at: now,
+                        };
+                        diesel::insert_into(keykeeper_member_health::table).values(&row).execute(conn)?;
+                    }
+                    mine().first::<Self>(conn)
+                })
+            };
+            match save(conn) {
+                // Another of the person's apps made the row first: update it.
+                Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::UniqueViolation, _)) => {
+                    save(conn)
                 }
-                Ok::<_, diesel::result::Error>(row)
-            })
+                other => other,
+            }
             .map_res("Error saving your numbers")
         })
         .await
