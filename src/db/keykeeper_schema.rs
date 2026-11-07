@@ -566,3 +566,15 @@ table! {
         revoked -> Bool,
     }
 }
+
+table! {
+    keykeeper_member_health (user_uuid) {
+        user_uuid -> Text,
+        logins -> Integer,
+        weak -> Integer,
+        reused -> Integer,
+        exposed -> Nullable<Integer>,
+        exposed_checked_at -> Nullable<Timestamp>,
+        reported_at -> Timestamp,
+    }
+}

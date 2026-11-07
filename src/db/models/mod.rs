@@ -15,6 +15,7 @@ mod keykeeper_event_streaming;
 pub mod keykeeper_folder_permissions;
 mod keykeeper_install_tokens;
 mod keykeeper_joining;
+mod keykeeper_member_health;
 mod keykeeper_msp;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
@@ -61,6 +62,7 @@ pub use self::keykeeper_joining::{
     INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, confirms_automatically, effective_joining,
     invite_hours, msp_default,
 };
+pub use self::keykeeper_member_health::{MemberHealth, OwnCounts, msp_memberships_among};
 pub use self::keykeeper_msp::{
     CustomRole, EnrollmentDomains, Msp, MspClient, MspEnrollmentJoin, MspEvent, MspId, MspInvite, MspMembership,
     MspPolicy, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,
