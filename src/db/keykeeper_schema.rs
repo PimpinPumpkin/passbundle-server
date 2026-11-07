@@ -566,3 +566,13 @@ table! {
         revoked -> Bool,
     }
 }
+
+table! {
+    msp_client_seats (msp_uuid, org_uuid, day) {
+        msp_uuid -> Text,
+        org_uuid -> Text,
+        day -> Text,
+        seats -> Integer,
+        org_name -> Text,
+    }
+}

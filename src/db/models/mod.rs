@@ -16,6 +16,7 @@ pub mod keykeeper_folder_permissions;
 mod keykeeper_install_tokens;
 mod keykeeper_joining;
 mod keykeeper_msp;
+pub mod keykeeper_msp_seats;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
 pub mod keykeeper_roles;
@@ -66,6 +67,7 @@ pub use self::keykeeper_msp::{
     MspPolicy, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,
     exempt_from_member_policies, exempt_from_two_step_policy, parse_enrollment_domains,
 };
+pub use self::keykeeper_msp_seats::ClientSeats;
 pub use self::keykeeper_offboarding::RemovedMember;
 pub use self::keykeeper_orgs::OrgSetup;
 pub use self::keykeeper_scim::{
