@@ -59,8 +59,9 @@ use crate::{
         DbConn,
         models::{
             Device, EventType, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId, MspMembership,
-            MspStaff, MspStaffTwoStep, OrgAdminTwoStep, Organization, OrganizationId, TwoFactor, TwoFactorType,
-            TwoStepSetupSession, UnacceptedMembership, User, UserId, keykeeper_roles, qualifying_two_step,
+            MspStaff, MspStaffTwoStep, OrgAdminTwoStep, OrgPolicy, Organization, OrganizationId, RevokedUntilAccepted,
+            TwoFactor, TwoFactorType, TwoStepSetupSession, UnacceptedMembership, User, UserId, keykeeper_roles,
+            qualifying_two_step,
         },
     },
 };
@@ -697,8 +698,10 @@ async fn not_set_up(org_id: &OrganizationId, own_only: bool, conn: &DbConn) -> V
 /// event in its log (high for security tools). Used by the Settings page, the
 /// Business preset, and an MSP's default policies. Turned on, it ends the
 /// sessions of the people it now covers who have no method that counts
-/// (Watch). Whoever turns it off must meet it (require_caller_meets), which
-/// each endpoint checks first.
+/// (Watch), and revokes, until they accept it, each role it covers that was
+/// confirmed before it while its person never accepted it
+/// (`hold_unaccepted_roles`). Whoever turns it off must meet it
+/// (require_caller_meets), which each endpoint checks first.
 pub async fn set_org_required(
     org_id: &OrganizationId,
     required: bool,
@@ -711,7 +714,9 @@ pub async fn set_org_required(
         return Ok(false);
     }
     let watch = if required {
-        let mut covered = Vec::new();
+        // The one turning it on, too: they accept a role of theirs that the
+        // server accepted for them by doing so (hold_unaccepted_roles).
+        let mut covered = vec![actor.clone()];
         for member in Membership::find_by_org(org_id, conn).await {
             if covered_membership(&member, conn).await {
                 covered.push(member.user_uuid);
@@ -721,6 +726,9 @@ pub async fn set_org_required(
     } else {
         Watch::users([], conn).await?
     };
+    if required {
+        hold_unaccepted_roles(org_id, actor, device_type, ip, conn).await?;
+    }
     OrgAdminTwoStep::set(org_id, required, conn).await?;
     let event = if required {
         EventType::KeykeeperAdminTwoStepOn
@@ -968,6 +976,74 @@ pub async fn require_accepted_to_promote(member: &Membership, elevated: bool, co
     Ok(())
 }
 
+/// When the rule comes to cover an organization: each confirmed member there
+/// in a role it covers whose membership the server accepted for them, and who
+/// never accepted it, would otherwise keep that role without two-step login
+/// (the rule doesn't count it until they accept). So each is revoked until
+/// they accept it (RevokedUntilAccepted), in the event log as revoked by
+/// whoever turned the rule on; accepting restores them (accept_membership).
+/// Revoked, not sent back to "Needs confirmation", so they need nobody to
+/// confirm them again: an MSP's default can't keep a client's own owner out.
+/// The one turning the rule on accepts their own role by doing so. Never an
+/// organization's last confirmed owner, which upstream never leaves it
+/// without; they keep the role until they accept it.
+async fn hold_unaccepted_roles(
+    org_id: &OrganizationId,
+    actor: &UserId,
+    device_type: i32,
+    ip: &IpAddr,
+    conn: &DbConn,
+) -> EmptyResult {
+    for mut member in Membership::find_by_org(org_id, conn).await {
+        if member.status != MembershipStatus::Confirmed as i32
+            || !UnacceptedMembership::is(&member.uuid, conn).await
+            || !covered_role(&member, conn).await
+        {
+            continue;
+        }
+        if &member.user_uuid == actor {
+            UnacceptedMembership::accept(&member.uuid, conn).await?;
+            continue;
+        }
+        if member.atype == MembershipType::Owner as i32
+            && Membership::count_confirmed_by_org_and_type(org_id, MembershipType::Owner, conn).await <= 1
+        {
+            continue;
+        }
+        member.revoke();
+        member.save(conn).await?;
+        RevokedUntilAccepted::hold(&member.uuid, conn).await?;
+        log_event(EventType::OrganizationUserRevoked, &member.uuid, org_id, actor, device_type, ip, conn).await;
+    }
+    Ok(())
+}
+
+/// Whether restoring this revoked member must wait for them to accept their
+/// role: they'd come back confirmed, in a role the rule covers where their
+/// organization requires it, which they never accepted (must_accept_first).
+/// If so, they're held (RevokedUntilAccepted), and accepting restores them.
+/// For an owner's or admin's restore and the directory's.
+pub async fn restore_waits_for_them(member: &Membership, conn: &DbConn) -> ApiResult<bool> {
+    if member.get_unrevoked_status() != MembershipStatus::Confirmed as i32 || !must_accept_first(member, conn).await {
+        return Ok(false);
+    }
+    RevokedUntilAccepted::hold(&member.uuid, conn).await?;
+    Ok(true)
+}
+
+/// Refuses an owner's or admin's restore of someone whose role waits for them
+/// to accept it (restore_waits_for_them), saying they come back when they do.
+pub async fn require_accepted_to_restore(member: &Membership, conn: &DbConn) -> EmptyResult {
+    if restore_waits_for_them(member, conn).await? {
+        let email = User::find_by_uuid(&member.user_uuid, conn).await.map(|u| u.email);
+        err!(format!(
+            "{} hasn't accepted their role yet (this server sends no email), and it requires two-step login here. They come back as soon as they accept it on their vault page.",
+            email.unwrap_or_default().escape_debug()
+        ))
+    }
+    Ok(())
+}
+
 /// Whether a role is one the rule covers: an owner, an admin, or a custom
 /// role that manages members, policies, or account recovery.
 pub fn elevated_role(atype: MembershipType, custom: Option<&keykeeper_roles::CustomPermissions>) -> bool {
@@ -986,12 +1062,14 @@ fn role_name(member: &Membership) -> &'static str {
 
 /// The caller's memberships the server accepted for them, in a role the rule
 /// covers where the organization requires it: the web vault asks them to
-/// accept each one.
+/// accept each one. Those revoked until they accept it (RevokedUntilAccepted)
+/// say so (`revoked`).
 #[get("/keykeeper/organizations/unaccepted")]
 async fn unaccepted_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
     let mut out = Vec::new();
     for member in Membership::find_by_user(&headers.user.uuid, &conn).await {
-        if member.status < MembershipStatus::Accepted as i32
+        let revoked = RevokedUntilAccepted::is(&member.uuid, &conn).await;
+        if (member.status < MembershipStatus::Accepted as i32 && !revoked)
             || !UnacceptedMembership::is(&member.uuid, &conn).await
             || !covered_role(&member, &conn).await
             || !OrgAdminTwoStep::required(&member.org_uuid, &conn).await?
@@ -999,22 +1077,47 @@ async fn unaccepted_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
             continue;
         }
         let name = Organization::find_by_uuid(&member.org_uuid, &conn).await.map(|o| o.name).unwrap_or_default();
-        out.push(json!({ "organizationId": member.org_uuid, "name": name, "role": role_name(&member) }));
+        out.push(json!({
+            "organizationId": member.org_uuid,
+            "name": name,
+            "role": role_name(&member),
+            "revoked": revoked,
+        }));
     }
     Ok(Json(json!({ "data": out })))
 }
 
 /// The person accepts a membership the server accepted for them. From then
 /// on the rule counts it, which may end their sessions now (Watch), as for
-/// anyone who takes on a role that requires two-step login.
+/// anyone who takes on a role that requires two-step login. One revoked
+/// until they accept it (RevokedUntilAccepted) is restored, with upstream's
+/// checks for restoring someone; if those refuse, nothing changes.
 #[post("/keykeeper/organizations/<org_id>/accept")]
 async fn accept_membership(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
-    let Some(member) = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await else {
+    let Some(mut member) = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await else {
         err_code!("Organization not found", Status::NotFound.code)
     };
     if UnacceptedMembership::is(&member.uuid, &conn).await {
         let watch = Watch::user(&headers.user.uuid, &conn).await?;
+        let held = RevokedUntilAccepted::is(&member.uuid, &conn).await;
+        if held && member.restore() {
+            OrgPolicy::check_user_allowed(&member, "restore", &conn).await?;
+            member.save(&conn).await?;
+        }
         UnacceptedMembership::accept(&member.uuid, &conn).await?;
+        if held {
+            RevokedUntilAccepted::end(&member.uuid, &conn).await?;
+            log_event(
+                EventType::OrganizationUserRestored,
+                &member.uuid,
+                &org_id,
+                &headers.user.uuid,
+                headers.device.atype,
+                &headers.ip.ip,
+                &conn,
+            )
+            .await;
+        }
         watch.settle(&conn).await?;
     }
     Ok(Json(json!({ "accepted": true })))

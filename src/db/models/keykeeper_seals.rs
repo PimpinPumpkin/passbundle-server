@@ -6,9 +6,10 @@
 // the apps and checks only that each looks like what it should be.
 // Invitation and staff seals end and carry a nonce (version 2), and the
 // server deletes them once the person they vouch for is confirmed, so each is
-// used once. Joining seals say where the setting comes from (version 2): the
-// organization's own, or a default it follows. See DESIGN.md, "Joins a hacked
-// server can't forge".
+// used once. Joining seals say where the setting comes from (the
+// organization's own, or a default it follows) and when they were sealed
+// (version 3), so the apps never go back to an older setting than one they've
+// seen. See DESIGN.md, "Joins a hacked server can't forge".
 
 use diesel::prelude::*;
 
@@ -61,14 +62,18 @@ pub enum JoiningSealSource {
     Default,
 }
 
-/// A joining seal, version 2: `v2.<source>.<mac>`, the source `own` or
-/// `default` and the HMAC-SHA256 in base64url without padding, with the
-/// source inside the MAC. The apps check the MAC; the server only checks the
-/// form, and reads the source. Version 1, which said nothing of where the
-/// setting comes from, isn't taken.
+/// A joining seal, version 3: `v3.<source>.<sealedAt>.<nonce>.<mac>`, the
+/// source `own` or `default`, when it was sealed (Unix seconds, no leading
+/// zero, at most 12 digits), a 16-byte nonce, and the HMAC-SHA256, both in
+/// base64url without padding, with all of it inside the MAC. The apps check
+/// the MAC, and that it isn't older than the newest they've seen; the server
+/// only checks the form, and reads the source. It doesn't compare times: it
+/// can't check them, and a hacked server would skip it anyway. Version 1,
+/// which said nothing of where the setting comes from, and version 2, which
+/// said nothing of when it was sealed, aren't taken.
 pub fn joining_seal_source(seal: &str) -> Option<JoiningSealSource> {
     let parts: Vec<&str> = seal.split('.').collect();
-    let ["v2", source, mac] = parts.as_slice() else {
+    let ["v3", source, sealed_at, nonce, mac] = parts.as_slice() else {
         return None;
     };
     let source = match *source {
@@ -76,8 +81,13 @@ pub fn joining_seal_source(seal: &str) -> Option<JoiningSealSource> {
         "default" => JoiningSealSource::Default,
         _ => return None,
     };
-    (mac.len() == 43 && data_encoding::BASE64URL_NOPAD.decode(mac.as_bytes()).is_ok_and(|bytes| bytes.len() == 32))
-        .then_some(source)
+    let decodes_to = |text: &str, len: usize| {
+        data_encoding::BASE64URL_NOPAD.decode(text.as_bytes()).is_ok_and(|bytes| bytes.len() == len)
+    };
+    let time = (1..=12).contains(&sealed_at.len())
+        && !sealed_at.starts_with('0')
+        && sealed_at.bytes().all(|b| b.is_ascii_digit());
+    (time && nonce.len() == 22 && decodes_to(nonce, 16) && mac.len() == 43 && decodes_to(mac, 32)).then_some(source)
 }
 
 /// The install command's join secret, encrypted with the organization's key
@@ -302,13 +312,15 @@ mod tests {
         }
     }
 
-    /// docs/vectors/joining-v2.json in the meta repo (a copy is in vectors/
-    /// here), made with Node's crypto: the server takes version 2 joining
+    /// docs/vectors/joining-v3.json in the meta repo (a copy is in vectors/
+    /// here), made with Node's crypto: the server takes version 3 joining
     /// seals and reads their source, and the vectors' MACs hold, checked here
     /// with ring as the apps check them, so the vectors are what they say.
+    /// Which of two seals is newer is the apps' to decide (their tests check
+    /// the vectors' `current` and `sealedAt`); the server doesn't compare.
     #[test]
-    fn joining_seals_say_where_the_setting_comes_from() {
-        let v: serde_json::Value = serde_json::from_str(include_str!("vectors/joining-v2.json")).unwrap();
+    fn joining_seals_say_where_the_setting_comes_from_and_when() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("vectors/joining-v3.json")).unwrap();
         let join_key = data_encoding::BASE64.decode(v["joinKey"].as_str().unwrap().as_bytes()).unwrap();
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &join_key);
         let org = v["inputs"]["organizationId"].as_str().unwrap();
@@ -317,8 +329,9 @@ mod tests {
             "default" => JoiningSealSource::Default,
             other => panic!("{other}"),
         };
-        // What an app checks: the seal's form, the source it asks for (if
-        // any), and the MAC over the setting, its domains, and the source.
+        // What an app checks of the seal alone: its form, the source it asks
+        // for (if any), and the MAC over the setting, its domains, the
+        // source, the time, and the nonce, as the seal writes them.
         let vouches = |seal: &str, auto_confirm: bool, domains: &[&str], asked: Option<&str>| {
             let Some(source) = joining_seal_source(seal) else {
                 return false;
@@ -328,13 +341,9 @@ mod tests {
             }
             let mut sorted = domains.to_vec();
             sorted.sort_unstable();
-            let source = if source == JoiningSealSource::Own {
-                "own"
-            } else {
-                "default"
-            };
+            let parts: Vec<&str> = seal.split('.').collect();
             let data = [
-                "passbundle joining v2",
+                "passbundle joining v3",
                 org,
                 if auto_confirm {
                     "1"
@@ -342,10 +351,12 @@ mod tests {
                     "0"
                 },
                 &sorted.join(","),
-                source,
+                parts[1],
+                parts[2],
+                parts[3],
             ]
             .join("\0");
-            let mac = data_encoding::BASE64URL_NOPAD.decode(seal.rsplit('.').next().unwrap().as_bytes()).unwrap();
+            let mac = data_encoding::BASE64URL_NOPAD.decode(parts[4].as_bytes()).unwrap();
             ring::hmac::verify(&key, data.as_bytes(), &mac).is_ok()
         };
         let domains_of = |c: &serde_json::Value| -> Vec<String> {
@@ -354,6 +365,7 @@ mod tests {
         for s in v["seals"].as_array().unwrap() {
             let seal = s["seal"].as_str().unwrap();
             assert_eq!(joining_seal_source(seal), Some(source_of(s["source"].as_str().unwrap())), "{seal}");
+            assert!(seal.contains(&format!(".{}.{}.", s["sealedAt"], s["nonce"].as_str().unwrap())), "{seal}");
             let domains = domains_of(s);
             let domains: Vec<&str> = domains.iter().map(String::as_str).collect();
             assert!(vouches(seal, s["autoConfirm"].as_bool().unwrap(), &domains, None), "{seal}");
@@ -373,18 +385,43 @@ mod tests {
                 c["why"]
             );
         }
-        // Version 1, and forms that aren't a seal, aren't taken.
+    }
+
+    /// Version 2 joining seals (docs/vectors/joining-v2.json), which say
+    /// nothing of when they were sealed, and forms that aren't a seal, aren't
+    /// taken.
+    #[test]
+    fn earlier_joining_seals_are_not_taken() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("vectors/joining-v2.json")).unwrap();
+        for s in v["seals"].as_array().unwrap() {
+            let seal = s["seal"].as_str().unwrap();
+            assert_eq!(joining_seal_source(seal), None, "{seal}");
+        }
+        let nonce = "EBESExQVFhcYGRobHB0eHw";
+        let mac = "pqd_HI4wPVM0UuttpjrlKebbT_H6dO5JzSPhSOQly0Y";
+        assert_eq!(
+            joining_seal_source(&format!("v3.default.1793059200.{nonce}.{mac}")),
+            Some(JoiningSealSource::Default)
+        );
         for bad in [
-            "Lzxr28jrCFbS8FDbf7uxBHX4MyVhlz+g1h1WL/9m2SE=",
-            "v1.own.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYfY",
-            "v2.msp.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYfY",
-            "v2.own.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYf",
-            "v2.own.OKFnhDXt8AwYQaKfXtY+rRA21dE1T4S1ysMUVa-bYfY",
-            "v2.own.OKFnhDXt8AwYQaKfXtY-rRA21dE1T4S1ysMUVa-bYfY.x",
-            "v2.own",
-            "",
+            "Lzxr28jrCFbS8FDbf7uxBHX4MyVhlz+g1h1WL/9m2SE=".to_owned(),
+            format!("v2.default.1793059200.{nonce}.{mac}"),
+            format!("v3.msp.1793059200.{nonce}.{mac}"),
+            format!("v3.default.01793059200.{nonce}.{mac}"),
+            format!("v3.default.0.{nonce}.{mac}"),
+            format!("v3.default.1000000000000.{nonce}.{mac}"),
+            format!("v3.default.17930592O0.{nonce}.{mac}"),
+            format!("v3.default.-1793059200.{nonce}.{mac}"),
+            format!("v3.default..{nonce}.{mac}"),
+            format!("v3.default.1793059200.EBESExQVFhcYGRobHB0e.{mac}"),
+            format!("v3.default.1793059200.EBESExQVFhcYGRobHB0e+w.{mac}"),
+            format!("v3.default.1793059200.{nonce}.{}", &mac[..42]),
+            format!("v3.default.1793059200.{nonce}.{mac}.x"),
+            format!("v3.default.1793059200.{nonce}"),
+            "v3.own".to_owned(),
+            String::new(),
         ] {
-            assert_eq!(joining_seal_source(bad), None, "{bad}");
+            assert_eq!(joining_seal_source(&bad), None, "{bad}");
         }
     }
 

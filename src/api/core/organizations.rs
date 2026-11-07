@@ -2747,6 +2747,9 @@ async fn restore_member_impl(
             // they revoked (keykeeper_offboarding.rs).
             let by = super::keykeeper_offboarding::By::Member(&headers.user);
             super::keykeeper_offboarding::check_restore(&member, by, conn).await?;
+            // Keykeeper: a role its person never accepted, where it requires
+            // two-step login, comes back only when they accept it.
+            super::keykeeper_two_step::require_accepted_to_restore(&member, conn).await?;
 
             // Keykeeper: restored, they may come under two-step login for admins.
             let watch = super::keykeeper_two_step::Watch::user(&member.user_uuid, conn).await?;
@@ -2755,6 +2758,7 @@ async fn restore_member_impl(
             // This check need to be done after restoring to work with the correct status
             OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
             member.save(conn).await?;
+            crate::db::models::RevokedUntilAccepted::end(&member.uuid, conn).await?;
             super::keykeeper_offboarding::after_restore(&member, by, conn).await?;
             watch.settle(conn).await?;
             // Keykeeper: so a later revoke here stays one provisioning can't undo.
