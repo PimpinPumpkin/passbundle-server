@@ -570,6 +570,8 @@ make_config! {
         /// Purge incomplete SSO auth. |> Cron schedule of the job that cleans leftover auth in db due to incomplete SSO login.
         /// Defaults to daily. Set blank to disable this job.
         purge_incomplete_sso_auth: String, false,  def,   "0 20 0 * * *".to_owned();
+        /// MSP clients' seats schedule |> PassBundle: cron schedule of the job that records how many seats each MSP client has, once a day, for the MSP console's Seats section. The reading counts for the UTC day it's taken on, so the default takes it near the day's end (23:55 UTC). Set blank to disable this job.
+        msp_seats_schedule:     String, false,  def,    "0 55 23 * * *".to_owned();
     },
 
     /// General settings
@@ -1425,6 +1427,11 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
 
     if !cfg.auth_request_purge_schedule.is_empty() && cfg.auth_request_purge_schedule.parse::<Schedule>().is_err() {
         err!("`AUTH_REQUEST_PURGE_SCHEDULE` is not a valid cron expression")
+    }
+
+    // Keykeeper: the daily reading of MSP clients' seats.
+    if !cfg.msp_seats_schedule.is_empty() && cfg.msp_seats_schedule.parse::<Schedule>().is_err() {
+        err!("`MSP_SEATS_SCHEDULE` is not a valid cron expression")
     }
 
     if !cfg.disable_admin_token {

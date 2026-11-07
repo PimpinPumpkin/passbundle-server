@@ -785,6 +785,13 @@ fn schedule_jobs(pool: db::DbPool) {
                 }));
             }
 
+            // Keykeeper: record each MSP client's seats (default daily at 23h55 UTC).
+            if !CONFIG.msp_seats_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.msp_seats_schedule().parse().unwrap(), || {
+                    runtime.spawn(api::record_client_seats_job(pool.clone()));
+                }));
+            }
+
             // Periodically check for jobs to run. We probably won't need any
             // jobs that run more often than once a minute, so a default poll
             // interval of 30 seconds should be sufficient. Users who want to
