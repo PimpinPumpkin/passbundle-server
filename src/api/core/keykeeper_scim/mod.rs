@@ -972,17 +972,18 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
     let active_now = person.member.status > MembershipStatus::Revoked as i32;
     let active = fields.active.unwrap_or(active_now);
     // Keykeeper: someone revoked until they accept their role (two-step login
-    // for admins) is active as far as the directory goes: they come back when
-    // they accept it. Turned off by the directory, they don't.
+    // for admins) wasn't turned off by an owner or admin, and comes back when
+    // they accept it, or when the directory restores them where the role no
+    // longer waits for that. Turned off by the directory, they don't.
     let held = RevokedUntilAccepted::is(&person.member.uuid, conn).await;
     if held && !active {
         RevokedUntilAccepted::end(&person.member.uuid, conn).await?;
         scim.turned_off = true;
     }
 
-    if active != active_now && !(held && active) {
+    if active != active_now {
         if active {
-            if !scim.turned_off {
+            if !held && !scim.turned_off {
                 return Err(ScimError::forbidden(
                     "An owner or admin turned this person off in PassBundle; they turn them back on there.",
                 ));
@@ -1000,6 +1001,7 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
                     return Err(ScimError::new(Status::Conflict, None, e.message().to_owned()));
                 }
                 person.member.save(conn).await?;
+                RevokedUntilAccepted::end(&person.member.uuid, conn).await?;
                 watch.settle(conn).await?;
                 log_scim_event(EventType::OrganizationUserRestored, &person.member.uuid, org, &caller.ip, conn).await;
             }

@@ -1063,7 +1063,8 @@ fn role_name(member: &Membership) -> &'static str {
 /// The caller's memberships the server accepted for them, in a role the rule
 /// covers where the organization requires it: the web vault asks them to
 /// accept each one. Those revoked until they accept it (RevokedUntilAccepted)
-/// say so (`revoked`).
+/// say so (`revoked`), and are listed even once the organization no longer
+/// requires it, since accepting is what gives them back.
 #[get("/keykeeper/organizations/unaccepted")]
 async fn unaccepted_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
     let mut out = Vec::new();
@@ -1072,7 +1073,7 @@ async fn unaccepted_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
         if (member.status < MembershipStatus::Accepted as i32 && !revoked)
             || !UnacceptedMembership::is(&member.uuid, &conn).await
             || !covered_role(&member, &conn).await
-            || !OrgAdminTwoStep::required(&member.org_uuid, &conn).await?
+            || (!revoked && !OrgAdminTwoStep::required(&member.org_uuid, &conn).await?)
         {
             continue;
         }
