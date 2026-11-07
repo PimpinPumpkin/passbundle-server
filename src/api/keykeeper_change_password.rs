@@ -52,7 +52,7 @@ const MAX_ANSWERS: usize = 10_000;
 
 static CLIENT: LazyLock<Client> = LazyLock::new(|| {
     get_reqwest_client_builder(true)
-        .timeout(Duration::from_secs(CONFIG.icon_download_timeout()))
+        .timeout(Duration::from_secs(CONFIG.icon_download_timeout().into()))
         .build()
         .expect("Failed to build client")
 });
@@ -102,7 +102,7 @@ async fn change_password_uri(uri: Option<&str>, ip: ClientIp) -> ApiResult<Cache
         Some(site) if downloads_allowed() => lookup(&site).await,
         _ => None,
     };
-    Ok(Cached::ttl(Json(json!({ "uri": page })), ANSWER_TTL.as_secs(), false))
+    Ok(Cached::ttl(Json(json!({ "uri": page })), u32::try_from(ANSWER_TTL.as_secs()).unwrap_or(u32::MAX), false))
 }
 
 /// Whether the server may reach sites at all: the same rule as icon downloads.

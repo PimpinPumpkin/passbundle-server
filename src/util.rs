@@ -225,7 +225,7 @@ impl Fairing for Cors {
 pub struct Cached<R> {
     response: R,
     is_immutable: bool,
-    ttl: u64,
+    ttl: u32,
 }
 
 impl<R> Cached<R> {
@@ -245,7 +245,7 @@ impl<R> Cached<R> {
         }
     }
 
-    pub fn ttl(response: R, ttl: u64, is_immutable: bool) -> Cached<R> {
+    pub fn ttl(response: R, ttl: u32, is_immutable: bool) -> Cached<R> {
         Self {
             response,
             is_immutable,
@@ -266,7 +266,7 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cache
         res.set_raw_header("Cache-Control", cache_control_header);
 
         let time_now = Local::now();
-        let expiry_time = time_now + chrono::TimeDelta::try_seconds(self.ttl.try_into().unwrap()).unwrap();
+        let expiry_time = time_now + chrono::TimeDelta::try_seconds(self.ttl.into()).unwrap();
         res.set_raw_header("Expires", format_datetime_http(&expiry_time));
         Ok(res)
     }
@@ -274,14 +274,16 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cache
 
 pub struct EtagCached<R> {
     response: R,
+    content_type: ContentType,
     etag: String,
 }
 
 impl<R> EtagCached<R> {
     /// An `etag` response should always be quoted
-    pub fn new(response: R, etag: &str) -> Self {
+    pub fn new(response: R, content_type: ContentType, etag: &str) -> Self {
         Self {
             response,
+            content_type,
             etag: format!("\"{etag}\""),
         }
     }
@@ -303,7 +305,8 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for EtagC
             self.response.respond_to(request)?
         };
 
-        // Both 200 (OK) and 304 (Not Modified) need to return the etag and cache-control
+        // Both 200 (OK) and 304 (Not Modified) need to return the Content-Type Etag and Cache-Control
+        res.set_header(self.content_type);
         res.set_raw_header("Etag", self.etag);
         res.set_raw_header("Cache-Control", "public, no-cache");
         Ok(res)
@@ -327,28 +330,53 @@ fn routed_path(uri: &rocket::http::uri::Origin<'_>) -> String {
     path
 }
 
-/// The routed path after the domain's own path, if it has one.
-fn routed_subpath(uri: &rocket::http::uri::Origin<'_>) -> String {
-    let path = routed_path(uri);
-    match path.strip_prefix(&CONFIG.domain_path()) {
-        Some(rest) => rest.to_owned(),
-        None => path,
+// When extra is true, we ignore the whitelist above and also print the mounts
+pub struct BetterLogging {
+    extra: bool,
+    log_requests: bool,
+    log_response: bool,
+    domain_path: String,
+}
+
+impl BetterLogging {
+    pub fn new(extra: bool, domain_path: &str) -> Self {
+        Self {
+            extra,
+            log_requests: log_enabled!(target: "request", log::Level::Info),
+            log_response: log_enabled!(target: "response", log::Level::Info),
+            domain_path: rocket::http::RawStr::new(&domain_path).percent_decode_lossy().into_owned(),
+        }
+    }
+
+    /// Keykeeper: the routed path (routed_path) after the domain's own path,
+    /// if it has one.
+    fn routed_subpath(&self, uri: &rocket::http::uri::Origin<'_>) -> String {
+        let path = routed_path(uri);
+        match path.strip_prefix(&self.domain_path) {
+            Some(rest) => rest.to_owned(),
+            None => path,
+        }
     }
 }
 
-// Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
-pub struct BetterLogging(pub bool);
 #[rocket::async_trait]
 impl Fairing for BetterLogging {
     fn info(&self) -> Info {
+        let mut kind = Kind::Liftoff;
+        if self.log_requests {
+            kind = kind | Kind::Request;
+        }
+        if self.log_response {
+            kind = kind | Kind::Response;
+        }
         Info {
             name: "Better Logging",
-            kind: Kind::Liftoff | Kind::Request | Kind::Response,
+            kind,
         }
     }
 
     async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
-        if self.0 {
+        if self.extra {
             info!(target: "routes", "Routes loaded:");
             let mut routes: Vec<_> = rocket.routes().collect();
             routes.sort_by_key(|r| r.uri.path());
@@ -373,47 +401,47 @@ impl Fairing for BetterLogging {
 
     async fn on_request(&self, request: &mut Request<'_>, _data: &mut Data<'_>) {
         let method = request.method();
-        if !self.0 && method == Method::Options {
+        if !self.extra && method == Method::Options {
             return;
         }
         let uri = request.uri();
-        let uri_path = uri.path();
-        let uri_path_str = uri_path.url_decode_lossy();
+        let path = uri.path().raw().percent_decode_lossy();
         // Keykeeper: decided on the path as Rocket routes it (routed_path).
-        let uri_subpath = &routed_subpath(uri);
+        let subpath = &self.routed_subpath(uri);
         // Keykeeper: provisioning requests are logged without their query,
         // whose filters carry people's names and emails, and so are single
         // sign-on's, whose queries carry codes and states, and a sign-in
         // request's answer, read with its access code.
-        if uri_subpath.starts_with("/scim")
-            || crate::api::keykeeper_sso_redacts(uri_subpath)
-            || crate::api::core::keykeeper_device_approval::redacts(uri_subpath)
+        if subpath.starts_with("/scim")
+            || crate::api::keykeeper_sso_redacts(subpath)
+            || crate::api::core::keykeeper_device_approval::redacts(subpath)
         {
-            info!(target: "request", "{method} {uri_path_str}");
+            info!(target: "request", "{method} {}", path.escape_debug());
             return;
         }
-        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
+        if self.extra || LOGGED_ROUTES.iter().any(|r| subpath.starts_with(r)) {
             // Keykeeper: a query's names only, never its values, which can be
             // codes, tokens, emails, or the websites in people's vaults
             // (`?code=`, `?uri=`, `?username=`).
             match uri.query() {
-                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", query_names(q.as_str())),
-                None => info!(target: "request", "{method} {uri_path_str}"),
+                Some(q) => {
+                    info!(target: "request", "{method} {}?{}", path.escape_debug(), query_names(q.as_str()).escape_debug());
+                }
+                None => info!(target: "request", "{method} {}", path.escape_debug()),
             }
         }
     }
 
     async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
-        if !self.0 && request.method() == Method::Options {
+        if !self.extra && request.method() == Method::Options {
             return;
         }
-        let uri_subpath = &routed_subpath(request.uri());
-        if self.0 || uri_subpath.starts_with("/scim") || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
+        let subpath = &self.routed_subpath(request.uri());
+        if self.extra || subpath.starts_with("/scim") || LOGGED_ROUTES.iter().any(|r| subpath.starts_with(r)) {
             let status = response.status();
-            if let Some(route) = request.route() {
-                info!(target: "response", "{route} => {status}");
-            } else {
-                info!(target: "response", "{status}");
+            match request.route() {
+                Some(r) => info!(target: "response", "{r} => {status}"),
+                None => info!(target: "response", "{status}"),
             }
         }
     }
@@ -512,20 +540,34 @@ pub fn get_env_str_value(key: &str) -> Option<String> {
     }
 }
 
-pub fn get_env<V>(key: &str) -> Option<V>
+pub static INVALID_ENV_VARS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+pub fn get_env<V>(key: &'static str) -> Option<V>
 where
     V: FromStr,
 {
-    try_parse_string(get_env_str_value(key))
+    let value = get_env_str_value(key);
+    let value_is_some = value.is_some();
+    let parsed: Option<V> = try_parse_string(value);
+    if parsed.is_none() && value_is_some {
+        println!("[ERROR] `{key}` contains an invalid value for its type and is ignored, the default is used instead.");
+        INVALID_ENV_VARS.lock().unwrap().push(key);
+    }
+    parsed
 }
 
-pub fn get_env_bool(key: &str) -> Option<bool> {
+pub fn get_env_bool(key: &'static str) -> Option<bool> {
     const TRUE_VALUES: &[&str] = &["true", "t", "yes", "y", "1"];
     const FALSE_VALUES: &[&str] = &["false", "f", "no", "n", "0"];
 
     match get_env_str_value(key) {
         Some(val) if TRUE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(true),
         Some(val) if FALSE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(false),
+        Some(_) => {
+            println!("[ERROR] `{key}` contains an invalid boolean value and is ignored, the default is used instead.");
+            INVALID_ENV_VARS.lock().unwrap().push(key);
+            None
+        }
         _ => None,
     }
 }
