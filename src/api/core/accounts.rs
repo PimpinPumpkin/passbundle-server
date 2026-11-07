@@ -1284,7 +1284,7 @@ struct VerifyEmailTokenData {
 }
 
 #[post("/accounts/verify-email-token", data = "<data>")]
-async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn) -> EmptyResult {
+async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let data: VerifyEmailTokenData = data.into_inner();
 
     let Some(mut user) = User::find_by_uuid(&data.user_id, &conn).await else {
@@ -1300,8 +1300,12 @@ async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn)
     user.verified_at = Some(Utc::now().naive_utc());
     user.last_verifying_at = None;
     user.login_verify_count = 0;
-    if let Err(e) = user.save(&conn).await {
-        error!("Error saving email verification: {e:#?}");
+    // Keykeeper: saving moves the account's revision date, and the person's
+    // open apps are told to sync, so a vault that's open (on this device or
+    // another) learns the address is verified and stops asking for it.
+    match user.save(&conn).await {
+        Ok(()) => nt.send_user_update(UpdateType::SyncSettings, &user, None, &conn).await,
+        Err(e) => error!("Error saving email verification: {e:#?}"),
     }
 
     Ok(())
