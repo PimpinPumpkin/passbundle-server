@@ -1,7 +1,6 @@
 use data_encoding::BASE32;
 use rocket::{Route, serde::json::Json};
 
-use super::keykeeper_verification;
 use crate::{
     api::{
         EmptyResult, JsonResult, PasswordOrOtpData,
@@ -9,11 +8,11 @@ use crate::{
         core::log_user_event,
         core::two_factor::generate_recover_code,
     },
-    auth::{ClientIp, Headers},
+    auth::{ClientIp, Headers, two_factor},
     crypto,
     db::{
         DbConn,
-        models::{Device, EventType, TwoFactor, TwoFactorType, UserId},
+        models::{EventType, TwoFactor, TwoFactorType, UserId},
     },
     util::NumberOrString,
 };
@@ -29,27 +28,23 @@ pub fn routes() -> Vec<Route> {
 // they haven't set it up (DESIGN.md, "Two-step login for admins").
 #[post("/two-factor/get-authenticator", data = "<data>")]
 async fn generate_authenticator(data: Json<PasswordOrOtpData>, headers: SetupHeaders, conn: DbConn) -> JsonResult {
-    let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
     data.validate(&user, false, &conn).await?;
 
-    let type_ = TwoFactorType::Authenticator as i32;
-    let twofactor = TwoFactor::find_by_user_and_type(&user.uuid, type_, &conn).await;
+    let twofactor = TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::Authenticator, &conn).await;
 
     let (enabled, key) = match twofactor {
         Some(tf) => (true, tf.data),
         _ => (false, crypto::encode_random_bytes::<20>(&BASE32)),
     };
 
-    // Keykeeper: with the token the dialog sends next instead of the password
-    // (keykeeper_verification.rs), as upstream's clients expect.
     Ok(Json(json!({
-        "enabled": enabled,
-        "key": key,
-        "authenticator": { "enabled": enabled, "key": key },
-        "userVerificationToken": keykeeper_verification::token(&user),
-        "object": "twoFactorAuthenticator"
+        "authenticator": json!({
+            "enabled": enabled,
+            "key": key,
+        }),
+        "userVerificationToken": two_factor::authenticator_token(user.uuid, key, enabled),
     })))
 }
 
@@ -58,9 +53,7 @@ async fn generate_authenticator(data: Json<PasswordOrOtpData>, headers: SetupHea
 struct EnableAuthenticatorData {
     key: String,
     token: NumberOrString,
-    master_password_hash: Option<String>,
-    otp: Option<String>,
-    user_verification_token: Option<String>,
+    user_verification_token: String,
 }
 
 #[post("/two-factor/authenticator", data = "<data>")]
@@ -75,13 +68,7 @@ async fn activate_authenticator(
 
     let mut user = headers.user;
 
-    PasswordOrOtpData {
-        master_password_hash: data.master_password_hash,
-        otp: data.otp,
-        user_verification_token: data.user_verification_token,
-    }
-    .validate_two_step(&user, true, &conn)
-    .await?;
+    two_factor::validate_authenticator(&data.user_verification_token, &user.uuid, &key, false)?;
 
     // Validate key as base32 and 20 bytes length
     let decoded_key: Vec<u8> = if let Ok(decoded) = BASE32.decode(key.as_bytes()) {
@@ -99,14 +86,13 @@ async fn activate_authenticator(
 
     generate_recover_code(&mut user, &conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device_type, &headers.ip.ip, &conn).await;
+    log_user_event(EventType::UserUpdated2fa, &user.uuid, headers.device_type, &headers.ip.ip, &conn).await;
 
     let mut answer = json!({
-        "enabled": true,
-        "key": key,
-        // Keykeeper: as upstream's clients read it, too.
-        "authenticator": { "enabled": true, "key": key },
-        "object": "twoFactorAuthenticator"
+        "authenticator": json!({
+            "enabled": true,
+            "key": key,
+        }),
     });
     // Keykeeper: a setup session ends here.
     finish_setup(headers.session.as_ref(), &mut user, &mut answer, &conn).await?;
@@ -149,8 +135,7 @@ pub async fn validate_totp_code(
         err!("Invalid TOTP secret")
     };
 
-    let mut twofactor = match TwoFactor::find_by_user_and_type(user_id, TwoFactorType::Authenticator as i32, conn).await
-    {
+    let mut twofactor = match TwoFactor::find_by_user_and_type(user_id, TwoFactorType::Authenticator, conn).await {
         Some(tf) => tf,
         _ => TwoFactor::new(user_id.clone(), TwoFactorType::Authenticator, secret.to_owned()),
     };
@@ -208,53 +193,29 @@ pub async fn validate_totp_code(
 #[serde(rename_all = "camelCase")]
 struct DisableAuthenticatorData {
     key: String,
-    master_password_hash: Option<String>,
-    user_verification_token: Option<String>,
-    #[serde(default)]
-    r#type: Option<NumberOrString>,
+    user_verification_token: String,
 }
 
 #[delete("/two-factor/authenticator", data = "<data>")]
-async fn disable_authenticator(data: Json<DisableAuthenticatorData>, headers: Headers, conn: DbConn) -> JsonResult {
-    let data = data.into_inner();
+async fn disable_authenticator(data: Json<DisableAuthenticatorData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let user = headers.user;
-    // Keykeeper: upstream's clients send no type here: it's the authenticator app.
-    let type_ = match data.r#type {
-        Some(t) => t.into_i32()?,
-        None => TwoFactorType::Authenticator as i32,
-    };
+
+    two_factor::validate_authenticator(&data.user_verification_token, &user.uuid, &data.key, true)?;
     // Keykeeper: their last method that counts for two-step login for admins
     // may go, which ends their sessions.
     let watch = crate::api::core::keykeeper_two_step::Watch::user(&user.uuid, &conn).await?;
 
-    // Keykeeper: the password, or the dialog's token (keykeeper_verification.rs).
-    PasswordOrOtpData {
-        master_password_hash: data.master_password_hash,
-        otp: None,
-        user_verification_token: data.user_verification_token,
-    }
-    .validate_two_step(&user, false, &conn)
-    .await?;
-
-    if let Some(twofactor) = TwoFactor::find_by_user_and_type(&user.uuid, type_, &conn).await {
+    if let Some(twofactor) = TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::Authenticator, &conn).await {
         if twofactor.data == data.key {
             twofactor.delete(&conn).await?;
-            Device::clear_twofactor_remember_by_user(&user.uuid, &conn).await?;
-            log_user_event(EventType::UserDisabled2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn)
-                .await;
+            log_user_event(EventType::UserDisabled2fa, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
         } else {
             err!(format!("TOTP key for user {} does not match recorded value, cannot deactivate", &user.email));
         }
     }
 
-    if TwoFactor::find_by_user(&user.uuid, &conn).await.is_empty() {
-        super::enforce_2fa_policy(&user, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await?;
-    }
+    super::check_2fa_state(&user, headers.device.atype, &headers.ip.ip, &conn).await?;
     watch.settle(&conn).await?;
 
-    Ok(Json(json!({
-        "enabled": false,
-        "keys": type_,
-        "object": "twoFactorProvider"
-    })))
+    Ok(())
 }

@@ -121,6 +121,7 @@ table! {
         atype -> Integer,
         enabled -> Bool,
         data -> Text,
+        revision_date -> Timestamp,
     }
 }
 
