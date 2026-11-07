@@ -619,9 +619,9 @@ async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientD
     if let Some(admins) = admins_collection {
         Collection::new(org.uuid.clone(), admins, None).save(&conn).await?;
     }
-    if business {
-        keykeeper_msp_policies::apply_defaults_to_new_client(&msp_id, &org.uuid, &headers, &conn).await?;
-    }
+    // Keykeeper: without the default policies, still the ones the MSP requires
+    // for every client (DESIGN.md, "Required for every client").
+    keykeeper_msp_policies::apply_defaults_to_new_client(&msp_id, &org.uuid, !business, &headers, &conn).await?;
     MspClient::new(
         org.uuid.clone(),
         msp_id.clone(),
