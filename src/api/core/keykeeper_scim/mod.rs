@@ -47,8 +47,9 @@ use crate::{
         DbConn,
         models::{
             Collection, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation, JoinSeal, Membership,
-            MembershipId, MembershipStatus, MspClient, OrgPolicy, OrgSetup, Organization, OrganizationId, ScimGroup,
-            ScimPerson, ScimToken, ScimUser, SealKind, User, invite_hours, looks_like_scim_token, remove_group_member,
+            MembershipId, MembershipStatus, MspClient, OrgPolicy, OrgSetup, Organization, OrganizationId,
+            RevokedUntilAccepted, ScimGroup, ScimPerson, ScimToken, ScimUser, SealKind, User, invite_hours,
+            looks_like_scim_token, remove_group_member,
         },
     },
     mail,
@@ -970,26 +971,40 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
     check_user_name_slot(org, &fields.user_name, Some(&person.member.uuid), conn).await?;
     let active_now = person.member.status > MembershipStatus::Revoked as i32;
     let active = fields.active.unwrap_or(active_now);
+    // Keykeeper: someone revoked until they accept their role (two-step login
+    // for admins) wasn't turned off by an owner or admin, and comes back when
+    // they accept it, or when the directory restores them where the role no
+    // longer waits for that. Turned off by the directory, they don't.
+    let held = RevokedUntilAccepted::is(&person.member.uuid, conn).await;
+    if held && !active {
+        RevokedUntilAccepted::end(&person.member.uuid, conn).await?;
+        scim.turned_off = true;
+    }
 
     if active != active_now {
         if active {
-            if !scim.turned_off {
+            if !held && !scim.turned_off {
                 return Err(ScimError::forbidden(
                     "An owner or admin turned this person off in PassBundle; they turn them back on there.",
                 ));
             }
-            // Restored, they may come under two-step login for admins.
-            let watch = crate::api::core::keykeeper_two_step::Watch::user(&person.member.user_uuid, conn).await?;
-            person.member.restore();
-            // Upstream's checks for restoring someone: single organization,
-            // two-step login.
-            if let Err(e) = OrgPolicy::check_user_allowed(&person.member, "restore", conn).await {
-                return Err(ScimError::new(Status::Conflict, None, e.message().to_owned()));
-            }
-            person.member.save(conn).await?;
-            watch.settle(conn).await?;
             scim.turned_off = false;
-            log_scim_event(EventType::OrganizationUserRestored, &person.member.uuid, org, &caller.ip, conn).await;
+            // Keykeeper: a role they never accepted, where it requires
+            // two-step login, comes back only when they accept it.
+            if !crate::api::core::keykeeper_two_step::restore_waits_for_them(&person.member, conn).await? {
+                // Restored, they may come under two-step login for admins.
+                let watch = crate::api::core::keykeeper_two_step::Watch::user(&person.member.user_uuid, conn).await?;
+                person.member.restore();
+                // Upstream's checks for restoring someone: single organization,
+                // two-step login.
+                if let Err(e) = OrgPolicy::check_user_allowed(&person.member, "restore", conn).await {
+                    return Err(ScimError::new(Status::Conflict, None, e.message().to_owned()));
+                }
+                person.member.save(conn).await?;
+                RevokedUntilAccepted::end(&person.member.uuid, conn).await?;
+                watch.settle(conn).await?;
+                log_scim_event(EventType::OrganizationUserRestored, &person.member.uuid, org, &caller.ip, conn).await;
+            }
         } else {
             person.member.revoke();
             person.member.save(conn).await?;

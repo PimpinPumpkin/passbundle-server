@@ -12,7 +12,10 @@ use crate::{
     api::{ApiResult, EmptyResult},
     db::{
         DbConn,
-        keykeeper_schema::{msp_staff_two_step, org_admin_two_step, two_step_setup_sessions, unaccepted_memberships},
+        keykeeper_schema::{
+            msp_staff_two_step, org_admin_two_step, revoked_until_accepted, two_step_setup_sessions,
+            unaccepted_memberships,
+        },
     },
     error::MapResult,
 };
@@ -173,6 +176,57 @@ impl UnacceptedMembership {
             diesel::delete(unaccepted_memberships::table.filter(unaccepted_memberships::membership_uuid.eq(id)))
                 .execute(conn)
                 .map_res("Error accepting a membership")
+                .map(|_: usize| ())
+        })
+        .await
+    }
+}
+
+/// Memberships revoked until their person accepts them: a role the server
+/// accepted for its person (UnacceptedMembership), confirmed before its
+/// organization required two-step login for it. Accepting restores it; a
+/// revoke by the directory, or a restore once the organization no longer
+/// requires it, ends the hold. Removing the membership removes the row.
+pub struct RevokedUntilAccepted;
+
+impl RevokedUntilAccepted {
+    /// Records that this membership is revoked until its person accepts it.
+    pub async fn hold(id: &MembershipId, conn: &DbConn) -> EmptyResult {
+        let id = id.clone();
+        conn.run(move |conn| {
+            diesel::delete(revoked_until_accepted::table.filter(revoked_until_accepted::membership_uuid.eq(&id)))
+                .execute(conn)
+                .map_res("Error recording a membership revoked until it's accepted")
+                .map(|_: usize| ())?;
+            diesel::insert_into(revoked_until_accepted::table)
+                .values(revoked_until_accepted::membership_uuid.eq(&id))
+                .execute(conn)
+                .map_res("Error recording a membership revoked until it's accepted")
+                .map(|_: usize| ())
+        })
+        .await
+    }
+
+    /// Whether this membership is revoked until its person accepts it.
+    pub async fn is(id: &MembershipId, conn: &DbConn) -> bool {
+        let id = id.clone();
+        conn.run(move |conn| {
+            revoked_until_accepted::table
+                .filter(revoked_until_accepted::membership_uuid.eq(id))
+                .count()
+                .first::<i64>(conn)
+                .is_ok_and(|n| n > 0)
+        })
+        .await
+    }
+
+    /// The hold is over: accepted, restored, or turned off by the directory.
+    pub async fn end(id: &MembershipId, conn: &DbConn) -> EmptyResult {
+        let id = id.clone();
+        conn.run(move |conn| {
+            diesel::delete(revoked_until_accepted::table.filter(revoked_until_accepted::membership_uuid.eq(id)))
+                .execute(conn)
+                .map_res("Error ending a membership's hold")
                 .map(|_: usize| ())
         })
         .await

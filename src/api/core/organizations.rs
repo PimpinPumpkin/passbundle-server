@@ -2607,8 +2607,18 @@ async fn revoke_member_impl(
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    match Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
-        Some(mut member) if member.status > MembershipStatus::Revoked as i32 => {
+    // Keykeeper: someone revoked only until they accept their role (two-step
+    // login for admins, keykeeper_two_step.rs) is already revoked, but would
+    // come back by accepting it; an owner's or admin's revoke makes it an
+    // ordinary one, with the same checks, so accepting no longer restores them.
+    let found = Membership::find_by_uuid_and_org(member_id, org_id, conn).await;
+    let held = match &found {
+        Some(member) => crate::db::models::RevokedUntilAccepted::is(&member.uuid, conn).await,
+        None => false,
+    };
+    match found {
+        Some(mut member) if member.status > MembershipStatus::Revoked as i32 || held => {
+            let already_revoked = member.status <= MembershipStatus::Revoked as i32;
             if member.user_uuid == headers.user.uuid {
                 err!("You cannot revoke yourself")
             }
@@ -2623,7 +2633,9 @@ async fn revoke_member_impl(
             if member.atype == MembershipType::Owner && headers.membership_type != MembershipType::Owner {
                 err!("Only owners can revoke other owners")
             }
-            if member.atype == MembershipType::Owner
+            // (One already revoked isn't a confirmed owner any more.)
+            if !already_revoked
+                && member.atype == MembershipType::Owner
                 && Membership::count_confirmed_by_org_and_type(org_id, MembershipType::Owner, conn).await <= 1
             {
                 err!("Organization must have at least one confirmed owner")
@@ -2638,8 +2650,12 @@ async fn revoke_member_impl(
             )
             .await?;
 
-            member.revoke();
-            member.save(conn).await?;
+            // Never one its person undoes by accepting their role.
+            crate::db::models::RevokedUntilAccepted::end(&member.uuid, conn).await?;
+            if !already_revoked {
+                member.revoke();
+                member.save(conn).await?;
+            }
             // Keykeeper: provisioning can't turn them back on (DESIGN.md,
             // "Provisioning from Entra ID").
             crate::db::models::ScimUser::admin_decided(&member.uuid, conn).await?;
@@ -2747,6 +2763,9 @@ async fn restore_member_impl(
             // they revoked (keykeeper_offboarding.rs).
             let by = super::keykeeper_offboarding::By::Member(&headers.user);
             super::keykeeper_offboarding::check_restore(&member, by, conn).await?;
+            // Keykeeper: a role its person never accepted, where it requires
+            // two-step login, comes back only when they accept it.
+            super::keykeeper_two_step::require_accepted_to_restore(&member, conn).await?;
 
             // Keykeeper: restored, they may come under two-step login for admins.
             let watch = super::keykeeper_two_step::Watch::user(&member.user_uuid, conn).await?;
@@ -2755,6 +2774,7 @@ async fn restore_member_impl(
             // This check need to be done after restoring to work with the correct status
             OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
             member.save(conn).await?;
+            crate::db::models::RevokedUntilAccepted::end(&member.uuid, conn).await?;
             super::keykeeper_offboarding::after_restore(&member, by, conn).await?;
             watch.settle(conn).await?;
             // Keykeeper: so a later revoke here stays one provisioning can't undo.
@@ -3601,4 +3621,101 @@ async fn rotate_api_key(
     conn: DbConn,
 ) -> JsonResult {
     api_key(&org_id, data, true, headers, conn).await
+}
+
+// Keykeeper: an owner's or admin's revoke of someone revoked only until they
+// accept their role (two-step login for admins) is an ordinary revoke.
+#[cfg(test)]
+mod keykeeper_tests {
+    use super::*;
+    use crate::db::{
+        DbPool,
+        models::{DeviceId, OrgAdminTwoStep, RevokedUntilAccepted, UnacceptedMembership},
+    };
+
+    async fn person(name: &str, conn: &DbConn) -> User {
+        let mut user = User::new(&format!("{name}@example.test"), None);
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    async fn join(user: &User, org: &Organization, atype: MembershipType, conn: &DbConn) -> Membership {
+        let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
+        member.atype = atype as i32;
+        member.status = MembershipStatus::Confirmed as i32;
+        member.access_all = atype != MembershipType::User;
+        member.save(conn).await.unwrap();
+        member
+    }
+
+    async fn headers(user: &User, org: &Organization, membership_type: MembershipType, conn: &DbConn) -> AdminHeaders {
+        AdminHeaders {
+            host: "https://127.0.0.1".to_owned(),
+            device: Device::new(
+                DeviceId::from(format!("device-{}", user.uuid)),
+                user.uuid.clone(),
+                "test".to_owned(),
+                9,
+            ),
+            user: User::find_by_uuid(&user.uuid, conn).await.unwrap(),
+            membership_type,
+            ip: ClientIp {
+                ip: "127.0.0.1".parse().unwrap(),
+            },
+            org_id: org.uuid.clone(),
+            custom_permissions: None,
+        }
+    }
+
+    #[rocket::async_test]
+    async fn an_owners_revoke_of_someone_held_until_they_accept_is_an_ordinary_revoke() {
+        let conn = DbPool::for_test().await;
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let org = Organization::new("Contoso".to_owned(), "billing@example.test", None, None);
+        org.save(&conn).await.unwrap();
+        let olivia = person("olivia", &conn).await;
+        join(&olivia, &org, MembershipType::Owner, &conn).await;
+        let cy = person("cy", &conn).await;
+        join(&cy, &org, MembershipType::Admin, &conn).await;
+        // An admin and an owner, confirmed before the rule, who never accepted.
+        let ana = person("ana", &conn).await;
+        let admin = join(&ana, &org, MembershipType::Admin, &conn).await;
+        let bo = person("bo", &conn).await;
+        let owner = join(&bo, &org, MembershipType::Owner, &conn).await;
+        UnacceptedMembership::mark(vec![admin.uuid.clone(), owner.uuid.clone()], &conn).await.unwrap();
+        super::super::keykeeper_two_step::set_org_required(&org.uuid, true, &olivia.uuid, 9, &ip, &conn).await.unwrap();
+        assert!(RevokedUntilAccepted::is(&admin.uuid, &conn).await);
+        assert!(RevokedUntilAccepted::is(&owner.uuid, &conn).await);
+
+        // An admin can't revoke an owner, held or not: the hold stays.
+        assert!(
+            revoke_member_impl(&org.uuid, &owner.uuid, &headers(&cy, &org, MembershipType::Admin, &conn).await, &conn)
+                .await
+                .is_err()
+        );
+        assert!(RevokedUntilAccepted::is(&owner.uuid, &conn).await);
+
+        // The owner revokes the admin: still revoked, no longer on hold, so
+        // accepting their role won't bring them back.
+        revoke_member_impl(&org.uuid, &admin.uuid, &headers(&olivia, &org, MembershipType::Owner, &conn).await, &conn)
+            .await
+            .unwrap();
+        let admin = Membership::find_by_uuid(&admin.uuid, &conn).await.unwrap();
+        assert!(admin.status < MembershipStatus::Invited as i32);
+        assert_eq!(admin.get_unrevoked_status(), MembershipStatus::Confirmed as i32);
+        assert!(!RevokedUntilAccepted::is(&admin.uuid, &conn).await);
+        // An ordinary revoke now: revoking again is refused as for anyone.
+        assert!(
+            revoke_member_impl(
+                &org.uuid,
+                &admin.uuid,
+                &headers(&olivia, &org, MembershipType::Owner, &conn).await,
+                &conn
+            )
+            .await
+            .is_err()
+        );
+        // The rule is still on.
+        assert!(OrgAdminTwoStep::required(&org.uuid, &conn).await.unwrap());
+    }
 }

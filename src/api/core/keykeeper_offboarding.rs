@@ -489,11 +489,17 @@ pub(super) async fn cut_msp_out(
 
 #[cfg(test)]
 mod tests {
-    use super::super::keykeeper_two_step::{require_accepted_to_confirm, require_accepted_to_promote};
+    use super::super::keykeeper_two_step::{
+        require_accepted_to_confirm, require_accepted_to_promote, require_accepted_to_restore, restore_waits_for_them,
+        set_org_required,
+    };
     use super::*;
     use crate::db::{
         DbPool,
-        models::{EventKind, Msp, MspRole, MspStaff, OrgAdminTwoStep, UnacceptedMembership, confirms_automatically},
+        models::{
+            EventKind, Msp, MspRole, MspStaff, OrgAdminTwoStep, RevokedUntilAccepted, UnacceptedMembership,
+            confirms_automatically,
+        },
     };
 
     async fn person(name: &str, conn: &DbConn) -> User {
@@ -702,5 +708,71 @@ mod tests {
         assert!(require_accepted_to_confirm(&admin, &conn).await.is_ok());
         OrgAdminTwoStep::set(&org.uuid, false, &conn).await.unwrap();
         assert!(require_accepted_to_promote(&member, true, &conn).await.is_ok());
+    }
+
+    #[rocket::async_test]
+    async fn a_role_confirmed_before_the_rule_is_revoked_until_its_person_accepts_it() {
+        let conn = DbPool::for_test().await;
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let org = organization("Contoso", &conn).await;
+        let olivia = person("olivia", &conn).await;
+        join(&olivia, &org, MembershipType::Owner, &conn).await;
+        // Confirmed while the rule was off, in roles the server accepted for
+        // their person: an admin, a regular member, and the admin who turns it on.
+        let ana = person("ana", &conn).await;
+        let admin = join(&ana, &org, MembershipType::Admin, &conn).await;
+        let ben = person("ben", &conn).await;
+        let member = join(&ben, &org, MembershipType::User, &conn).await;
+        let cy = person("cy", &conn).await;
+        let actor = join(&cy, &org, MembershipType::Admin, &conn).await;
+        UnacceptedMembership::mark(vec![admin.uuid.clone(), member.uuid.clone(), actor.uuid.clone()], &conn)
+            .await
+            .unwrap();
+
+        assert!(set_org_required(&org.uuid, true, &cy.uuid, 0, &ip, &conn).await.unwrap());
+
+        // The admin is revoked until they accept it.
+        let admin = Membership::find_by_uuid(&admin.uuid, &conn).await.unwrap();
+        assert!(admin.status < MembershipStatus::Invited as i32);
+        assert_eq!(admin.get_unrevoked_status(), MembershipStatus::Confirmed as i32);
+        assert!(RevokedUntilAccepted::is(&admin.uuid, &conn).await);
+        assert!(UnacceptedMembership::is(&admin.uuid, &conn).await);
+        // A regular member's role isn't one the rule covers.
+        let member = Membership::find_by_uuid(&member.uuid, &conn).await.unwrap();
+        assert_eq!(member.status, MembershipStatus::Confirmed as i32);
+        assert!(!RevokedUntilAccepted::is(&member.uuid, &conn).await);
+        // Whoever turned it on accepted their own role by doing so.
+        let actor = Membership::find_by_uuid(&actor.uuid, &conn).await.unwrap();
+        assert_eq!(actor.status, MembershipStatus::Confirmed as i32);
+        assert!(!UnacceptedMembership::is(&actor.uuid, &conn).await);
+
+        // An owner's restore waits for them, and says so; once they accept,
+        // nothing holds it.
+        assert!(require_accepted_to_restore(&admin, &conn).await.is_err());
+        assert!(RevokedUntilAccepted::is(&admin.uuid, &conn).await);
+        UnacceptedMembership::accept(&admin.uuid, &conn).await.unwrap();
+        assert!(!restore_waits_for_them(&admin, &conn).await.unwrap());
+        // Nor where the organization doesn't require it.
+        OrgAdminTwoStep::set(&org.uuid, false, &conn).await.unwrap();
+        UnacceptedMembership::mark(vec![admin.uuid.clone()], &conn).await.unwrap();
+        assert!(!restore_waits_for_them(&admin, &conn).await.unwrap());
+    }
+
+    #[rocket::async_test]
+    async fn the_rule_never_revokes_an_organizations_last_confirmed_owner() {
+        let conn = DbPool::for_test().await;
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let org = organization("Fabrikam", &conn).await;
+        let olivia = person("olivia", &conn).await;
+        let owner = join(&olivia, &org, MembershipType::Owner, &conn).await;
+        UnacceptedMembership::mark(vec![owner.uuid.clone()], &conn).await.unwrap();
+        let cy = person("cy", &conn).await;
+        join(&cy, &org, MembershipType::Admin, &conn).await;
+
+        set_org_required(&org.uuid, true, &cy.uuid, 0, &ip, &conn).await.unwrap();
+
+        let owner = Membership::find_by_uuid(&owner.uuid, &conn).await.unwrap();
+        assert_eq!(owner.status, MembershipStatus::Confirmed as i32);
+        assert!(!RevokedUntilAccepted::is(&owner.uuid, &conn).await);
     }
 }
