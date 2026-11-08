@@ -1482,21 +1482,25 @@ pub struct PreloginData {
     email: String,
 }
 
+/// The KDF settings an unknown email can get, as (type, iterations, memory, parallelism). The default is in it
+/// twice to give it more weight, as upstream's list has it. Keykeeper: upstream's list also has PBKDF2 at 5,000 and
+/// 100,000 iterations, for its legacy accounts. A PassBundle account can't have 5,000 (a KDF change refuses PBKDF2
+/// under 100,000), so that answer would say the email has no account, and PassBundle's apps refuse PBKDF2 under
+/// 600,000, so they'd say an unknown email's settings are too weak instead of a wrong email or password. Every
+/// setting here is one an account could have that the apps accept (DESIGN.md, "Unknown emails at prelogin").
+const UNKNOWN_EMAIL_KDF_SETTINGS: [(i32, i32, Option<i32>, Option<i32>); 6] = [
+    (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT, None, None),
+    (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT, None, None),
+    (UserKdfType::Pbkdf2 as i32, 800_000, None, None),
+    (UserKdfType::Pbkdf2 as i32, 1_000_000, None, None),
+    (UserKdfType::Argon2id as i32, 3, Some(64), Some(4)),
+    (UserKdfType::Argon2id as i32, 6, Some(32), Some(4)),
+];
+
 /// Like upstream, an unknown email gets KDF settings picked from a list of common ones by a keyed hash of the email,
 /// so they stay the same between requests. The salt stays null, as for existing users.
 fn unknown_email_kdf(email: &str) -> (i32, i32, Option<i32>, Option<i32>) {
-    const PBKDF2: i32 = UserKdfType::Pbkdf2 as i32;
-    const ARGON2ID: i32 = UserKdfType::Argon2id as i32;
-    // Same list as upstream, the default is in it twice to give it more weight
-    const KDF_SETTINGS: [(i32, i32, Option<i32>, Option<i32>); 6] = [
-        (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT, None, None),
-        (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT, None, None),
-        (PBKDF2, 100_000, None, None),
-        (PBKDF2, 5_000, None, None),
-        (ARGON2ID, 3, Some(64), Some(4)),
-        (ARGON2ID, 6, Some(32), Some(4)),
-    ];
-    KDF_SETTINGS[crate::auth::prelogin_kdf_index(email, KDF_SETTINGS.len())]
+    UNKNOWN_EMAIL_KDF_SETTINGS[crate::auth::prelogin_kdf_index(email, UNKNOWN_EMAIL_KDF_SETTINGS.len())]
 }
 
 pub async fn prelogin(data: Json<PreloginData>, ip: ClientIp, conn: DbConn) -> JsonResult {
@@ -2063,6 +2067,52 @@ pub async fn purge_auth_requests(pool: DbPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every KDF setting an unknown email can get is one a PassBundle account could have (the server's own check
+    /// for a KDF change takes it) and that PassBundle's apps accept (passbundle-apps core/src/kdf.rs: PBKDF2 600,000
+    /// to 2,000,000 iterations; Argon2id 16 to 1,024 MiB, 2 to 10 iterations, 1 to 16 parallelism), so neither the
+    /// answer nor the apps tell an email with no account from one with an account. The default keeps its weight.
+    #[test]
+    fn unknown_emails_get_settings_an_account_could_have_and_the_apps_take() {
+        for (kdf, iterations, memory, parallelism) in UNKNOWN_EMAIL_KDF_SETTINGS {
+            let data: KDFData = serde_json::from_value(json!({
+                "kdf": kdf,
+                "kdfIterations": iterations,
+                "kdfMemory": memory,
+                "kdfParallelism": parallelism,
+            }))
+            .unwrap();
+            let mut user = User::new("decoy@example.test", None);
+            assert!(
+                set_kdf_data(&mut user, &data).is_ok(),
+                "the server refuses {kdf} {iterations} {memory:?} {parallelism:?}"
+            );
+            assert_eq!(
+                (user.client_kdf_type, user.client_kdf_iter, user.client_kdf_memory, user.client_kdf_parallelism),
+                (kdf, iterations, memory, parallelism)
+            );
+            match kdf {
+                k if k == UserKdfType::Pbkdf2 as i32 => {
+                    assert!((600_000..=2_000_000).contains(&iterations), "the apps refuse PBKDF2 at {iterations}");
+                    assert_eq!((memory, parallelism), (None, None));
+                }
+                k if k == UserKdfType::Argon2id as i32 => {
+                    assert!((2..=10).contains(&iterations), "the apps refuse Argon2id at {iterations} iterations");
+                    assert!(
+                        memory.is_some_and(|m| (16..=1024).contains(&m)),
+                        "the apps refuse Argon2id at {memory:?} MiB"
+                    );
+                    assert!(
+                        parallelism.is_some_and(|p| (1..=16).contains(&p)),
+                        "the apps refuse Argon2id at a parallelism of {parallelism:?}"
+                    );
+                }
+                _ => panic!("a KDF type the apps don't know: {kdf}"),
+            }
+        }
+        let default = (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT, None, None);
+        assert_eq!(UNKNOWN_EMAIL_KDF_SETTINGS.iter().filter(|s| **s == default).count(), 2);
+    }
 
     #[test]
     fn test_register_data_current_format() {
