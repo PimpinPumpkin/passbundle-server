@@ -12,6 +12,7 @@ mod keykeeper_enrollment;
 mod keykeeper_event_streaming;
 mod keykeeper_folder_looks;
 mod keykeeper_joining;
+mod keykeeper_member_health;
 mod keykeeper_msp;
 mod keykeeper_msp_policies;
 mod keykeeper_msp_seats;
@@ -77,6 +78,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut organizations::routes());
     routes.append(&mut keykeeper_cipher_history::routes());
     routes.append(&mut keykeeper_joining::routes());
+    routes.append(&mut keykeeper_member_health::routes());
     routes.append(&mut keykeeper_event_streaming::routes());
     routes.append(&mut keykeeper_folder_looks::routes());
     routes.append(&mut keykeeper_msp::routes());
