@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env::consts::EXE_SUFFIX,
     fmt,
     process::exit,
@@ -612,8 +613,8 @@ make_config! {
         /// This setting applies globally to all users. To control this on a per-org basis instead, use the "Disable Send" org policy.
         sends_allowed:          bool,   true,   def,    true;
 
-        /// Fill Assist Rules URL |> HTTPS URL for the server-wide Fill Assist rules feed base directory. PassBundle: set only in the environment
-        fill_assist_rules_url: String, false, def, "https://fillassist.bitwarden.com".to_owned();
+        /// Fill Assist Rules URL |> HTTPS URL for the server-wide Fill Assist rules feed base directory. PassBundle: empty by default, which keeps Fill Assist off; set only in the environment
+        fill_assist_rules_url: String, false, def, String::new();
 
         /// HIBP Api Key |> HaveIBeenPwned API Key, request it here: https://haveibeenpwned.com/API/Key
         hibp_api_key:           Pass,   true,   option;
@@ -1175,18 +1176,23 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         err!(e);
     }
 
-    let valid_fill_assist_rules_url = Url::parse(&cfg.fill_assist_rules_url).is_ok_and(|url| {
-        url.scheme() == "https"
-            && url.has_host()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && cfg.fill_assist_rules_url.trim() == cfg.fill_assist_rules_url
-    });
-    if !valid_fill_assist_rules_url {
+    // Keykeeper: empty (the default) keeps Fill Assist off; a feed someone sets
+    // gets upstream's checks.
+    if !fill_assist_rules_url_is_valid(&cfg.fill_assist_rules_url) {
         err!(
-            "`FILL_ASSIST_RULES_URL` must be a valid HTTPS URL without credentials, query parameters, fragments, or surrounding whitespace."
+            "`FILL_ASSIST_RULES_URL` must be empty, or a valid HTTPS URL without credentials, query parameters, fragments, or surrounding whitespace."
+        );
+    }
+    if cfg.fill_assist_rules_url.is_empty()
+        && parse_experimental_client_feature_flags(
+            &cfg.experimental_client_feature_flags,
+            &FeatureFlagFilter::ValidOnly,
+        )
+        .contains_key(FILL_ASSIST_FLAG)
+    {
+        println!(
+            "[WARNING] `EXPERIMENTAL_CLIENT_FEATURE_FLAGS` lists {FILL_ASSIST_FLAG}, but `FILL_ASSIST_RULES_URL` is empty, \
+             so Fill Assist stays off. Set `FILL_ASSIST_RULES_URL` to a rules feed to turn it on.\n"
         );
     }
 
@@ -1676,6 +1682,36 @@ fn ip_header_problem(cfg: &ConfigItems) -> Option<String> {
             cfg.domain
         )
     })
+}
+
+/// Keykeeper: the client feature flag that turns on upstream's Fill Assist.
+pub const FILL_ASSIST_FLAG: &str = "fill-assist-targeting-rules";
+
+/// Keykeeper: whether `FILL_ASSIST_RULES_URL` is one the server takes: empty,
+/// which keeps Fill Assist off (the default, so no server reaches Bitwarden's
+/// feed by accident), or a feed by upstream's rule: an https URL with a host
+/// and without credentials, a query, a fragment, or surrounding whitespace.
+fn fill_assist_rules_url_is_valid(url: &str) -> bool {
+    url.is_empty()
+        || Url::parse(url).is_ok_and(|parsed| {
+            parsed.scheme() == "https"
+                && parsed.has_host()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && url.trim() == url
+        })
+}
+
+/// Keykeeper: with no `FILL_ASSIST_RULES_URL`, the clients' Fill Assist flag
+/// is off, even when `EXPERIMENTAL_CLIENT_FEATURE_FLAGS` lists it. Upstream's
+/// clients fetch Bitwarden's own feed when the server names none, so the flag
+/// is what keeps them from it.
+pub fn fill_assist_flag_for_clients(rules_url: &str, feature_states: &mut HashMap<String, bool>) {
+    if rules_url.is_empty() {
+        feature_states.insert(FILL_ASSIST_FLAG.to_owned(), false);
+    }
 }
 
 fn extract_url_path(url: &str) -> String {
@@ -2300,5 +2336,77 @@ mod keykeeper_tests {
         for local in ["http://localhost", "https://127.0.0.1:8000", "https://dell.local"] {
             assert!(ip_header_problem(&built(local, |_| {})).is_none(), "{local}");
         }
+    }
+
+    /// A config the server would start with, with its database in a folder that exists.
+    fn startable(more: impl FnOnce(&mut ConfigBuilder)) -> ConfigItems {
+        built("http://localhost", |b| {
+            b.database_url = Some(format!("sqlite://{}/db.sqlite3", env!("CARGO_MANIFEST_DIR")));
+            more(b);
+        })
+    }
+
+    #[test]
+    fn fill_assist_rules_url_is_empty_by_default_and_the_server_starts() {
+        let config = startable(|_| {});
+        assert_eq!(config.fill_assist_rules_url, "");
+        if let Err(e) = validate_config(&config, false) {
+            panic!("the default config should start: {e:?}");
+        }
+        // Listing the flag without a feed still starts (with a warning).
+        let listed = startable(|b| b.experimental_client_feature_flags = Some(FILL_ASSIST_FLAG.to_owned()));
+        assert!(validate_config(&listed, false).is_ok());
+    }
+
+    #[test]
+    fn a_fill_assist_rules_url_someone_sets_keeps_upstreams_checks() {
+        for good in
+            ["", "https://rules.example.com", "https://rules.example.com/feed/", "https://rules.example.com:8443/v1"]
+        {
+            assert!(fill_assist_rules_url_is_valid(good), "{good:?}");
+            let config = startable(|b| b.fill_assist_rules_url = Some(good.to_owned()));
+            assert!(validate_config(&config, false).is_ok(), "{good:?}");
+        }
+        for bad in [
+            " ",
+            "not a url",
+            "http://rules.example.com",
+            "ftp://rules.example.com",
+            "https://user:pass@rules.example.com",
+            "https://user@rules.example.com",
+            "https://rules.example.com/?feed=1",
+            "https://rules.example.com/#feed",
+            " https://rules.example.com",
+            "https://rules.example.com\n",
+            "file:///etc/passwd",
+        ] {
+            assert!(!fill_assist_rules_url_is_valid(bad), "{bad:?}");
+            let config = startable(|b| b.fill_assist_rules_url = Some(bad.to_owned()));
+            assert!(validate_config(&config, false).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn fill_assist_is_off_for_clients_without_a_rules_feed() {
+        let flags = |listed: &str| parse_experimental_client_feature_flags(listed, &FeatureFlagFilter::ValidOnly);
+
+        // No feed: the flag is off, listed or not.
+        for listed in ["", FILL_ASSIST_FLAG, "ssh-agent-v2,fill-assist-targeting-rules"] {
+            let mut states = flags(listed);
+            fill_assist_flag_for_clients("", &mut states);
+            assert_eq!(states.get(FILL_ASSIST_FLAG), Some(&false), "{listed:?}");
+        }
+        // Other flags stay as listed.
+        let mut states = flags("ssh-agent-v2,fill-assist-targeting-rules");
+        fill_assist_flag_for_clients("", &mut states);
+        assert_eq!(states.get("ssh-agent-v2"), Some(&true));
+
+        // A feed: the flag is what the operator listed.
+        let mut states = flags(FILL_ASSIST_FLAG);
+        fill_assist_flag_for_clients("https://rules.example.com", &mut states);
+        assert_eq!(states.get(FILL_ASSIST_FLAG), Some(&true));
+        let mut states = flags("");
+        fill_assist_flag_for_clients("https://rules.example.com", &mut states);
+        assert_eq!(states.get(FILL_ASSIST_FLAG), None);
     }
 }
