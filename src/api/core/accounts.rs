@@ -1827,9 +1827,6 @@ async fn post_auth_request(
         "publicKey": auth_request.public_key,
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestIpAddress": auth_request.request_ip,
-        // Keykeeper: roughly where it came from, which upstream's approval
-        // dialog shows (DESIGN.md, "New-device check").
-        "requestCountryName": crate::keykeeper_location::describe(&auth_request.request_ip),
         "key": null,
         "masterPasswordHash": null,
         "creationDate": format_date(&auth_request.creation_date),
@@ -1864,9 +1861,6 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestDeviceIdentifier": auth_request.request_device_identifier,
         "requestIpAddress": auth_request.request_ip,
-        // Keykeeper: roughly where it came from, which upstream's approval
-        // dialog shows (DESIGN.md, "New-device check").
-        "requestCountryName": crate::keykeeper_location::describe(&auth_request.request_ip),
         "key": auth_request.enc_key,
         // Keykeeper: never a master password hash.
         "masterPasswordHash": null,
@@ -1976,9 +1970,6 @@ async fn put_auth_request(
         "publicKey": auth_request.public_key,
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestIpAddress": auth_request.request_ip,
-        // Keykeeper: roughly where it came from, which upstream's approval
-        // dialog shows (DESIGN.md, "New-device check").
-        "requestCountryName": crate::keykeeper_location::describe(&auth_request.request_ip),
         "key": auth_request.enc_key,
         // Keykeeper: never a master password hash.
         "masterPasswordHash": null,
@@ -2019,9 +2010,6 @@ async fn get_auth_request_response(
         "publicKey": auth_request.public_key,
         "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
         "requestIpAddress": auth_request.request_ip,
-        // Keykeeper: roughly where it came from, which upstream's approval
-        // dialog shows (DESIGN.md, "New-device check").
-        "requestCountryName": crate::keykeeper_location::describe(&auth_request.request_ip),
         "key": auth_request.enc_key,
         // Keykeeper: never a master password hash.
         "masterPasswordHash": null,
@@ -2059,7 +2047,6 @@ async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult
                 "requestDeviceType": DeviceType::from_i32(request.device_type).to_string(),
                 "requestDeviceIdentifier": request.request_device_identifier,
                 "requestIpAddress": request.request_ip,
-                "requestCountryName": crate::keykeeper_location::describe(&request.request_ip),
                 "key": request.enc_key,
                 "masterPasswordHash": null,
                 "creationDate": format_date(&request.creation_date),
