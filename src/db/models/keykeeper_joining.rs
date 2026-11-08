@@ -61,7 +61,7 @@ impl Joining {
     pub fn server_default() -> Self {
         Self {
             auto_confirm: true,
-            invite_hours: i32::try_from(CONFIG.invitation_expiration_hours()).unwrap_or(120),
+            invite_hours: i32::from(CONFIG.invitation_expiration_hours()),
         }
     }
 }

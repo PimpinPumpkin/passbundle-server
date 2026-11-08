@@ -157,6 +157,8 @@ fn policy_name(kind: Kind) -> &'static str {
         OrgPolicyType::OrganizationUserNotification => "Vault banner",
         OrgPolicyType::MaximumVaultTimeout => "Vault lock",
         OrgPolicyType::RequireSso => "Require single sign-on",
+        OrgPolicyType::AutotypeDefaultSetting => "Desktop Autotype default setting",
+        OrgPolicyType::FillAssist => "Activate fill assist",
     }
 }
 
