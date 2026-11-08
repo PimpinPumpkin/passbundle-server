@@ -17,6 +17,11 @@
 // never an upstream policy, since upstream's apps refuse every policy when one
 // has a type they don't know.
 //
+// Another isn't one either: "Members' own passwords" (MEMBER_HEALTH), whether
+// each client's owners and admins see how many of its members' own passwords
+// are weak, reused, or exposed (keykeeper_member_health). It's kept the same
+// way, and a client's setting is its own row too.
+//
 // A default can also be required for every client: it reaches every client,
 // those with their own setting too, and nobody can change that policy in a
 // client's admin console until the MSP stops requiring it (refuse_if_required,
@@ -40,13 +45,14 @@ use crate::{
         DbConn,
         models::{
             Membership, MembershipType, Msp, MspClient, MspId, MspPolicy, MspRequiredHadOwn, OrgAdminTwoStep,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationId, TwoStepScope,
+            OrgMemberHealth, OrgPolicy, OrgPolicyType, Organization, OrganizationId, TwoStepScope,
             keykeeper_roles::{self, Permission},
         },
     },
 };
 
 use super::{
+    keykeeper_member_health,
     keykeeper_msp::{Audit, require_admin, staff_member},
     keykeeper_two_step::{self, SessionFacts},
     organizations::{PolicyData, set_policy},
@@ -60,6 +66,12 @@ pub fn routes() -> Vec<Route> {
 /// login for each client's admins (keykeeper_two_step). Upstream's policy
 /// types are small numbers; this one is never sent to the apps as a policy.
 pub const ADMIN_TWO_STEP: i32 = 1000;
+
+/// The type number of "Members' own passwords", which isn't an upstream
+/// policy either: on, the client's owners and admins see how many of its
+/// members' own passwords are weak, reused, or exposed
+/// (keykeeper_member_health). Never sent to the apps as a policy.
+pub const MEMBER_HEALTH: i32 = 1002;
 
 /// Two-step login for admins' one option, as its data: everyone else too.
 /// Without it, the data is null, as it always was.
@@ -78,18 +90,22 @@ fn admin_level(effect: Option<&Value>) -> TwoStepScope {
     }
 }
 
-/// What an MSP default sets in a client: an upstream policy, or two-step
-/// login for its admins.
+/// What an MSP default sets in a client: an upstream policy, two-step login
+/// for its admins, or "Members' own passwords".
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Policy(OrgPolicyType),
     AdminTwoStep,
+    MemberHealth,
 }
 
 impl Kind {
     fn from_i32(t: i32) -> Option<Self> {
         if t == ADMIN_TWO_STEP {
             return Some(Self::AdminTwoStep);
+        }
+        if t == MEMBER_HEALTH {
+            return Some(Self::MemberHealth);
         }
         OrgPolicyType::from_i32(t).map(Self::Policy)
     }
@@ -98,14 +114,16 @@ impl Kind {
         match self {
             Self::Policy(t) => t as i32,
             Self::AdminTwoStep => ADMIN_TWO_STEP,
+            Self::MemberHealth => MEMBER_HEALTH,
         }
     }
 }
 
 /// The policies an MSP can set defaults for: every upstream policy this server
 /// supports, in the order the admin console lists them, with two-step login
-/// for admins after upstream's two-step login.
-const OFFERED: [Kind; 14] = [
+/// for admins after upstream's two-step login, and "Members' own passwords"
+/// last.
+const OFFERED: [Kind; 15] = [
     Kind::Policy(OrgPolicyType::TwoFactorAuthentication),
     Kind::AdminTwoStep,
     Kind::Policy(OrgPolicyType::MasterPassword),
@@ -120,6 +138,7 @@ const OFFERED: [Kind; 14] = [
     Kind::Policy(OrgPolicyType::RestrictedItemTypes),
     Kind::Policy(OrgPolicyType::UriMatchDefaults),
     Kind::Policy(OrgPolicyType::OrganizationUserNotification),
+    Kind::MemberHealth,
 ];
 
 /// The policies offered on this server. Account recovery needs email, since a
@@ -157,8 +176,10 @@ fn prerequisites_where(t: Kind, single_org_for_recovery: bool) -> Vec<Kind> {
 /// A policy's name as the admin console shows it, for the audit log and a
 /// client's owners.
 fn policy_name(kind: Kind) -> &'static str {
-    let Kind::Policy(t) = kind else {
-        return "Two-step login for admins";
+    let t = match kind {
+        Kind::Policy(t) => t,
+        Kind::AdminTwoStep => return "Two-step login for admins",
+        Kind::MemberHealth => return "Members' own passwords",
     };
     match t {
         OrgPolicyType::TwoFactorAuthentication => "Require two-step login",
@@ -223,6 +244,11 @@ fn business_policies() -> Vec<(Kind, Value)> {
         // authenticator app, a security key or passkey, or Duo (DESIGN.md,
         // "Two-step login for admins").
         (Kind::AdminTwoStep, Value::Null),
+        // Members' own passwords: the client's owners and admins see how
+        // many of each member's own passwords are weak, reused, or exposed,
+        // never which ones, and members are told (DESIGN.md, "Members' own
+        // passwords").
+        (Kind::MemberHealth, Value::Null),
     ]
 }
 
@@ -246,8 +272,11 @@ fn effect(enabled: bool, data: &str) -> Option<Value> {
 
 /// What one kind of default does (effect). Two-step login for admins has one
 /// option, everyone else too, which only `true` turns on: anything else is
-/// the same as none.
+/// the same as none. "Members' own passwords" has no options.
 fn kind_effect(t: Kind, enabled: bool, data: &str) -> Option<Value> {
+    if t == Kind::MemberHealth {
+        return enabled.then(|| json!({}));
+    }
     if t != Kind::AdminTwoStep {
         return effect(enabled, data);
     }
@@ -370,11 +399,13 @@ pub async fn is_locked(org_id: &OrganizationId, pol_type: i32, conn: &DbConn) ->
     locked_by(org_id, pol_type, conn).await.is_some()
 }
 
-/// What a client has now for each kind of default: its upstream policies, and
-/// whom it requires two-step login of (its admins, or everyone).
+/// What a client has now for each kind of default: its upstream policies,
+/// whom it requires two-step login of (its admins, or everyone), and whether
+/// it has "Members' own passwords" on.
 struct ClientPolicies {
     policies: Vec<OrgPolicy>,
     admin_two_step: TwoStepScope,
+    member_health: bool,
 }
 
 impl ClientPolicies {
@@ -382,6 +413,7 @@ impl ClientPolicies {
         Ok(Self {
             policies: OrgPolicy::find_by_org(org_id, conn).await,
             admin_two_step: OrgAdminTwoStep::scope(org_id, conn).await?,
+            member_health: OrgMemberHealth::enabled(org_id, conn).await?,
         })
     }
 
@@ -392,6 +424,7 @@ impl ClientPolicies {
                 self.policies.iter().find(|p| p.atype == t as i32).map_or((false, None), |p| (p.enabled, Some(&p.data)))
             }
             Kind::AdminTwoStep => (self.admin_two_step.required(), self.admin_two_step.everyone().then_some(EVERYONE)),
+            Kind::MemberHealth => (self.member_health, None),
         }
     }
 
@@ -469,7 +502,8 @@ async fn client_effect(org_id: &OrganizationId, t: Kind, conn: &DbConn) -> ApiRe
 
 /// Sets one kind of default in a client: an upstream policy through
 /// upstream's own policy code, as if the caller had saved it in the client's
-/// admin console, or the client's two-step login for admins.
+/// admin console, the client's two-step login for admins, or its "Members'
+/// own passwords".
 async fn set_in_client(
     org_id: &OrganizationId,
     t: Kind,
@@ -486,6 +520,17 @@ async fn set_in_client(
             keykeeper_two_step::set_org_scope(
                 org_id,
                 TwoStepScope::of(data.enabled, everyone),
+                &headers.user.uuid,
+                headers.device.atype,
+                &headers.ip.ip,
+                conn,
+            )
+            .await?;
+        }
+        Kind::MemberHealth => {
+            keykeeper_member_health::set_org_member_health(
+                org_id,
+                data.enabled,
                 &headers.user.uuid,
                 headers.device.atype,
                 &headers.ip.ip,
@@ -704,10 +749,11 @@ async fn set_default(
         err!("Policy options must be an object")
     }
     // Two-step login for admins keeps its one option, and nothing else, so
-    // its data stays null without it, as it always was.
+    // its data stays null without it, as it always was. "Members' own
+    // passwords" has none.
     let options = if t == Kind::AdminTwoStep && everyone_option(&options.to_string()) {
         json!({ "everyone": true })
-    } else if t == Kind::AdminTwoStep {
+    } else if t == Kind::AdminTwoStep || t == Kind::MemberHealth {
         Value::Null
     } else {
         options
@@ -1131,6 +1177,7 @@ mod tests {
         let client = |scope| ClientPolicies {
             policies: Vec::new(),
             admin_two_step: scope,
+            member_health: false,
         };
         assert_eq!(client(TwoStepScope::Everyone).effect(t), kind_effect(t, true, EVERYONE));
         assert_eq!(client(TwoStepScope::Admins).effect(t), kind_effect(t, true, "null"));
@@ -1162,7 +1209,7 @@ mod tests {
             .iter()
             .filter_map(|(t, data)| match t {
                 Kind::Policy(t) => Some((*t, data)),
-                Kind::AdminTwoStep => None,
+                Kind::AdminTwoStep | Kind::MemberHealth => None,
             })
             .collect();
         assert_eq!(policies.len(), migrated.len());
@@ -1171,7 +1218,9 @@ mod tests {
             assert_eq!(effect(true, &data.to_string()), effect(true, mdata));
         }
         assert_eq!(preset.iter().filter(|(t, _)| *t == Kind::AdminTwoStep).count(), 1);
-        assert_eq!(preset.len(), migrated.len() + 1);
+        // Members' own passwords came after them too.
+        assert_eq!(preset.iter().filter(|(t, _)| *t == Kind::MemberHealth).count(), 1);
+        assert_eq!(preset.len(), migrated.len() + 2);
     }
 
     #[test]
@@ -1185,5 +1234,47 @@ mod tests {
         // new Business organization.
         assert!(business_policies().iter().any(|(t, _)| *t == Kind::AdminTwoStep));
         assert_eq!(policy_name(Kind::AdminTwoStep), "Two-step login for admins");
+    }
+
+    #[test]
+    fn members_own_passwords_is_a_default_with_no_options_upstream_never_sees_as_a_policy() {
+        assert!(OrgPolicyType::from_i32(MEMBER_HEALTH).is_none());
+        assert!(Kind::from_i32(MEMBER_HEALTH) == Some(Kind::MemberHealth));
+        assert_eq!(Kind::MemberHealth.as_i32(), MEMBER_HEALTH);
+        assert!(offered().contains(&Kind::MemberHealth));
+        assert_eq!(policy_name(Kind::MemberHealth), "Members' own passwords");
+        // On in the Business preset, so in every new MSP's defaults and every
+        // new Business organization.
+        assert!(business_policies().contains(&(Kind::MemberHealth, Value::Null)));
+        // On or off, whatever its data says.
+        let t = Kind::MemberHealth;
+        for data in ["null", "{}", r#"{"everyone":true}"#, r#"{"other":1}"#, "not json"] {
+            assert_eq!(kind_effect(t, true, data), Some(json!({})), "{data}");
+            assert_eq!(kind_effect(t, false, data), None, "{data}");
+        }
+        // A client's setting reads as the default's would.
+        let client = |on| ClientPolicies {
+            policies: Vec::new(),
+            admin_two_step: TwoStepScope::Off,
+            member_health: on,
+        };
+        assert_eq!(client(true).effect(t), kind_effect(t, true, "null"));
+        assert_eq!(client(false).effect(t), None);
+        assert_eq!(client(true).state(t), (true, None));
+    }
+
+    #[rocket::async_test]
+    async fn a_required_members_own_passwords_cant_be_changed_in_the_client() {
+        let conn = DbPool::for_test().await;
+        let (msp, org) = msp_with_client(false, &conn).await;
+        assert!(refuse_if_required(&org.uuid, MEMBER_HEALTH, false, &conn).await.is_ok());
+        let mut default = MspPolicy::new(msp.uuid.clone(), MEMBER_HEALTH, true, "null".to_owned());
+        default.required = true;
+        default.save(&conn).await.unwrap();
+        for enabled in [false, true] {
+            assert!(refuse_if_required(&org.uuid, MEMBER_HEALTH, enabled, &conn).await.is_err());
+        }
+        assert!(is_locked(&org.uuid, MEMBER_HEALTH, &conn).await);
+        assert!(!is_locked(&org.uuid, ADMIN_TWO_STEP, &conn).await);
     }
 }

@@ -772,8 +772,10 @@ pub const KEPT: i32 = 3;
 /// and clients), otherwise by severity. Single sign-on's sign-ins and
 /// refusals (1590 and 1591) go by severity, as logins do.
 pub fn priority(code: i32, severity: &str) -> i32 {
-    let kept = matches!(code, 1300..=1302 | 1400..=1499 | 1600 | 1601 | 1604 | 1605 | 1690..=1699 | 1700 | 2000..=2002)
-        || (matches!(code, 1500..=1599) && !matches!(code, 1522 | 1590 | 1591))
+    let kept = matches!(
+        code,
+        1300..=1302 | 1400..=1499 | 1600 | 1601 | 1604 | 1605 | 1688 | 1689 | 1690..=1699 | 1700 | 2000..=2002
+    ) || (matches!(code, 1500..=1599) && !matches!(code, 1522 | 1590 | 1591))
         || (matches!(code, 9100..=9199) && !matches!(code, 9120 | 9121 | 9199));
     if kept {
         return KEPT;
@@ -1189,7 +1191,7 @@ pub fn backoff(attempts: i32) -> TimeDelta {
 
 /// What kind of thing an event is about, its name in words, and how much a
 /// security team should care, by upstream's event type codes. Codes 1190,
-/// 1191, 1590, 1591, and 1690 to 1698 are ours.
+/// 1191, 1590, 1591, 1688, 1689, and 1690 to 1698 are ours.
 pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
     let (name, severity) = match code {
         1000 => ("Logged in", "low"),
@@ -1269,6 +1271,8 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         1602 => ("Exported the organization's vault", "high"),
         1604 => ("Turned on single sign-on", "high"),
         1605 => ("Turned off single sign-on", "high"),
+        1688 => ("Turned on Members' own passwords", "medium"),
+        1689 => ("Turned off Members' own passwords", "medium"),
         1690 => ("Added a place events are sent", "high"),
         1691 => ("Changed a place events are sent", "high"),
         1692 => ("Removed a place events are sent", "high"),
@@ -1558,6 +1562,9 @@ fn msp_code(action: &str) -> (i32, &'static str, &'static str) {
         "admin_two_step_default_set" => {
             (9192, "Changed whether clients' admins must use two-step login by default", "high")
         }
+        "client_member_health_set" => {
+            (9138, "Changed whether a client's admins see counts of members' own passwords", "medium")
+        }
         _ => (9199, "MSP activity", "low"),
     }
 }
@@ -1759,6 +1766,19 @@ mod tests {
             assert_eq!((c, s), (code, "high"), "{action}");
             assert_eq!(priority(c, s), KEPT, "{action}");
         }
+    }
+
+    #[test]
+    fn members_own_passwords_on_or_off_is_a_kept_organization_change() {
+        assert_eq!(describe(1688), ("organization", "Turned on Members' own passwords", "medium"));
+        assert_eq!(describe(1689), ("organization", "Turned off Members' own passwords", "medium"));
+        for code in [1688, 1689] {
+            assert_eq!(priority(code, describe(code).2), KEPT, "{code}");
+            assert!(!merges(code), "{code}");
+        }
+        let (code, _, severity) = msp_code("client_member_health_set");
+        assert_eq!((code, severity), (9138, "medium"));
+        assert_eq!(priority(code, severity), KEPT);
     }
 
     #[test]
