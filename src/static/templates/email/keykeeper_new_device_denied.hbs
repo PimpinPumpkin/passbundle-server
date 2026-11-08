@@ -1,0 +1,16 @@
+A sign-in on a new device was denied
+<!---------------->
+{{#if wrong_number}}A sign-in to your PassBundle account on a new device was denied, because the number typed on your other device didn't match.{{else}}A sign-in to your PassBundle account on a new device was denied from one of your devices.{{/if}}
+
+* Device: {{device}}
+* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}
+* When: {{datetime}}
+{{#if location_source}}
+
+{{location_source}}{{#if location_source_url}} ({{location_source_url}}){{/if}}
+{{/if}}
+
+If it was you, sign in again on the new device; it shows a new number.
+
+If it wasn't you, someone knows your master password. Change it now in the web vault ( {{url}} ), and turn on two-step login.
+{{> email/email_footer_text }}

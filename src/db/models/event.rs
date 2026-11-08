@@ -66,6 +66,14 @@ pub enum EventType {
     // UserMigratedKeyToKeyConnector = 1009, // Not supported
     UserRequestedDeviceApproval = 1010,
     // UserTdeOffboardingPasswordSet = 1011, // Not supported
+    // Keykeeper: the new-device check (DESIGN.md, "New-device check"): a
+    // sign-in on a device the account has never used, held for approval;
+    // approved (from a device, with an emailed code, or after the wait);
+    // denied (a wrong number, or Deny); and a code by email asked for later.
+    KeykeeperNewDeviceCheckStarted = 1090,
+    KeykeeperNewDeviceApproved = 1091,
+    KeykeeperNewDeviceDenied = 1092,
+    KeykeeperNewDeviceEmailLater = 1093,
 
     // Cipher
     CipherCreated = 1100,
@@ -245,6 +253,12 @@ impl Event {
     pub fn to_json(&self) -> Value {
         use crate::util::format_date;
 
+        // Keykeeper: roughly where the address is, worked out now from this
+        // server's own database file, never kept, and who to credit for it
+        // (DESIGN.md, "New-device check").
+        let location = self.ip_address.as_deref().and_then(crate::keykeeper_location::describe);
+        let location_source = location.as_ref().and_then(|_| crate::keykeeper_location::attribution());
+
         json!({
             "type": self.event_type,
             "userId": self.user_uuid,
@@ -266,6 +280,8 @@ impl Event {
             // our other events' subject in words.
             "domainName": if (2000..=2099).contains(&self.event_type) { self.keykeeper_detail.as_deref() } else { None },
             "keykeeperDetail": self.keykeeper_detail,
+            "keykeeperLocation": location,
+            "keykeeperLocationSource": location_source,
             // "installationId": null, // Not supported
         })
     }

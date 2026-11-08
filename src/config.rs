@@ -538,6 +538,8 @@ make_config! {
         rsa_key_filename:       String, false,  auto,   |c| storage::join_path(&c.data_folder, "rsa_key");
         /// Web vault folder
         web_vault_folder:       String, false,  def,    "web-vault/".to_owned();
+        /// IP location database |> PassBundle: an IP-to-location database file on this server's disk, in the MaxMind DB format (DB-IP's free IP to City Lite or IP to Country Lite), for showing roughly where a sign-in comes from. Without the file, no location is shown. Nothing is ever sent to another service. Replace it by moving a new file into place (tools/update-ip-location.sh).
+        ip_location_database:   String, false,  auto,   |c| storage::join_path(&c.data_folder, "ip-location.mmdb");
     },
     ws {
         /// Enable websocket notifications
@@ -781,6 +783,13 @@ make_config! {
 
         /// Customize the enabled feature flags on the clients |> This is a comma separated list of feature flags to enable.
         experimental_client_feature_flags: String, false, def, String::new();
+
+        /// New-device check |> PassBundle: an account without two-step login that signs in on a device it has never used waits until the person approves it from a device already signed in (typing the number the new device shows), or, with no such device, with a code by email. Turn it off only for a test server. Set only in the environment.
+        new_device_check:       bool,   false,  def,    true;
+        /// IP location credit |> PassBundle: who to credit next to each location shown, as the database's license asks (DB-IP's CC BY 4.0 by default). Empty shows none.
+        ip_location_attribution: String, true,  def,    "IP Geolocation by DB-IP".to_owned();
+        /// IP location credit link |> PassBundle: the link for that credit.
+        ip_location_attribution_url: String, true, def, "https://db-ip.com".to_owned();
 
         /// Require new device emails |> When a user logs in an email is required to be sent.
         /// If sending the email fails the login attempt will fail.
@@ -2112,6 +2121,9 @@ where
     reg!("email/keykeeper_member_joined", ".html");
     reg!("email/keykeeper_event_stream_paused", ".html");
     reg!("email/keykeeper_sso_linked", ".html");
+    reg!("email/keykeeper_new_device_code", ".html");
+    reg!("email/keykeeper_new_device_denied", ".html");
+    reg!("email/keykeeper_new_device_waiting", ".html");
     reg!("email/send_single_org_removed_from_org", ".html");
     reg!("email/smtp_test", ".html");
     reg!("email/sso_change_email", ".html");

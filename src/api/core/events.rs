@@ -186,6 +186,7 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                     headers.device.atype,
                     Some(event_date),
                     &headers.ip.ip,
+                    None,
                     &conn,
                 )
                 .await;
@@ -260,7 +261,23 @@ pub async fn log_user_event(event_type: EventType, user_id: &UserId, device_type
     if !CONFIG.org_events_enabled() {
         return;
     }
-    log_user_event_impl(event_type as i32, user_id, device_type, None, ip, conn).await;
+    log_user_event_impl(event_type as i32, user_id, device_type, None, ip, None, conn).await;
+}
+
+/// Keykeeper: a person's event with a few words about it (`keykeeper_detail`),
+/// such as how a new device's sign-in was approved.
+pub async fn log_user_event_detail(
+    event_type: EventType,
+    user_id: &UserId,
+    device_type: i32,
+    ip: &IpAddr,
+    detail: &str,
+    conn: &DbConn,
+) {
+    if !CONFIG.org_events_enabled() {
+        return;
+    }
+    log_user_event_impl(event_type as i32, user_id, device_type, None, ip, Some(detail), conn).await;
 }
 
 async fn log_user_event_impl(
@@ -269,6 +286,7 @@ async fn log_user_event_impl(
     device_type: i32,
     event_date: Option<NaiveDateTime>,
     ip: &IpAddr,
+    detail: Option<&str>,
     conn: &DbConn,
 ) {
     let memberships = Membership::find_confirmed_by_user(user_id, conn).await;
@@ -280,6 +298,7 @@ async fn log_user_event_impl(
     event.act_user_uuid = Some(user_id.clone());
     event.device_type = Some(device_type);
     event.ip_address = Some(ip.to_string());
+    event.keykeeper_detail = detail.map(str::to_owned);
     events.push(event);
 
     // For each org a user is a member of store these events per org
@@ -291,6 +310,7 @@ async fn log_user_event_impl(
         event.act_user_uuid = Some(user_id.clone());
         event.device_type = Some(device_type);
         event.ip_address = Some(ip.to_string());
+        event.keykeeper_detail = detail.map(str::to_owned);
         events.push(event);
     }
 
