@@ -4,8 +4,10 @@
 // Who: an organization's owners, admins, custom roles that manage members,
 // policies, or account recovery, and everyone an MSP's membership brings in,
 // where the organization requires it (its own setting: on with the Business
-// preset and an MSP's default policies); and everyone on an MSP's staff,
-// where the MSP requires it (on by default).
+// preset and an MSP's default policies), or everyone who has joined it, where
+// it requires it of everyone (the setting's third level, TwoStepScope; off by
+// default); and everyone on an MSP's staff, where the MSP requires it (on by
+// default).
 //
 // What counts: an authenticator app, a security key or passkey with at least
 // one key, or Duo with this server's own Duo account. Email codes don't: a
@@ -32,7 +34,12 @@
 // in someone who doesn't meet it (check_api_key), and for someone it covers,
 // an API key's token isn't taken where admins act (api_key_refused).
 //
-// See DESIGN.md, "Two-step login for admins", in the meta repo.
+// For everyone no rule covers who has no two-step login at all, the web vault
+// and the extension show a nudge to set it up (nudge), which "Not now" hides
+// for 90 days on every device.
+//
+// See DESIGN.md, "Two-step login for admins" and "Two-step login for
+// everyone", in the meta repo.
 
 use std::net::IpAddr;
 
@@ -60,8 +67,8 @@ use crate::{
         models::{
             Device, EventType, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId, MspMembership,
             MspStaff, MspStaffTwoStep, OrgAdminTwoStep, OrgPolicy, Organization, OrganizationId, RevokedUntilAccepted,
-            TwoFactor, TwoFactorType, TwoStepSetupSession, UnacceptedMembership, User, UserId, keykeeper_roles,
-            qualifying_two_step,
+            TwoFactor, TwoFactorType, TwoStepNudgeDismissal, TwoStepScope, TwoStepSetupSession, UnacceptedMembership,
+            User, UserId, keykeeper_roles, qualifying_two_step,
         },
     },
 };
@@ -74,7 +81,9 @@ pub fn routes() -> Vec<Route> {
         get_msp_setting,
         put_msp_setting,
         unaccepted_for_caller,
-        accept_membership
+        accept_membership,
+        get_nudge,
+        dismiss_nudge
     ]
 }
 
@@ -139,21 +148,35 @@ fn elevated_permissions(p: &keykeeper_roles::CustomPermissions) -> bool {
     p.has(ManageUsers) || p.has(ManagePolicies) || p.has(ManageResetPassword)
 }
 
-/// Whether an organization's setting covers this membership: an owner, an
-/// admin, a custom role that manages members, policies, or account recovery,
-/// or anyone an MSP's membership brought in (its admins and technicians,
-/// whatever their role there: a technician with every vault item and export
-/// reaches as much as an admin), who has joined (accepted or confirmed).
-/// Invited and revoked memberships reach nothing, so they aren't covered; nor
+/// Whether an organization's setting, at this level, covers this membership:
+/// at the admin level, an owner, an admin, a custom role that manages members,
+/// policies, or account recovery, or anyone an MSP's membership brought in
+/// (its admins and technicians, whatever their role there: a technician with
+/// every vault item and export reaches as much as an admin); at the everyone
+/// level, every role. Only once they've joined (accepted or confirmed):
+/// invited and revoked memberships reach nothing, so they aren't covered; nor
 /// is one the server accepted for its person, without email, until they
 /// accept it themselves (UnacceptedMembership).
-pub async fn covered_membership(member: &Membership, conn: &DbConn) -> bool {
-    member.status >= MembershipStatus::Accepted as i32
+pub async fn covered_membership(member: &Membership, scope: TwoStepScope, conn: &DbConn) -> bool {
+    scope.required()
+        && member.status >= MembershipStatus::Accepted as i32
         && !UnacceptedMembership::is(&member.uuid, conn).await
-        && covered_role(member, conn).await
+        && covered_by(member, scope, conn).await
 }
 
-/// Whether a membership's role is one the rule covers, whatever its status.
+/// Whether a setting at this level covers a membership's role, whatever its
+/// status: every role at the everyone level, the admin roles (covered_role)
+/// at the admin level.
+async fn covered_by(member: &Membership, scope: TwoStepScope, conn: &DbConn) -> bool {
+    match scope {
+        TwoStepScope::Off => false,
+        TwoStepScope::Admins => covered_role(member, conn).await,
+        TwoStepScope::Everyone => true,
+    }
+}
+
+/// Whether a membership's role is one the admin level covers, whatever its
+/// status.
 async fn covered_role(member: &Membership, conn: &DbConn) -> bool {
     if member.atype == MembershipType::Owner as i32 || member.atype == MembershipType::Admin as i32 {
         return true;
@@ -178,7 +201,8 @@ pub async fn requirements(user_id: &UserId, conn: &DbConn) -> ApiResult<Vec<Requ
         }
     }
     for member in Membership::find_by_user(user_id, conn).await {
-        if !covered_membership(&member, conn).await || !OrgAdminTwoStep::required(&member.org_uuid, conn).await? {
+        let scope = OrgAdminTwoStep::scope(&member.org_uuid, conn).await?;
+        if !covered_membership(&member, scope, conn).await {
             continue;
         }
         let name = Organization::find_by_uuid(&member.org_uuid, conn).await.map(|o| o.name).unwrap_or_default();
@@ -660,7 +684,7 @@ async fn setup_info(headers: SetupHeaders, conn: DbConn) -> JsonResult {
 /// Someone the rule covers (or would) who has no method that counts.
 async fn person_json(member: &Membership, conn: &DbConn) -> Option<Value> {
     let user = User::find_by_uuid(&member.user_uuid, conn).await?;
-    let role = role_name(member);
+    let role = role_word(member, conn).await;
     let through_msp = MspMembership::find_by_membership(&member.uuid, conn).await.is_some();
     let sso = !through_msp
         && member.atype != MembershipType::Owner as i32
@@ -676,12 +700,15 @@ async fn person_json(member: &Membership, conn: &DbConn) -> Option<Value> {
     }))
 }
 
-/// An organization's members its setting covers (or would) who have no method
-/// that counts. MSP staff come from the MSP, so `own_only` leaves them out.
+/// An organization's members its admin level covers (or would) who have no
+/// method that counts. MSP staff come from the MSP, so `own_only` leaves them
+/// out.
 async fn not_set_up(org_id: &OrganizationId, own_only: bool, conn: &DbConn) -> Vec<Value> {
     let mut out = Vec::new();
     for member in Membership::find_by_org(org_id, conn).await {
-        if !covered_membership(&member, conn).await || has_qualifying(&member.user_uuid, conn).await {
+        if !covered_membership(&member, TwoStepScope::Admins, conn).await
+            || has_qualifying(&member.user_uuid, conn).await
+        {
             continue;
         }
         if own_only && MspMembership::find_by_membership(&member.uuid, conn).await.is_some() {
@@ -694,31 +721,71 @@ async fn not_set_up(org_id: &OrganizationId, own_only: bool, conn: &DbConn) -> V
     out
 }
 
-/// Turns an organization's setting on or off, if that's a change, with an
-/// event in its log (high for security tools). Used by the Settings page, the
-/// Business preset, and an MSP's default policies. Turned on, it ends the
-/// sessions of the people it now covers who have no method that counts
-/// (Watch), and revokes, until they accept it, each role it covers that was
-/// confirmed before it while its person never accepted it
-/// (`hold_unaccepted_roles`). Whoever turns it off must meet it
+/// The organization's other members (its admin level doesn't cover them)
+/// without a method that counts: who requiring it of everyone holds up, or
+/// would. Joined ones only, as for admins.
+async fn members_not_set_up(org_id: &OrganizationId, conn: &DbConn) -> Vec<Value> {
+    let mut out = Vec::new();
+    for member in Membership::find_by_org(org_id, conn).await {
+        if !covered_membership(&member, TwoStepScope::Everyone, conn).await
+            || covered_role(&member, conn).await
+            || has_qualifying(&member.user_uuid, conn).await
+        {
+            continue;
+        }
+        if let Some(person) = person_json(&member, conn).await {
+            out.push(person);
+        }
+    }
+    out
+}
+
+/// The events a change of level logs, in order: the admin level on before
+/// everyone, everyone off before the admin level.
+fn scope_events(before: TwoStepScope, after: TwoStepScope) -> Vec<EventType> {
+    let mut out = Vec::new();
+    if !before.required() && after.required() {
+        out.push(EventType::KeykeeperAdminTwoStepOn);
+    }
+    if !before.everyone() && after.everyone() {
+        out.push(EventType::KeykeeperEveryoneTwoStepOn);
+    }
+    if before.everyone() && !after.everyone() {
+        out.push(EventType::KeykeeperEveryoneTwoStepOff);
+    }
+    if before.required() && !after.required() {
+        out.push(EventType::KeykeeperAdminTwoStepOff);
+    }
+    out
+}
+
+/// Sets whom an organization requires it of (off, its admins, or everyone),
+/// if that's a change, with events in its log (high for security tools). Used
+/// by the Settings page, the Business preset, and an MSP's default policies.
+/// Widened, it ends the sessions of the people it now covers who have no
+/// method that counts (Watch), and revokes, until they accept it, each role it
+/// now covers that was confirmed before it while its person never accepted it
+/// (`hold_unaccepted_roles`). Whoever lowers it must meet it
 /// (require_caller_meets), which each endpoint checks first.
-pub async fn set_org_required(
+pub async fn set_org_scope(
     org_id: &OrganizationId,
-    required: bool,
+    scope: TwoStepScope,
     actor: &UserId,
     device_type: i32,
     ip: &IpAddr,
     conn: &DbConn,
 ) -> ApiResult<bool> {
-    if OrgAdminTwoStep::required(org_id, conn).await? == required {
+    let before = OrgAdminTwoStep::scope(org_id, conn).await?;
+    if before == scope {
         return Ok(false);
     }
-    let watch = if required {
-        // The one turning it on, too: they accept a role of theirs that the
+    let widened = scope > before;
+    let watch = if widened {
+        // The one changing it, too: they accept a role of theirs that the
         // server accepted for them by doing so (hold_unaccepted_roles).
         let mut covered = vec![actor.clone()];
         for member in Membership::find_by_org(org_id, conn).await {
-            if covered_membership(&member, conn).await {
+            if covered_membership(&member, scope, conn).await {
                 covered.push(member.user_uuid);
             }
         }
@@ -726,16 +793,13 @@ pub async fn set_org_required(
     } else {
         Watch::users([], conn).await?
     };
-    if required {
-        hold_unaccepted_roles(org_id, actor, device_type, ip, conn).await?;
+    if widened {
+        hold_unaccepted_roles(org_id, scope, actor, device_type, ip, conn).await?;
     }
-    OrgAdminTwoStep::set(org_id, required, conn).await?;
-    let event = if required {
-        EventType::KeykeeperAdminTwoStepOn
-    } else {
-        EventType::KeykeeperAdminTwoStepOff
-    };
-    log_event(event, org_id, org_id, actor, device_type, ip, conn).await;
+    OrgAdminTwoStep::set(org_id, scope, conn).await?;
+    for event in scope_events(before, scope) {
+        log_event(event, org_id, org_id, actor, device_type, ip, conn).await;
+    }
     watch.settle(conn).await?;
     Ok(true)
 }
@@ -747,8 +811,11 @@ async fn org_view(org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Value> {
         }
         None => None,
     };
+    let scope = OrgAdminTwoStep::scope(org_id, conn).await?;
     Ok(json!({
-        "required": OrgAdminTwoStep::required(org_id, conn).await?,
+        "required": scope.required(),
+        // Everyone else too (DESIGN.md, "Two-step login for everyone").
+        "everyone": scope.everyone(),
         "msp": msp,
         // Keykeeper: the MSP requires it for every client, so it can't be
         // changed here (DESIGN.md, "Required for every client").
@@ -759,6 +826,7 @@ async fn org_view(org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Value> {
         )
         .await,
         "notSetUp": not_set_up(org_id, false, conn).await,
+        "membersNotSetUp": members_not_set_up(org_id, conn).await,
     }))
 }
 
@@ -778,15 +846,19 @@ async fn get_org_setting(org_id: OrganizationId, headers: Headers, conn: DbConn)
 #[serde(rename_all = "camelCase")]
 struct OrgSettingData {
     required: bool,
+    /// Everyone else too; it needs `required`. Left out, it stays as it is
+    /// (and goes with `required` off).
+    everyone: Option<bool>,
     /// The caller's master password or a one-time code (DESIGN.md,
     /// "Confirming sensitive changes").
     #[serde(flatten)]
     verification: PasswordOrOtpData,
 }
 
-/// Turns the organization's setting on or off. For an MSP's client, the
-/// change is its own setting from then on, and goes in the MSP's activity log.
-/// Only someone who meets the rule turns it off.
+/// Sets whom the organization requires it of: its admins (`required`), and
+/// everyone else too (`everyone`). For an MSP's client, the change is its own
+/// setting from then on, and goes in the MSP's activity log. Only someone who
+/// meets the rule lowers it.
 #[put("/keykeeper/organizations/<org_id>/admin-two-step", data = "<data>")]
 async fn put_org_setting(
     org_id: OrganizationId,
@@ -799,35 +871,52 @@ async fn put_org_setting(
         err_code!("Organization not found", Status::NotFound.code)
     }
     let data = data.into_inner();
-    let required = data.required;
+    let current = OrgAdminTwoStep::scope(&org_id, &conn).await?;
+    let everyone = data.everyone.unwrap_or(data.required && current.everyone());
+    if everyone && !data.required {
+        err!("Requiring two-step login of everyone includes the admins, so turn that on too.")
+    }
+    let scope = TwoStepScope::of(data.required, everyone);
     // Keykeeper: not while the organization's MSP requires it for every
     // client (DESIGN.md, "Required for every client").
     super::keykeeper_msp_policies::refuse_if_required(
         &org_id,
         super::keykeeper_msp_policies::ADMIN_TWO_STEP,
-        required,
+        scope.required(),
         &conn,
     )
     .await?;
-    if !required && OrgAdminTwoStep::required(&org_id, &conn).await? {
+    if scope < current {
         require_caller_meets(&headers.user, &session, &conn).await?;
     }
     // Keykeeper: and the caller confirms it with their master password or a
     // one-time code (DESIGN.md, "Confirming sensitive changes").
     data.verification.confirm_change(&headers.user, &conn).await?;
     let changed =
-        set_org_required(&org_id, required, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn).await?;
+        set_org_scope(&org_id, scope, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn).await?;
     if changed && let Some(client) = MspClient::find_by_org(&org_id, &conn).await {
         let name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
-        Audit::by("client_admin_two_step_set", &headers)
-            .org(&org_id, &name)
-            .detail(if required {
+        let on_off = |on: bool| {
+            if on {
                 "on"
             } else {
                 "off"
-            })
-            .record(&client.msp_uuid, &conn)
-            .await?;
+            }
+        };
+        if current.required() != scope.required() {
+            Audit::by("client_admin_two_step_set", &headers)
+                .org(&org_id, &name)
+                .detail(on_off(scope.required()))
+                .record(&client.msp_uuid, &conn)
+                .await?;
+        }
+        if current.everyone() != scope.everyone() {
+            Audit::by("client_everyone_two_step_set", &headers)
+                .org(&org_id, &name)
+                .detail(on_off(scope.everyone()))
+                .record(&client.msp_uuid, &conn)
+                .await?;
+        }
     }
     Ok(Json(org_view(&org_id, &conn).await?))
 }
@@ -865,11 +954,20 @@ async fn msp_view(msp_id: &MspId, caller: &MspStaff, conn: &DbConn) -> ApiResult
         let Some(org) = Organization::find_by_uuid(&client.org_uuid, conn).await else {
             continue;
         };
+        let scope = OrgAdminTwoStep::scope(&org.uuid, conn).await?;
         clients.push(json!({
             "id": org.uuid,
             "name": org.name,
-            "required": OrgAdminTwoStep::required(&org.uuid, conn).await?,
+            "required": scope.required(),
+            "everyone": scope.everyone(),
             "notSetUp": not_set_up(&org.uuid, true, conn).await,
+            // The client's other members without one, where it requires it
+            // of everyone.
+            "membersNotSetUp": if scope.everyone() {
+                members_not_set_up(&org.uuid, conn).await
+            } else {
+                Vec::new()
+            },
         }));
     }
     Ok(json!({
@@ -946,23 +1044,19 @@ pub async fn accepted_without_them(ids: Vec<crate::db::models::MembershipId>, co
     UnacceptedMembership::mark(ids, conn).await
 }
 
-/// Whether a membership waits for its person to accept it before it's let in
-/// or takes on a role the rule covers: the server accepted it for them (on a
-/// server that sends no email), its role is covered (`elevated`), and its
-/// organization requires two-step login for admins. The rule doesn't count it
-/// until they accept it, so holding that role first would mean holding it
-/// without two-step login. A database error counts as yes.
-async fn waits_to_accept(member: &Membership, elevated: bool, conn: &DbConn) -> bool {
-    elevated
-        && UnacceptedMembership::is(&member.uuid, conn).await
-        && OrgAdminTwoStep::required(&member.org_uuid, conn).await.unwrap_or(true)
-}
-
 /// Whether someone waiting to be let in must first accept their role
-/// themselves (`waits_to_accept`): the apps don't let them in on their own,
-/// and confirming them is refused until they do.
+/// themselves: the server accepted it for them (on a server that sends no
+/// email), and their organization's setting covers their role (its admins, or
+/// everyone). The rule doesn't count it until they accept it, so holding it
+/// first would mean holding it without two-step login. The apps don't let
+/// them in on their own, and confirming them is refused until they do. A
+/// database error counts as yes.
 pub async fn must_accept_first(member: &Membership, conn: &DbConn) -> bool {
-    waits_to_accept(member, covered_role(member, conn).await, conn).await
+    if !UnacceptedMembership::is(&member.uuid, conn).await {
+        return false;
+    }
+    let scope = OrgAdminTwoStep::scope(&member.org_uuid, conn).await.unwrap_or(TwoStepScope::Everyone);
+    covered_by(member, scope, conn).await
 }
 
 /// Refuses confirming someone whose role waits for them to accept it
@@ -983,7 +1077,14 @@ pub async fn require_accepted_to_confirm(member: &Membership, conn: &DbConn) -> 
 /// organization requires it: they'd hold it without two-step login. They can
 /// be invited again in that role, and accept it on their vault page.
 pub async fn require_accepted_to_promote(member: &Membership, elevated: bool, conn: &DbConn) -> EmptyResult {
-    if !covered_role(member, conn).await && waits_to_accept(member, elevated, conn).await {
+    // Where it's required of everyone, they're covered already, whatever
+    // their role: a promotion brings them under nothing new.
+    let scope = OrgAdminTwoStep::scope(&member.org_uuid, conn).await.unwrap_or(TwoStepScope::Admins);
+    if elevated
+        && scope.required()
+        && !covered_by(member, scope, conn).await
+        && UnacceptedMembership::is(&member.uuid, conn).await
+    {
         let email = User::find_by_uuid(&member.user_uuid, conn).await.map(|u| u.email);
         err!(format!(
             "{} hasn't accepted their place here yet (this server sends no email), so they can't take on a role that requires two-step login. Remove them and invite them in that role: they accept it on their vault page.",
@@ -993,19 +1094,21 @@ pub async fn require_accepted_to_promote(member: &Membership, elevated: bool, co
     Ok(())
 }
 
-/// When the rule comes to cover an organization: each confirmed member there
-/// in a role it covers whose membership the server accepted for them, and who
-/// never accepted it, would otherwise keep that role without two-step login
-/// (the rule doesn't count it until they accept). So each is revoked until
-/// they accept it (RevokedUntilAccepted), in the event log as revoked by
-/// whoever turned the rule on; accepting restores them (accept_membership).
-/// Revoked, not sent back to "Needs confirmation", so they need nobody to
-/// confirm them again: an MSP's default can't keep a client's own owner out.
-/// The one turning the rule on accepts their own role by doing so. Never an
-/// organization's last confirmed owner, which upstream never leaves it
-/// without; they keep the role until they accept it.
+/// When the rule comes to cover an organization, or more of it (`scope`):
+/// each confirmed member there in a role it now covers whose membership the
+/// server accepted for them, and who never accepted it, would otherwise keep
+/// that role without two-step login (the rule doesn't count it until they
+/// accept). So each is revoked until they accept it (RevokedUntilAccepted),
+/// in the event log as revoked by whoever turned the rule on; accepting
+/// restores them (accept_membership). Revoked, not sent back to "Needs
+/// confirmation", so they need nobody to confirm them again: an MSP's default
+/// can't keep a client's own owner out. The one turning the rule on accepts
+/// their own role by doing so. Never an organization's last confirmed owner,
+/// which upstream never leaves it without; they keep the role until they
+/// accept it.
 async fn hold_unaccepted_roles(
     org_id: &OrganizationId,
+    scope: TwoStepScope,
     actor: &UserId,
     device_type: i32,
     ip: &IpAddr,
@@ -1014,7 +1117,7 @@ async fn hold_unaccepted_roles(
     for mut member in Membership::find_by_org(org_id, conn).await {
         if member.status != MembershipStatus::Confirmed as i32
             || !UnacceptedMembership::is(&member.uuid, conn).await
-            || !covered_role(&member, conn).await
+            || !covered_by(&member, scope, conn).await
         {
             continue;
         }
@@ -1067,30 +1170,38 @@ pub fn elevated_role(atype: MembershipType, custom: Option<&keykeeper_roles::Cus
     atype == MembershipType::Owner || atype == MembershipType::Admin || custom.is_some_and(elevated_permissions)
 }
 
-fn role_name(member: &Membership) -> &'static str {
+/// A membership's role in a word, as the apps name it: "owner", "admin",
+/// "custom" (a custom role, or someone an MSP brought in, that the admin
+/// level covers), or "member" (anyone else).
+async fn role_word(member: &Membership, conn: &DbConn) -> &'static str {
     if member.atype == MembershipType::Owner as i32 {
         "owner"
     } else if member.atype == MembershipType::Admin as i32 {
         "admin"
-    } else {
+    } else if covered_role(member, conn).await {
         "custom"
+    } else {
+        "member"
     }
 }
 
 /// The caller's memberships the server accepted for them, in a role the rule
-/// covers where the organization requires it: the web vault asks them to
-/// accept each one. Those revoked until they accept it (RevokedUntilAccepted)
-/// say so (`revoked`), and are listed even once the organization no longer
-/// requires it, since accepting is what gives them back.
+/// covers where the organization requires it (of its admins, or of everyone):
+/// the web vault asks them to accept each one. Those revoked until they
+/// accept it (RevokedUntilAccepted) say so (`revoked`), and are listed even
+/// once the organization no longer requires it, since accepting is what gives
+/// them back.
 #[get("/keykeeper/organizations/unaccepted")]
 async fn unaccepted_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
     let mut out = Vec::new();
     for member in Membership::find_by_user(&headers.user.uuid, &conn).await {
+        if !UnacceptedMembership::is(&member.uuid, &conn).await {
+            continue;
+        }
         let revoked = RevokedUntilAccepted::is(&member.uuid, &conn).await;
-        if (member.status < MembershipStatus::Accepted as i32 && !revoked)
-            || !UnacceptedMembership::is(&member.uuid, &conn).await
-            || !covered_role(&member, &conn).await
-            || (!revoked && !OrgAdminTwoStep::required(&member.org_uuid, &conn).await?)
+        if !revoked
+            && (member.status < MembershipStatus::Accepted as i32
+                || !covered_by(&member, OrgAdminTwoStep::scope(&member.org_uuid, &conn).await?, &conn).await)
         {
             continue;
         }
@@ -1098,7 +1209,7 @@ async fn unaccepted_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
         out.push(json!({
             "organizationId": member.org_uuid,
             "name": name,
-            "role": role_name(&member),
+            "role": role_word(&member, &conn).await,
             "revoked": revoked,
         }));
     }
@@ -1141,6 +1252,71 @@ async fn accept_membership(org_id: OrganizationId, headers: Headers, conn: DbCon
     Ok(Json(json!({ "accepted": true })))
 }
 
+// ---------------------------------------------------------------------------
+// A nudge for everyone else.
+
+/// Whether a two-step method (upstream's type number, and its data) is one at
+/// all, for the nudge: an authenticator app, email codes, a security key or
+/// passkey with a key left, a YubiKey, or Duo. Not a recovery code or a
+/// remembered device.
+fn a_method(atype: i32, data: &str) -> bool {
+    match TwoFactorType::from_i32(atype) {
+        Some(TwoFactorType::Webauthn) => has_keys(data),
+        Some(
+            TwoFactorType::Authenticator
+            | TwoFactorType::Email
+            | TwoFactorType::Duo
+            | TwoFactorType::YubiKey
+            | TwoFactorType::U2f
+            | TwoFactorType::OrganizationDuo,
+        ) => true,
+        _ => false,
+    }
+}
+
+/// Whether someone has any two-step login at all, whether or not it counts
+/// for the rule.
+async fn has_any_method(user_id: &UserId, conn: &DbConn) -> bool {
+    TwoFactor::find_by_user(user_id, conn).await.iter().any(|tf| tf.enabled && a_method(tf.atype, &tf.data))
+}
+
+/// Whether an organization is waiting for this person to turn on two-step
+/// login before it confirms them (upstream's Require two-step login), which
+/// has its own notice ("Joining").
+async fn upstream_waits(user_id: &UserId, conn: &DbConn) -> bool {
+    for member in Membership::find_accepted_and_confirmed_by_user(user_id, conn).await {
+        if member.status == MembershipStatus::Accepted as i32 && OrgPolicy::waits_for_two_step(&member, conn).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether to nudge this person to set up two-step login: they have none at
+/// all, no rule covers them (they'd get a setup session instead), no
+/// organization is waiting on it for upstream's policy (its own notice says
+/// so), and they haven't said "Not now" in the last 90 days. See DESIGN.md, "A
+/// nudge for everyone else".
+async fn nudge_shows(user_id: &UserId, conn: &DbConn) -> ApiResult<bool> {
+    Ok(!has_any_method(user_id, conn).await
+        && requirements(user_id, conn).await?.is_empty()
+        && !upstream_waits(user_id, conn).await
+        && !TwoStepNudgeDismissal::hidden(user_id, conn).await)
+}
+
+/// Whether the web vault and the extension show the nudge on the vault page.
+#[get("/keykeeper/two-step-nudge")]
+async fn get_nudge(headers: Headers, conn: DbConn) -> JsonResult {
+    Ok(Json(json!({ "show": nudge_shows(&headers.user.uuid, &conn).await? })))
+}
+
+/// "Not now": hidden for 90 days, on every device.
+#[post("/keykeeper/two-step-nudge/dismiss")]
+async fn dismiss_nudge(headers: Headers, conn: DbConn) -> JsonResult {
+    TwoStepNudgeDismissal::dismiss(&headers.user.uuid, &conn).await?;
+    Ok(Json(json!({ "show": false })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1346,50 @@ mod tests {
             name: "m".to_owned(),
         };
         assert!(!staff.met_by_sso(&[a, b]));
+    }
+
+    #[test]
+    fn any_two_step_method_ends_the_nudge() {
+        for t in [
+            TwoFactorType::Authenticator,
+            TwoFactorType::Email,
+            TwoFactorType::Duo,
+            TwoFactorType::YubiKey,
+            TwoFactorType::OrganizationDuo,
+        ] {
+            let n = t as i32;
+            assert!(a_method(n, ""), "{n}");
+        }
+        assert!(a_method(TwoFactorType::Webauthn as i32, r#"[{"id":1,"name":"Key"}]"#));
+        // Upstream leaves a security key method on with no key left.
+        assert!(!a_method(TwoFactorType::Webauthn as i32, "[]"));
+        for t in [
+            TwoFactorType::RecoveryCode,
+            TwoFactorType::Remember,
+            TwoFactorType::EmailVerificationChallenge,
+            TwoFactorType::WebauthnRegisterChallenge,
+            TwoFactorType::ProtectedActions,
+        ] {
+            let n = t as i32;
+            assert!(!a_method(n, ""), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_change_of_level_logs_the_admin_level_around_everyone() {
+        use EventType::{
+            KeykeeperAdminTwoStepOff as AdminsOff, KeykeeperAdminTwoStepOn as AdminsOn,
+            KeykeeperEveryoneTwoStepOff as EveryoneOff, KeykeeperEveryoneTwoStepOn as EveryoneOn,
+        };
+        use TwoStepScope::{Admins, Everyone, Off};
+        let codes = |before, after| scope_events(before, after).into_iter().map(|e| e as i32).collect::<Vec<_>>();
+        assert_eq!(codes(Off, Admins), vec![AdminsOn as i32]);
+        assert_eq!(codes(Admins, Off), vec![AdminsOff as i32]);
+        assert_eq!(codes(Admins, Everyone), vec![EveryoneOn as i32]);
+        assert_eq!(codes(Everyone, Admins), vec![EveryoneOff as i32]);
+        assert_eq!(codes(Off, Everyone), vec![AdminsOn as i32, EveryoneOn as i32]);
+        assert_eq!(codes(Everyone, Off), vec![EveryoneOff as i32, AdminsOff as i32]);
+        assert_eq!(codes(Everyone, Everyone), Vec::<i32>::new());
     }
 
     #[test]
@@ -1231,5 +1451,137 @@ mod tests {
             org("Acme", false, false),
         ];
         assert_eq!(requirer_names(&unmet), vec!["Acme".to_owned(), "Contoso IT".to_owned()]);
+    }
+
+    // With a database: who each level covers, and the nudge.
+
+    async fn person(name: &str, conn: &DbConn) -> User {
+        let mut user = User::new(&format!("{name}@example.test"), None);
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    async fn organization(name: &str, conn: &DbConn) -> Organization {
+        let org = Organization::new(name.to_owned(), "billing@example.test", None, None);
+        org.save(conn).await.unwrap();
+        org
+    }
+
+    async fn join(user: &User, org: &Organization, atype: MembershipType, status: MembershipStatus, conn: &DbConn) {
+        let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
+        member.atype = atype as i32;
+        member.status = status as i32;
+        member.save(conn).await.unwrap();
+    }
+
+    async fn covered(user: &User, conn: &DbConn) -> bool {
+        !requirements(&user.uuid, conn).await.unwrap().is_empty()
+    }
+
+    #[rocket::async_test]
+    async fn everyone_covers_every_role_that_has_joined_and_admins_only_the_admin_roles() {
+        let conn = crate::db::DbPool::for_test().await;
+        let org = organization("Acme Dental", &conn).await;
+        let owner = person("owner", &conn).await;
+        join(&owner, &org, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        let member = person("member", &conn).await;
+        join(&member, &org, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        let manager = person("manager", &conn).await;
+        join(&manager, &org, MembershipType::Manager, MembershipStatus::Accepted, &conn).await;
+        let invited = person("invited", &conn).await;
+        join(&invited, &org, MembershipType::User, MembershipStatus::Invited, &conn).await;
+        let revoked = person("revoked", &conn).await;
+        join(&revoked, &org, MembershipType::User, MembershipStatus::Revoked, &conn).await;
+        // Joined by the server on a server without email, never accepted.
+        let unaccepted = person("unaccepted", &conn).await;
+        join(&unaccepted, &org, MembershipType::User, MembershipStatus::Accepted, &conn).await;
+        let id = Membership::find_by_user_and_org(&unaccepted.uuid, &org.uuid, &conn).await.unwrap().uuid;
+        UnacceptedMembership::mark(vec![id], &conn).await.unwrap();
+
+        for (scope, owner_covered, members_covered) in [
+            (TwoStepScope::Off, false, false),
+            (TwoStepScope::Admins, true, false),
+            (TwoStepScope::Everyone, true, true),
+        ] {
+            OrgAdminTwoStep::set(&org.uuid, scope, &conn).await.unwrap();
+            assert_eq!(covered(&owner, &conn).await, owner_covered, "{scope:?}");
+            assert_eq!(covered(&member, &conn).await, members_covered, "{scope:?}");
+            assert_eq!(covered(&manager, &conn).await, members_covered, "{scope:?}");
+            for nobody in [&invited, &revoked, &unaccepted] {
+                assert!(!covered(nobody, &conn).await, "{scope:?} {}", nobody.email);
+            }
+        }
+        // Who isn't set up: the admins, and the other members apart.
+        let admins: Vec<String> =
+            not_set_up(&org.uuid, false, &conn).await.iter().map(|p| p["email"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(admins, vec![owner.email.clone()]);
+        let mut members: Vec<String> = members_not_set_up(&org.uuid, &conn)
+            .await
+            .iter()
+            .map(|p| p["email"].as_str().unwrap().to_owned())
+            .collect();
+        members.sort();
+        assert_eq!(members, vec![manager.email.clone(), member.email.clone()]);
+        assert!(members_not_set_up(&org.uuid, &conn).await.iter().all(|p| p["role"] == "member"));
+    }
+
+    #[rocket::async_test]
+    async fn a_member_who_never_accepted_waits_to_accept_only_where_everyone_is_covered() {
+        let conn = crate::db::DbPool::for_test().await;
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let org = organization("Contoso", &conn).await;
+        let olivia = person("olivia", &conn).await;
+        join(&olivia, &org, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        let ben = person("ben", &conn).await;
+        join(&ben, &org, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        let ana = person("ana", &conn).await;
+        join(&ana, &org, MembershipType::User, MembershipStatus::Accepted, &conn).await;
+        let confirmed = Membership::find_by_user_and_org(&ben.uuid, &org.uuid, &conn).await.unwrap();
+        let waiting = Membership::find_by_user_and_org(&ana.uuid, &org.uuid, &conn).await.unwrap();
+        UnacceptedMembership::mark(vec![confirmed.uuid.clone(), waiting.uuid.clone()], &conn).await.unwrap();
+
+        // For admins only, a member is let in, and stays.
+        set_org_scope(&org.uuid, TwoStepScope::Admins, &olivia.uuid, 0, &ip, &conn).await.unwrap();
+        assert!(!must_accept_first(&waiting, &conn).await);
+        assert!(require_accepted_to_promote(&waiting, true, &conn).await.is_err());
+        let still = Membership::find_by_uuid(&confirmed.uuid, &conn).await.unwrap();
+        assert_eq!(still.status, MembershipStatus::Confirmed as i32);
+
+        // For everyone, the one waiting accepts first, and the confirmed one
+        // is revoked until they accept; a promotion brings nothing new.
+        assert!(set_org_scope(&org.uuid, TwoStepScope::Everyone, &olivia.uuid, 0, &ip, &conn).await.unwrap());
+        assert!(must_accept_first(&waiting, &conn).await);
+        assert!(require_accepted_to_promote(&waiting, true, &conn).await.is_ok());
+        let held = Membership::find_by_uuid(&confirmed.uuid, &conn).await.unwrap();
+        assert!(held.status < MembershipStatus::Invited as i32);
+        assert!(RevokedUntilAccepted::is(&held.uuid, &conn).await);
+        assert_eq!(role_word(&held, &conn).await, "member");
+        // Back to admins only, nobody is restored on its own.
+        set_org_scope(&org.uuid, TwoStepScope::Admins, &olivia.uuid, 0, &ip, &conn).await.unwrap();
+        assert!(RevokedUntilAccepted::is(&held.uuid, &conn).await);
+    }
+
+    #[rocket::async_test]
+    async fn the_nudge_is_for_someone_with_no_two_step_login_whom_no_rule_covers() {
+        let conn = crate::db::DbPool::for_test().await;
+        let ana = person("ana", &conn).await;
+        assert!(nudge_shows(&ana.uuid, &conn).await.unwrap());
+        // Not now hides it.
+        TwoStepNudgeDismissal::dismiss(&ana.uuid, &conn).await.unwrap();
+        assert!(TwoStepNudgeDismissal::hidden(&ana.uuid, &conn).await);
+        assert!(!nudge_shows(&ana.uuid, &conn).await.unwrap());
+
+        // Any method at all ends it, email codes included.
+        let ben = person("ben", &conn).await;
+        TwoFactor::new(ben.uuid.clone(), TwoFactorType::Email, String::new()).save(&conn).await.unwrap();
+        assert!(!nudge_shows(&ben.uuid, &conn).await.unwrap());
+
+        // Someone a rule covers gets a setup session instead.
+        let cy = person("cy", &conn).await;
+        let org = organization("Acme Dental", &conn).await;
+        join(&cy, &org, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        assert!(nudge_shows(&cy.uuid, &conn).await.unwrap());
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Everyone, &conn).await.unwrap();
+        assert!(!nudge_shows(&cy.uuid, &conn).await.unwrap());
     }
 }

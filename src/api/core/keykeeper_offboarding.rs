@@ -491,14 +491,14 @@ pub(super) async fn cut_msp_out(
 mod tests {
     use super::super::keykeeper_two_step::{
         require_accepted_to_confirm, require_accepted_to_promote, require_accepted_to_restore, restore_waits_for_them,
-        set_org_required,
+        set_org_scope,
     };
     use super::*;
     use crate::db::{
         DbPool,
         models::{
-            EventKind, Msp, MspRole, MspStaff, OrgAdminTwoStep, RevokedUntilAccepted, UnacceptedMembership,
-            confirms_automatically,
+            EventKind, Msp, MspRole, MspStaff, OrgAdminTwoStep, RevokedUntilAccepted, TwoStepScope,
+            UnacceptedMembership, confirms_automatically,
         },
     };
 
@@ -688,7 +688,7 @@ mod tests {
     async fn a_role_the_server_accepted_for_someone_waits_for_them_to_accept_it() {
         let conn = DbPool::for_test().await;
         let org = organization("Contoso", &conn).await;
-        OrgAdminTwoStep::set(&org.uuid, true, &conn).await.unwrap();
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Admins, &conn).await.unwrap();
         let ana = person("ana", &conn).await;
         let mut admin = join(&ana, &org, MembershipType::Admin, &conn).await;
         admin.status = MembershipStatus::Accepted as i32;
@@ -706,7 +706,7 @@ mod tests {
         // Once they accept, or where the organization doesn't require it, it goes ahead.
         UnacceptedMembership::accept(&admin.uuid, &conn).await.unwrap();
         assert!(require_accepted_to_confirm(&admin, &conn).await.is_ok());
-        OrgAdminTwoStep::set(&org.uuid, false, &conn).await.unwrap();
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Off, &conn).await.unwrap();
         assert!(require_accepted_to_promote(&member, true, &conn).await.is_ok());
     }
 
@@ -729,7 +729,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(set_org_required(&org.uuid, true, &cy.uuid, 0, &ip, &conn).await.unwrap());
+        assert!(set_org_scope(&org.uuid, TwoStepScope::Admins, &cy.uuid, 0, &ip, &conn).await.unwrap());
 
         // The admin is revoked until they accept it.
         let admin = Membership::find_by_uuid(&admin.uuid, &conn).await.unwrap();
@@ -753,7 +753,7 @@ mod tests {
         UnacceptedMembership::accept(&admin.uuid, &conn).await.unwrap();
         assert!(!restore_waits_for_them(&admin, &conn).await.unwrap());
         // Nor where the organization doesn't require it.
-        OrgAdminTwoStep::set(&org.uuid, false, &conn).await.unwrap();
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Off, &conn).await.unwrap();
         UnacceptedMembership::mark(vec![admin.uuid.clone()], &conn).await.unwrap();
         assert!(!restore_waits_for_them(&admin, &conn).await.unwrap());
     }
@@ -769,7 +769,7 @@ mod tests {
         let cy = person("cy", &conn).await;
         join(&cy, &org, MembershipType::Admin, &conn).await;
 
-        set_org_required(&org.uuid, true, &cy.uuid, 0, &ip, &conn).await.unwrap();
+        set_org_scope(&org.uuid, TwoStepScope::Admins, &cy.uuid, 0, &ip, &conn).await.unwrap();
 
         let owner = Membership::find_by_uuid(&owner.uuid, &conn).await.unwrap();
         assert_eq!(owner.status, MembershipStatus::Confirmed as i32);

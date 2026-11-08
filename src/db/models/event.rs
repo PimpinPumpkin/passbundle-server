@@ -154,6 +154,10 @@ pub enum EventType {
     // off (keykeeper_two_step).
     KeykeeperAdminTwoStepOn = 1695,
     KeykeeperAdminTwoStepOff = 1696,
+    // Keykeeper: it required two-step login of everyone in it, or went back
+    // to its admins only (DESIGN.md, "Two-step login for everyone").
+    KeykeeperEveryoneTwoStepOn = 1697,
+    KeykeeperEveryoneTwoStepOff = 1698,
     // OrganizationVaultAccessed = 1603,
     // Keykeeper: the organization's single sign-on turned on or off.
     OrganizationEnabledSso = 1604,

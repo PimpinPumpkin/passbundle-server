@@ -541,6 +541,7 @@ table! {
     org_admin_two_step (org_uuid) {
         org_uuid -> Text,
         required -> Bool,
+        everyone -> Bool,
     }
 }
 
@@ -557,6 +558,13 @@ table! {
         user_uuid -> Text,
         device_type -> Integer,
         created_at -> Timestamp,
+    }
+}
+
+table! {
+    two_step_nudge_dismissals (user_uuid) {
+        user_uuid -> Text,
+        dismissed_at -> Timestamp,
     }
 }
 
