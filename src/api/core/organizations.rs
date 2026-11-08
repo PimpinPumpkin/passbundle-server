@@ -3752,7 +3752,7 @@ mod keykeeper_tests {
     use super::*;
     use crate::db::{
         DbPool,
-        models::{DeviceId, OrgAdminTwoStep, RevokedUntilAccepted, UnacceptedMembership},
+        models::{DeviceId, OrgAdminTwoStep, RevokedUntilAccepted, TwoStepScope, UnacceptedMembership},
     };
 
     async fn person(name: &str, conn: &DbConn) -> User {
@@ -3805,7 +3805,9 @@ mod keykeeper_tests {
         let bo = person("bo", &conn).await;
         let owner = join(&bo, &org, MembershipType::Owner, &conn).await;
         UnacceptedMembership::mark(vec![admin.uuid.clone(), owner.uuid.clone()], &conn).await.unwrap();
-        super::super::keykeeper_two_step::set_org_required(&org.uuid, true, &olivia.uuid, 9, &ip, &conn).await.unwrap();
+        super::super::keykeeper_two_step::set_org_scope(&org.uuid, TwoStepScope::Admins, &olivia.uuid, 9, &ip, &conn)
+            .await
+            .unwrap();
         assert!(RevokedUntilAccepted::is(&admin.uuid, &conn).await);
         assert!(RevokedUntilAccepted::is(&owner.uuid, &conn).await);
 

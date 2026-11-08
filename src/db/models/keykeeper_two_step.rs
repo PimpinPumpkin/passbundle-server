@@ -13,8 +13,8 @@ use crate::{
     db::{
         DbConn,
         keykeeper_schema::{
-            msp_staff_two_step, org_admin_two_step, revoked_until_accepted, two_step_setup_sessions,
-            unaccepted_memberships,
+            msp_staff_two_step, org_admin_two_step, revoked_until_accepted, two_step_nudge_dismissals,
+            two_step_setup_sessions, unaccepted_memberships,
         },
     },
     error::MapResult,
@@ -36,37 +36,80 @@ pub fn qualifying_two_step(atype: i32) -> bool {
     QUALIFYING_TWO_STEP.contains(&atype)
 }
 
+/// Whom an organization requires two-step login of: nobody, its admins (its
+/// owners, admins, custom roles that manage members, policies, or account
+/// recovery, and everyone its MSP brings in), or everyone who has joined it,
+/// which includes the admins. One setting with three levels, so it can't
+/// require it of members but not admins. See DESIGN.md, "Two-step login for
+/// everyone".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TwoStepScope {
+    Off,
+    Admins,
+    Everyone,
+}
+
+impl TwoStepScope {
+    /// The level a row says: `everyone` counts only while `required` is on.
+    pub fn of(required: bool, everyone: bool) -> Self {
+        match (required, everyone) {
+            (false, _) => Self::Off,
+            (true, false) => Self::Admins,
+            (true, true) => Self::Everyone,
+        }
+    }
+
+    /// Whether it requires anything: the admin level, at least.
+    pub fn required(self) -> bool {
+        self != Self::Off
+    }
+
+    pub fn everyone(self) -> bool {
+        self == Self::Everyone
+    }
+}
+
 /// An organization's setting: whether its owners, admins, and the custom roles
-/// that manage members, policies, or account recovery must use two-step login.
+/// that manage members, policies, or account recovery must use two-step login,
+/// and whether everyone else must too (TwoStepScope).
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = org_admin_two_step)]
 #[diesel(primary_key(org_uuid))]
 pub struct OrgAdminTwoStep {
     pub org_uuid: OrganizationId,
     pub required: bool,
+    /// Everyone else too. Counts only while `required` is on.
+    pub everyone: bool,
 }
 
 impl OrgAdminTwoStep {
-    /// Whether the organization requires it. Without a row it doesn't: the
-    /// Business preset and an MSP's default policies write one.
+    /// Whether the organization requires it of its admins (or of everyone).
+    /// Without a row it doesn't: the Business preset and an MSP's default
+    /// policies write one.
     pub async fn required(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
+        Ok(Self::scope(org_uuid, conn).await?.required())
+    }
+
+    /// Whom the organization requires it of. Without a row, nobody.
+    pub async fn scope(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<TwoStepScope> {
         let org_uuid = org_uuid.clone();
         conn.run(move |conn| {
             org_admin_two_step::table
                 .filter(org_admin_two_step::org_uuid.eq(org_uuid))
-                .select(org_admin_two_step::required)
-                .first::<bool>(conn)
+                .select((org_admin_two_step::required, org_admin_two_step::everyone))
+                .first::<(bool, bool)>(conn)
                 .optional()
-                .map(|r| r.unwrap_or(false))
+                .map(|r| r.map_or(TwoStepScope::Off, |(required, everyone)| TwoStepScope::of(required, everyone)))
                 .map_res("Error reading an organization's two-step login setting")
         })
         .await
     }
 
-    pub async fn set(org_uuid: &OrganizationId, required: bool, conn: &DbConn) -> EmptyResult {
+    pub async fn set(org_uuid: &OrganizationId, scope: TwoStepScope, conn: &DbConn) -> EmptyResult {
         let row = Self {
             org_uuid: org_uuid.clone(),
-            required,
+            required: scope.required(),
+            everyone: scope.everyone(),
         };
         conn.run(move |conn| {
             diesel::delete(org_admin_two_step::table.filter(org_admin_two_step::org_uuid.eq(&row.org_uuid)))
@@ -233,6 +276,60 @@ impl RevokedUntilAccepted {
     }
 }
 
+/// How long "Not now" hides the nudge to set up two-step login.
+pub const TWO_STEP_NUDGE_DAYS: i64 = 90;
+
+/// When an account last said "Not now" to the nudge to set up two-step login
+/// (DESIGN.md, "A nudge for everyone else"): one row per account, so it's the
+/// same on every device. Nothing else is kept.
+pub struct TwoStepNudgeDismissal;
+
+impl TwoStepNudgeDismissal {
+    /// Whether the account said "Not now" in the last 90 days.
+    pub async fn hidden(user_uuid: &UserId, conn: &DbConn) -> bool {
+        let user_uuid = user_uuid.clone();
+        let since = Utc::now().naive_utc() - TimeDelta::days(TWO_STEP_NUDGE_DAYS);
+        conn.run(move |conn| {
+            two_step_nudge_dismissals::table
+                .filter(two_step_nudge_dismissals::user_uuid.eq(user_uuid))
+                .select(two_step_nudge_dismissals::dismissed_at)
+                .first::<NaiveDateTime>(conn)
+                .optional()
+                .ok()
+                .flatten()
+                .is_some_and(|at| hides_since(at, since))
+        })
+        .await
+    }
+
+    /// The account said "Not now", just now.
+    pub async fn dismiss(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+        let user_uuid = user_uuid.clone();
+        let now = Utc::now().naive_utc();
+        conn.run(move |conn| {
+            diesel::delete(
+                two_step_nudge_dismissals::table.filter(two_step_nudge_dismissals::user_uuid.eq(&user_uuid)),
+            )
+            .execute(conn)
+            .map_res("Error saving a dismissed notice")
+            .map(|_: usize| ())?;
+            diesel::insert_into(two_step_nudge_dismissals::table)
+                .values((
+                    two_step_nudge_dismissals::user_uuid.eq(&user_uuid),
+                    two_step_nudge_dismissals::dismissed_at.eq(now),
+                ))
+                .execute(conn)
+                .map_res("Error saving a dismissed notice")
+        })
+        .await
+    }
+}
+
+/// Whether a dismissal at `at` still hides the nudge: it came after `since`.
+fn hides_since(at: NaiveDateTime, since: NaiveDateTime) -> bool {
+    at > since
+}
+
 /// How long a setup session lasts.
 pub const TWO_STEP_SETUP_MINUTES: i64 = 15;
 
@@ -343,6 +440,29 @@ mod tests {
         ] {
             assert!(!qualifying_two_step(t as i32));
         }
+    }
+
+    #[test]
+    fn everyone_includes_the_admins_and_counts_only_with_them() {
+        assert_eq!(TwoStepScope::of(false, false), TwoStepScope::Off);
+        // Everyone without the admin level is off: turning off the admins
+        // turns off both.
+        assert_eq!(TwoStepScope::of(false, true), TwoStepScope::Off);
+        assert_eq!(TwoStepScope::of(true, false), TwoStepScope::Admins);
+        assert_eq!(TwoStepScope::of(true, true), TwoStepScope::Everyone);
+        assert!(!TwoStepScope::Off.required());
+        assert!(TwoStepScope::Admins.required() && !TwoStepScope::Admins.everyone());
+        assert!(TwoStepScope::Everyone.required() && TwoStepScope::Everyone.everyone());
+        assert!(TwoStepScope::Off < TwoStepScope::Admins && TwoStepScope::Admins < TwoStepScope::Everyone);
+    }
+
+    #[test]
+    fn not_now_hides_the_nudge_for_ninety_days() {
+        let now = Utc::now().naive_utc();
+        let since = now - TimeDelta::days(TWO_STEP_NUDGE_DAYS);
+        assert!(hides_since(now, since));
+        assert!(hides_since(now - TimeDelta::days(89), since));
+        assert!(!hides_since(now - TimeDelta::days(91), since));
     }
 
     #[test]

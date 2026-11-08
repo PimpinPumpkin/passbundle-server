@@ -11,7 +11,8 @@
 // checks and side effects. See DESIGN.md, "Default policies".
 //
 // One default isn't an upstream policy: two-step login for each client's
-// admins (keykeeper_two_step). It's kept with the others under a type number
+// admins (keykeeper_two_step), with an option to require it of everyone else
+// too (`{"everyone": true}`). It's kept with the others under a type number
 // upstream never uses (ADMIN_TWO_STEP), and a client's setting is its own row,
 // never an upstream policy, since upstream's apps refuse every policy when one
 // has a type they don't know.
@@ -39,7 +40,7 @@ use crate::{
         DbConn,
         models::{
             Membership, MembershipType, Msp, MspClient, MspId, MspPolicy, MspRequiredHadOwn, OrgAdminTwoStep,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationId,
+            OrgPolicy, OrgPolicyType, Organization, OrganizationId, TwoStepScope,
             keykeeper_roles::{self, Permission},
         },
     },
@@ -59,6 +60,23 @@ pub fn routes() -> Vec<Route> {
 /// login for each client's admins (keykeeper_two_step). Upstream's policy
 /// types are small numbers; this one is never sent to the apps as a policy.
 pub const ADMIN_TWO_STEP: i32 = 1000;
+
+/// Two-step login for admins' one option, as its data: everyone else too.
+/// Without it, the data is null, as it always was.
+const EVERYONE: &str = r#"{"everyone":true}"#;
+
+/// Whether two-step login for admins' options ask for everyone else too.
+fn everyone_option(data: &str) -> bool {
+    serde_json::from_str::<Value>(data).ok().and_then(|v| v.get("everyone").and_then(Value::as_bool)) == Some(true)
+}
+
+/// The level two-step login for admins' effect (kind_effect) sets.
+fn admin_level(effect: Option<&Value>) -> TwoStepScope {
+    match effect {
+        None => TwoStepScope::Off,
+        Some(options) => TwoStepScope::of(true, options.get("everyone").and_then(Value::as_bool) == Some(true)),
+    }
+}
 
 /// What an MSP default sets in a client: an upstream policy, or two-step
 /// login for its admins.
@@ -226,6 +244,22 @@ fn effect(enabled: bool, data: &str) -> Option<Value> {
     })
 }
 
+/// What one kind of default does (effect). Two-step login for admins has one
+/// option, everyone else too, which only `true` turns on: anything else is
+/// the same as none.
+fn kind_effect(t: Kind, enabled: bool, data: &str) -> Option<Value> {
+    if t != Kind::AdminTwoStep {
+        return effect(enabled, data);
+    }
+    enabled.then(|| {
+        if everyone_option(data) {
+            json!({ "everyone": true })
+        } else {
+            json!({})
+        }
+    })
+}
+
 /// A policy as the console reads it: on or off, with its options.
 fn policy_json(t: Kind, enabled: bool, data: Option<&str>) -> Value {
     json!({
@@ -241,7 +275,7 @@ async fn defaults(msp_id: &MspId, conn: &DbConn) -> HashMap<i32, MspPolicy> {
 }
 
 fn default_effect(defaults: &HashMap<i32, MspPolicy>, t: Kind) -> Option<Value> {
-    defaults.get(&t.as_i32()).and_then(|p| effect(p.enabled, &p.data))
+    defaults.get(&t.as_i32()).and_then(|p| kind_effect(t, p.enabled, &p.data))
 }
 
 /// The defaults the MSP requires for every client, in the console's order.
@@ -337,17 +371,17 @@ pub async fn is_locked(org_id: &OrganizationId, pol_type: i32, conn: &DbConn) ->
 }
 
 /// What a client has now for each kind of default: its upstream policies, and
-/// whether it requires two-step login of its admins.
+/// whom it requires two-step login of (its admins, or everyone).
 struct ClientPolicies {
     policies: Vec<OrgPolicy>,
-    admin_two_step: bool,
+    admin_two_step: TwoStepScope,
 }
 
 impl ClientPolicies {
     async fn of(org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Self> {
         Ok(Self {
             policies: OrgPolicy::find_by_org(org_id, conn).await,
-            admin_two_step: OrgAdminTwoStep::required(org_id, conn).await?,
+            admin_two_step: OrgAdminTwoStep::scope(org_id, conn).await?,
         })
     }
 
@@ -357,13 +391,13 @@ impl ClientPolicies {
             Kind::Policy(t) => {
                 self.policies.iter().find(|p| p.atype == t as i32).map_or((false, None), |p| (p.enabled, Some(&p.data)))
             }
-            Kind::AdminTwoStep => (self.admin_two_step, None),
+            Kind::AdminTwoStep => (self.admin_two_step.required(), self.admin_two_step.everyone().then_some(EVERYONE)),
         }
     }
 
     fn effect(&self, t: Kind) -> Option<Value> {
         let (enabled, data) = self.state(t);
-        effect(enabled, data.unwrap_or("null"))
+        kind_effect(t, enabled, data.unwrap_or("null"))
     }
 
     /// Whether this kind differs from the default: its own setting.
@@ -448,9 +482,10 @@ async fn set_in_client(
             set_policy(org_id, t, data, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn).await?;
         }
         Kind::AdminTwoStep => {
-            keykeeper_two_step::set_org_required(
+            let everyone = data.data.as_ref().and_then(|d| d.get("everyone")).and_then(Value::as_bool) == Some(true);
+            keykeeper_two_step::set_org_scope(
                 org_id,
-                data.enabled,
+                TwoStepScope::of(data.enabled, everyone),
                 &headers.user.uuid,
                 headers.device.atype,
                 &headers.ip.ip,
@@ -664,13 +699,27 @@ async fn set_default(
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let t = offered_type(pol_type)?;
     let data = data.into_inner();
-    // Only someone who meets two-step login for admins turns its default off.
-    if t == Kind::AdminTwoStep && !data.enabled {
-        keykeeper_two_step::require_caller_meets(&headers.user, &session, &conn).await?;
-    }
-    let options = data.data.unwrap_or(Value::Null);
+    let options = data.data.clone().unwrap_or(Value::Null);
     if !(options.is_null() || options.is_object()) {
         err!("Policy options must be an object")
+    }
+    // Two-step login for admins keeps its one option, and nothing else, so
+    // its data stays null without it, as it always was.
+    let options = if t == Kind::AdminTwoStep && everyone_option(&options.to_string()) {
+        json!({ "everyone": true })
+    } else if t == Kind::AdminTwoStep {
+        Value::Null
+    } else {
+        options
+    };
+    // Only someone who meets two-step login for admins turns its default off,
+    // or lowers it from everyone to admins.
+    if t == Kind::AdminTwoStep {
+        let was = admin_level(default_effect(&defaults(&msp_id, &conn).await, t).as_ref());
+        let now = admin_level(kind_effect(t, data.enabled, &options.to_string()).as_ref());
+        if !data.enabled || now < was {
+            keykeeper_two_step::require_caller_meets(&headers.user, &session, &conn).await?;
+        }
     }
     // Refused before it's kept, not by each client after.
     if t == Kind::Policy(OrgPolicyType::MaximumVaultTimeout) {
@@ -720,7 +769,7 @@ async fn set_default(
     let old = default_effect(&defaults, t);
     let mut default = MspPolicy::new(msp_id.clone(), t.as_i32(), data.enabled, options.to_string());
     default.required = required;
-    let new = effect(default.enabled, &default.data);
+    let new = kind_effect(t, default.enabled, &default.data);
     default.save(&conn).await?;
     // Stopping requiring it: the clients that had their own setting before,
     // as the console listed them, and then they're forgotten.
@@ -803,10 +852,12 @@ async fn set_default(
         }
         // Stopping a requirement changes the default only if it changed too.
         if !stopped || old != new {
-            let state = if data.enabled {
-                "on"
-            } else {
+            let state = if !data.enabled {
                 "off"
+            } else if t == Kind::AdminTwoStep && admin_level(new.as_ref()).everyone() {
+                "on for everyone"
+            } else {
+                "on"
             };
             // Two-step login for admins is a security setting, high for security tools.
             let action = if t == Kind::AdminTwoStep {
@@ -845,11 +896,6 @@ async fn use_default(
 ) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
     let t = offered_type(pol_type)?;
-    // Putting clients back on a default of off turns two-step login for
-    // admins off there: only someone who meets it does that.
-    if t == Kind::AdminTwoStep && default_effect(&defaults(&msp_id, &conn).await, t).is_none() {
-        keykeeper_two_step::require_caller_meets(&headers.user, &session, &conn).await?;
-    }
 
     // Every client must be this MSP's before anything changes.
     let mut seen = HashSet::new();
@@ -870,6 +916,18 @@ async fn use_default(
 
     let defaults = defaults(&msp_id, &conn).await;
     let want = default_effect(&defaults, t);
+    // Putting a client back on a default that lowers its two-step login for
+    // admins (off, or admins only where it required everyone) takes someone
+    // who meets it.
+    if t == Kind::AdminTwoStep {
+        let want_level = admin_level(want.as_ref());
+        for org in &orgs {
+            if OrgAdminTwoStep::scope(&org.uuid, &conn).await? > want_level {
+                keykeeper_two_step::require_caller_meets(&headers.user, &session, &conn).await?;
+                break;
+            }
+        }
+    }
     let (mut changed, mut refused) = (Vec::new(), Vec::new());
     for org in &orgs {
         if client_effect(&org.uuid, t, &conn).await? == want {
@@ -1053,6 +1111,34 @@ mod tests {
             effect(true, r#"{"minLength":12,"requireUpper":false}"#),
             effect(true, r#"{"requireUpper":false,"minLength":12}"#)
         );
+    }
+
+    #[test]
+    fn two_step_login_for_admins_has_one_option_everyone_else_too() {
+        let t = Kind::AdminTwoStep;
+        // Left out, false, null, or anything else: admins only.
+        for data in ["null", "{}", r#"{"everyone":false}"#, r#"{"everyone":null}"#, r#"{"other":1}"#, "not json"] {
+            assert_eq!(kind_effect(t, true, data), Some(json!({})), "{data}");
+            assert_eq!(admin_level(kind_effect(t, true, data).as_ref()), TwoStepScope::Admins, "{data}");
+        }
+        assert_eq!(kind_effect(t, true, EVERYONE), Some(json!({ "everyone": true })));
+        assert_eq!(admin_level(kind_effect(t, true, EVERYONE).as_ref()), TwoStepScope::Everyone);
+        assert_ne!(kind_effect(t, true, EVERYONE), kind_effect(t, true, "null"));
+        // Off is off, whatever it says.
+        assert_eq!(kind_effect(t, false, EVERYONE), None);
+        assert_eq!(admin_level(None), TwoStepScope::Off);
+        // A client's setting reads as the default's would.
+        let client = |scope| ClientPolicies {
+            policies: Vec::new(),
+            admin_two_step: scope,
+        };
+        assert_eq!(client(TwoStepScope::Everyone).effect(t), kind_effect(t, true, EVERYONE));
+        assert_eq!(client(TwoStepScope::Admins).effect(t), kind_effect(t, true, "null"));
+        assert_eq!(client(TwoStepScope::Admins).state(t), (true, None));
+        assert_eq!(client(TwoStepScope::Off).effect(t), None);
+        // Upstream's policies keep their own options as they are.
+        let p = Kind::Policy(OrgPolicyType::MasterPassword);
+        assert_eq!(kind_effect(p, true, r#"{"minLength":12}"#), effect(true, r#"{"minLength":12}"#));
     }
 
     #[test]

@@ -91,8 +91,8 @@ pub use self::keykeeper_sso::{
     pkce_challenge, sso_hash, sso_random, txt_value,
 };
 pub use self::keykeeper_two_step::{
-    MspStaffTwoStep, OrgAdminTwoStep, RevokedUntilAccepted, TwoStepSetupSession, UnacceptedMembership,
-    qualifying_two_step,
+    MspStaffTwoStep, OrgAdminTwoStep, RevokedUntilAccepted, TwoStepNudgeDismissal, TwoStepScope, TwoStepSetupSession,
+    UnacceptedMembership, qualifying_two_step,
 };
 pub use self::keykeeper_user_settings::{UserSettings, valid_settings};
 pub use self::org_policy::{FillAssistPolicyData, OrgPolicy, OrgPolicyId, OrgPolicyType};
