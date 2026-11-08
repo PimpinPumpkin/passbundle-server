@@ -23,8 +23,8 @@ if [[ ! -z "$REPO_URL" ]] && [[ ! -z "$COMMIT_HASH" ]] ; then
     mv build /web-vault
 fi
 
-# Lower the KDF iterations default for faster tests.
-sed -i 's/(6e5,2e6,6e5)/(1e5,2e6,1e5)/' /web-vault/app/main.*.js
+# Keykeeper: no lowered KDF iterations default for faster tests; the server
+# refuses PBKDF2 under 600,000 iterations.
 
 # Generate a self signed cert
 mkdir -p /data/ssl; cd /data/ssl

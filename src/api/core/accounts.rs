@@ -95,6 +95,11 @@ pub struct KDFData {
 }
 
 impl KDFData {
+    /// Keykeeper: settings an account can have (`check_kdf`).
+    pub(super) fn check(&self) -> EmptyResult {
+        check_kdf(self.kdf, self.kdf_iterations, self.kdf_memory, self.kdf_parallelism)
+    }
+
     pub(super) fn matches_user(&self, user: &User) -> bool {
         self.kdf == user.client_kdf_type
             && self.kdf_iterations == user.client_kdf_iter
@@ -278,6 +283,10 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     if data.unprocessable() {
         err_code!("Unexpected RegisterData format", Status::UnprocessableEntity.code);
     }
+
+    // Keykeeper: the KDF settings first, so that a refused registration keeps its invitation (taken below), as
+    // the password hint check does.
+    data.kdf().check()?;
 
     // First, validate the provided verification tokens
     let mut email_verified = match (
@@ -677,6 +686,8 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
             if authentication_data.kdf != unlock_data.kdf {
                 err!("KDF settings must be equal for authentication and unlock")
             }
+            // Keykeeper: settings an account can have, as on every path that takes them.
+            authentication_data.kdf.check()?;
 
             if user.email != authentication_data.salt || user.email != unlock_data.salt {
                 err!("Invalid master password salt")
@@ -718,31 +729,54 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
     save_result
 }
 
-fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
-    if data.kdf == UserKdfType::Pbkdf2 as i32 && data.kdf_iterations < 100_000 {
-        err!("PBKDF2 KDF iterations must be at least 100000.")
+/// Keykeeper: the KDF settings an account can have, the same bounds PassBundle's apps accept (passbundle-apps
+/// `core/src/kdf.rs`; docs/core.md, "KDF settings are checked before anything is derived") and the web vault's KDF
+/// form offers. Upstream takes PBKDF2 from 100,000 iterations with no maximum, and Argon2id from 1 iteration and
+/// 15 MiB, so an account could be set to something the apps refuse (DESIGN.md, "KDF settings an account can have").
+const PBKDF2_ITERATIONS: std::ops::RangeInclusive<i32> = 600_000..=2_000_000;
+const ARGON2ID_ITERATIONS: std::ops::RangeInclusive<i32> = 2..=10;
+const ARGON2ID_MEMORY_MIB: std::ops::RangeInclusive<i32> = 16..=1024;
+const ARGON2ID_PARALLELISM: std::ops::RangeInclusive<i32> = 1..=16;
+
+/// Keykeeper: the one check of the KDF settings a client sends, on every path that takes them: registration,
+/// setting a first password, changing the KDF or the master password, emergency access takeover, account
+/// recovery, and key rotation. The messages are the apps' own.
+pub(super) fn check_kdf(kdf: i32, iterations: i32, memory: Option<i32>, parallelism: Option<i32>) -> EmptyResult {
+    if kdf == UserKdfType::Pbkdf2 as i32 {
+        if iterations < *PBKDF2_ITERATIONS.start() {
+            err!("PBKDF2 needs at least 600,000 iterations.")
+        }
+        if iterations > *PBKDF2_ITERATIONS.end() {
+            err!("PBKDF2 allows at most 2,000,000 iterations.")
+        }
+    } else if kdf == UserKdfType::Argon2id as i32 {
+        if !ARGON2ID_ITERATIONS.contains(&iterations) {
+            err!("Argon2id needs 2 to 10 iterations.")
+        }
+        let Some(memory) = memory else {
+            err!("Argon2 memory parameter is required.")
+        };
+        if !ARGON2ID_MEMORY_MIB.contains(&memory) {
+            err!("Argon2id needs 16 to 1,024 MiB of memory.")
+        }
+        let Some(parallelism) = parallelism else {
+            err!("Argon2 parallelism parameter is required.")
+        };
+        if !ARGON2ID_PARALLELISM.contains(&parallelism) {
+            err!("Argon2id needs a parallelism of 1 to 16.")
+        }
+    } else {
+        err!("Unknown KDF type.")
     }
+    Ok(())
+}
+
+fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
+    data.check()?;
 
     if data.kdf == UserKdfType::Argon2id as i32 {
-        if data.kdf_iterations < 1 {
-            err!("Argon2 KDF iterations must be at least 1.")
-        }
-        if let Some(m) = data.kdf_memory {
-            if !(15..=1024).contains(&m) {
-                err!("Argon2 memory must be between 15 MB and 1024 MB.")
-            }
-            user.client_kdf_memory = data.kdf_memory;
-        } else {
-            err!("Argon2 memory parameter is required.")
-        }
-        if let Some(p) = data.kdf_parallelism {
-            if !(1..=16).contains(&p) {
-                err!("Argon2 parallelism must be between 1 and 16.")
-            }
-            user.client_kdf_parallelism = data.kdf_parallelism;
-        } else {
-            err!("Argon2 parallelism parameter is required.")
-        }
+        user.client_kdf_memory = data.kdf_memory;
+        user.client_kdf_parallelism = data.kdf_parallelism;
     } else {
         user.client_kdf_memory = None;
         user.client_kdf_parallelism = None;
@@ -769,6 +803,8 @@ impl AuthenticationData {
         if self.kdf != unlock.kdf {
             err!("KDF settings must be equal for authentication and unlock")
         }
+        // Keykeeper: changing the KDF, emergency access takeover, and account recovery all check here.
+        self.kdf.check()?;
 
         if self.salt != user.master_password_salt() || self.salt != unlock.salt {
             err!("Invalid master password salt")
@@ -901,6 +937,10 @@ fn validate_keydata(
     existing_sends: &[Send],
     user: &User,
 ) -> EmptyResult {
+    // Keykeeper: settings an account can have, as on every path that takes them.
+    let unlock = &data.account_unlock_data.master_password_unlock_data;
+    check_kdf(unlock.kdf_type, unlock.kdf_iterations, unlock.kdf_memory, unlock.kdf_parallelism)?;
+
     if user.client_kdf_type != data.account_unlock_data.master_password_unlock_data.kdf_type
         || user.client_kdf_iter != data.account_unlock_data.master_password_unlock_data.kdf_iterations
         || user.client_kdf_memory != data.account_unlock_data.master_password_unlock_data.kdf_memory
@@ -1484,8 +1524,8 @@ pub struct PreloginData {
 
 /// The KDF settings an unknown email can get, as (type, iterations, memory, parallelism). The default is in it
 /// twice to give it more weight, as upstream's list has it. Keykeeper: upstream's list also has PBKDF2 at 5,000 and
-/// 100,000 iterations, for its legacy accounts. A PassBundle account can't have 5,000 (a KDF change refuses PBKDF2
-/// under 100,000), so that answer would say the email has no account, and PassBundle's apps refuse PBKDF2 under
+/// 100,000 iterations, for its legacy accounts. A PassBundle account can't have either (`check_kdf` refuses PBKDF2
+/// under 600,000), so that answer would say the email has no account, and PassBundle's apps refuse PBKDF2 under
 /// 600,000, so they'd say an unknown email's settings are too weak instead of a wrong email or password. Every
 /// setting here is one an account could have that the apps accept (DESIGN.md, "Unknown emails at prelogin").
 const UNKNOWN_EMAIL_KDF_SETTINGS: [(i32, i32, Option<i32>, Option<i32>); 6] = [
@@ -2069,9 +2109,8 @@ mod tests {
     use super::*;
 
     /// Every KDF setting an unknown email can get is one a PassBundle account could have (the server's own check
-    /// for a KDF change takes it) and that PassBundle's apps accept (passbundle-apps core/src/kdf.rs: PBKDF2 600,000
-    /// to 2,000,000 iterations; Argon2id 16 to 1,024 MiB, 2 to 10 iterations, 1 to 16 parallelism), so neither the
-    /// answer nor the apps tell an email with no account from one with an account. The default keeps its weight.
+    /// takes it) and that PassBundle's apps accept (the shared bounds, which are the apps'), so neither the answer
+    /// nor the apps tell an email with no account from one with an account. The default keeps its weight.
     #[test]
     fn unknown_emails_get_settings_an_account_could_have_and_the_apps_take() {
         for (kdf, iterations, memory, parallelism) in UNKNOWN_EMAIL_KDF_SETTINGS {
@@ -2091,19 +2130,23 @@ mod tests {
                 (user.client_kdf_type, user.client_kdf_iter, user.client_kdf_memory, user.client_kdf_parallelism),
                 (kdf, iterations, memory, parallelism)
             );
+            // The shared bounds, which the_kdf_bounds_are_the_apps pins to the apps' own.
             match kdf {
                 k if k == UserKdfType::Pbkdf2 as i32 => {
-                    assert!((600_000..=2_000_000).contains(&iterations), "the apps refuse PBKDF2 at {iterations}");
+                    assert!(PBKDF2_ITERATIONS.contains(&iterations), "the apps refuse PBKDF2 at {iterations}");
                     assert_eq!((memory, parallelism), (None, None));
                 }
                 k if k == UserKdfType::Argon2id as i32 => {
-                    assert!((2..=10).contains(&iterations), "the apps refuse Argon2id at {iterations} iterations");
                     assert!(
-                        memory.is_some_and(|m| (16..=1024).contains(&m)),
+                        ARGON2ID_ITERATIONS.contains(&iterations),
+                        "the apps refuse Argon2id at {iterations} iterations"
+                    );
+                    assert!(
+                        memory.is_some_and(|m| ARGON2ID_MEMORY_MIB.contains(&m)),
                         "the apps refuse Argon2id at {memory:?} MiB"
                     );
                     assert!(
-                        parallelism.is_some_and(|p| (1..=16).contains(&p)),
+                        parallelism.is_some_and(|p| ARGON2ID_PARALLELISM.contains(&p)),
                         "the apps refuse Argon2id at a parallelism of {parallelism:?}"
                     );
                 }
@@ -2166,5 +2209,266 @@ mod tests {
         assert_eq!(data.key(), "key");
         assert_eq!(data.kdf().kdf_iterations, 600_000);
         assert!(data.keys.is_some());
+    }
+
+    // Keykeeper: the KDF settings an account can have, on every path that takes them (DESIGN.md, "KDF settings an
+    // account can have").
+
+    const TOO_FEW: &str = "PBKDF2 needs at least 600,000 iterations.";
+
+    fn refusal<T: std::fmt::Debug>(result: ApiResult<T>) -> String {
+        result.expect_err("refused").message().to_owned()
+    }
+
+    fn pbkdf2(iterations: i32) -> Value {
+        json!({"kdfType": 0, "iterations": iterations})
+    }
+
+    async fn headers(user_id: &UserId, conn: &DbConn) -> Headers {
+        Headers {
+            host: "https://127.0.0.1".to_owned(),
+            device: Device::new(DeviceId::from(format!("device-{user_id}")), user_id.clone(), "test".to_owned(), 9),
+            user: User::find_by_uuid(user_id, conn).await.unwrap(),
+            ip: ClientIp {
+                ip: "127.0.0.1".parse().unwrap(),
+            },
+        }
+    }
+
+    /// An account with this master password hash. The server's own rounds on the hash (not the KDF) are fewer
+    /// than its default, to keep the test quick.
+    async fn account(email: &str, hash: &str, conn: &DbConn) -> User {
+        let mut user = User::new(email, None);
+        user.password_iterations = 1_000;
+        user.set_password(hash, Some("2.key".to_owned()), false, None, conn).await.unwrap();
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    /// The server's bounds are the apps' (passbundle-apps `core/src/kdf.rs`) and the web vault's KDF form's
+    /// (`PBKDF2KdfConfig`, `Argon2KdfConfig`), so no account can be set to anything an app refuses.
+    #[test]
+    fn the_kdf_bounds_are_the_apps() {
+        assert_eq!(PBKDF2_ITERATIONS, 600_000..=2_000_000);
+        assert_eq!(ARGON2ID_ITERATIONS, 2..=10);
+        assert_eq!(ARGON2ID_MEMORY_MIB, 16..=1024);
+        assert_eq!(ARGON2ID_PARALLELISM, 1..=16);
+        assert_eq!(*PBKDF2_ITERATIONS.start(), User::CLIENT_KDF_ITER_DEFAULT);
+    }
+
+    #[test]
+    fn the_shared_check_takes_the_bounds_and_nothing_outside_them() {
+        let pbkdf2 = |iterations| check_kdf(UserKdfType::Pbkdf2 as i32, iterations, None, None);
+        assert_eq!(refusal(pbkdf2(100_000)), TOO_FEW);
+        assert_eq!(refusal(pbkdf2(599_999)), TOO_FEW);
+        assert!(pbkdf2(600_000).is_ok());
+        assert!(pbkdf2(2_000_000).is_ok());
+        assert_eq!(refusal(pbkdf2(2_000_001)), "PBKDF2 allows at most 2,000,000 iterations.");
+
+        let argon2id =
+            |iterations, memory, parallelism| check_kdf(UserKdfType::Argon2id as i32, iterations, memory, parallelism);
+        assert!(argon2id(2, Some(16), Some(1)).is_ok());
+        assert!(argon2id(10, Some(1024), Some(16)).is_ok());
+        for iterations in [0, 1, 11] {
+            assert_eq!(refusal(argon2id(iterations, Some(64), Some(4))), "Argon2id needs 2 to 10 iterations.");
+        }
+        for memory in [15, 1025] {
+            assert_eq!(refusal(argon2id(3, Some(memory), Some(4))), "Argon2id needs 16 to 1,024 MiB of memory.");
+        }
+        assert_eq!(refusal(argon2id(3, None, Some(4))), "Argon2 memory parameter is required.");
+        for parallelism in [0, 17] {
+            assert_eq!(refusal(argon2id(3, Some(64), Some(parallelism))), "Argon2id needs a parallelism of 1 to 16.");
+        }
+        assert_eq!(refusal(argon2id(3, Some(64), None)), "Argon2 parallelism parameter is required.");
+
+        // A type the apps don't know is no way around the bounds.
+        assert_eq!(refusal(check_kdf(2, 1, None, None)), "Unknown KDF type.");
+    }
+
+    fn registration(iterations: i32, current_format: bool) -> RegisterData {
+        let email = "ana@example.test";
+        serde_json::from_value(if current_format {
+            json!({
+                "email": email,
+                "masterPasswordAuthentication": {
+                    "kdf": pbkdf2(iterations),
+                    "salt": email,
+                    "masterPasswordAuthenticationHash": "hash"
+                },
+                "masterPasswordUnlock": {"kdf": pbkdf2(iterations), "salt": email, "masterKeyWrappedUserKey": "2.key"}
+            })
+        } else {
+            json!({
+                "email": email,
+                "masterPasswordHash": "hash",
+                "userSymmetricKey": "2.key",
+                "kdf": 0,
+                "kdfIterations": iterations
+            })
+        })
+        .unwrap()
+    }
+
+    /// Registration, in both formats the apps send: 599,999 iterations is refused first, before the invitation
+    /// is taken; 600,000 gets past that, to the verification token this request doesn't have. What a
+    /// registration stores is the same check's.
+    #[rocket::async_test]
+    async fn registration_needs_600000_iterations() {
+        for current_format in [true, false] {
+            let refused = register(Json(registration(599_999, current_format)), DbPool::for_test().await).await;
+            assert_eq!(refusal(refused), TOO_FEW);
+            let next = register(Json(registration(600_000, current_format)), DbPool::for_test().await).await;
+            assert_eq!(refusal(next), "Registration is missing required parameters");
+        }
+        let mut user = User::new("ana@example.test", None);
+        assert_eq!(refusal(set_kdf_data(&mut user, registration(599_999, true).kdf())), TOO_FEW);
+        user.client_kdf_iter = 800_000;
+        set_kdf_data(&mut user, registration(600_000, true).kdf()).unwrap();
+        assert_eq!((user.client_kdf_type, user.client_kdf_iter), (UserKdfType::Pbkdf2 as i32, 600_000));
+    }
+
+    fn first_password(iterations: i32) -> Json<SetPasswordData> {
+        Json(
+            serde_json::from_value(json!({
+                "kdf": 0,
+                "kdfIterations": iterations,
+                "key": "2.key",
+                "keys": null,
+                "masterPasswordHash": "hash",
+                "masterPasswordHint": null,
+                "orgIdentifier": null
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// Setting a first master password (someone who joined with single sign-on): 599,999 iterations is refused and
+    /// the account still has none; 600,000 sets it.
+    #[rocket::async_test]
+    async fn a_first_password_needs_600000_iterations() {
+        let pool = DbPool::for_test_pool();
+        let conn = pool.get().await.unwrap();
+        let mut sso = User::new("sso@example.test", None);
+        sso.save(&conn).await.unwrap();
+
+        let refused = post_set_password(first_password(599_999), headers(&sso.uuid, &conn).await, conn).await;
+        assert_eq!(refusal(refused), TOO_FEW);
+        let conn = pool.get().await.unwrap();
+        assert_eq!(User::find_by_uuid(&sso.uuid, &conn).await.unwrap().password_hash, Vec::<u8>::new());
+
+        post_set_password(first_password(600_000), headers(&sso.uuid, &conn).await, conn).await.unwrap();
+        let conn = pool.get().await.unwrap();
+        let sso = User::find_by_uuid(&sso.uuid, &conn).await.unwrap();
+        assert_ne!(sso.password_hash, Vec::<u8>::new());
+        assert_eq!((sso.client_kdf_type, sso.client_kdf_iter), (UserKdfType::Pbkdf2 as i32, 600_000));
+    }
+
+    fn kdf_change(email: &str, iterations: i32) -> Json<ChangeKdfData> {
+        Json(
+            serde_json::from_value(json!({
+                "authenticationData": {
+                    "salt": email,
+                    "kdf": pbkdf2(iterations),
+                    "masterPasswordAuthenticationHash": "new"
+                },
+                "unlockData": {"salt": email, "kdf": pbkdf2(iterations), "masterKeyWrappedUserKey": "2.new-key"},
+                "masterPasswordHash": "hash"
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// Changing the KDF: to 599,999 iterations is refused and the account keeps its settings and password; to
+    /// 600,000 is saved.
+    #[rocket::async_test]
+    async fn changing_the_kdf_needs_600000_iterations() {
+        let pool = DbPool::for_test_pool();
+        let conn = pool.get().await.unwrap();
+        let mut kim = account("kim@example.test", "hash", &conn).await;
+        kim.client_kdf_iter = 800_000;
+        kim.save(&conn).await.unwrap();
+        let nt: Notify<'_> = (&*crate::api::WS_USERS).into();
+
+        let refused = post_kdf(kdf_change(&kim.email, 599_999), headers(&kim.uuid, &conn).await, conn, nt).await;
+        assert_eq!(refusal(refused), TOO_FEW);
+        let conn = pool.get().await.unwrap();
+        let unchanged = User::find_by_uuid(&kim.uuid, &conn).await.unwrap();
+        assert_eq!(unchanged.client_kdf_iter, 800_000);
+        assert!(unchanged.check_valid_password("hash"));
+
+        post_kdf(kdf_change(&kim.email, 600_000), headers(&kim.uuid, &conn).await, conn, nt).await.unwrap();
+        let conn = pool.get().await.unwrap();
+        let changed = User::find_by_uuid(&kim.uuid, &conn).await.unwrap();
+        assert_eq!((changed.client_kdf_type, changed.client_kdf_iter), (UserKdfType::Pbkdf2 as i32, 600_000));
+        assert!(changed.check_valid_password("new"));
+    }
+
+    fn password_change(email: &str, iterations: i32) -> Json<ChangePassData> {
+        Json(
+            serde_json::from_value(json!({
+                "masterPasswordHash": "hash",
+                "masterPasswordHint": null,
+                "authenticationData": {
+                    "salt": email,
+                    "kdf": pbkdf2(iterations),
+                    "masterPasswordAuthenticationHash": "new"
+                },
+                "unlockData": {"salt": email, "kdf": pbkdf2(iterations), "masterKeyWrappedUserKey": "2.new-key"}
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// Changing the master password, which sends the KDF settings too: with 599,999 iterations it's refused and
+    /// the old password still works; with the account's 600,000 the new one is set.
+    #[rocket::async_test]
+    async fn a_new_master_password_needs_600000_iterations() {
+        let pool = DbPool::for_test_pool();
+        let conn = pool.get().await.unwrap();
+        let lee = account("lee@example.test", "hash", &conn).await;
+        let nt: Notify<'_> = (&*crate::api::WS_USERS).into();
+
+        let refused =
+            post_password(password_change(&lee.email, 599_999), headers(&lee.uuid, &conn).await, conn, nt).await;
+        assert_eq!(refusal(refused), TOO_FEW);
+        let conn = pool.get().await.unwrap();
+        assert!(User::find_by_uuid(&lee.uuid, &conn).await.unwrap().check_valid_password("hash"));
+
+        post_password(password_change(&lee.email, 600_000), headers(&lee.uuid, &conn).await, conn, nt).await.unwrap();
+        let conn = pool.get().await.unwrap();
+        assert!(User::find_by_uuid(&lee.uuid, &conn).await.unwrap().check_valid_password("new"));
+    }
+
+    fn rotation(email: &str, iterations: i32) -> KeyData {
+        serde_json::from_value(json!({
+            "accountUnlockData": {
+                "emergencyAccessUnlockData": [],
+                "masterPasswordUnlockData": {
+                    "kdfType": 0,
+                    "kdfIterations": iterations,
+                    "kdfParallelism": null,
+                    "kdfMemory": null,
+                    "email": email,
+                    "masterKeyAuthenticationHash": "new",
+                    "masterKeyEncryptedUserKey": "2.new-key"
+                },
+                "organizationAccountRecoveryUnlockData": []
+            },
+            "accountKeys": {"userKeyEncryptedAccountPrivateKey": "2.private-key", "accountPublicKey": "public-key"},
+            "accountData": {"ciphers": [], "folders": [], "sends": []},
+            "oldMasterKeyAuthenticationHash": "hash"
+        }))
+        .unwrap()
+    }
+
+    /// Key rotation keeps the account's KDF settings, and checks them as every other path does: 599,999
+    /// iterations is refused with the same message; the account's 600,000 passes.
+    #[test]
+    fn key_rotation_needs_600000_iterations() {
+        let mut max = User::new("max@example.test", None);
+        max.public_key = Some("public-key".to_owned());
+        let check = |data: &KeyData| validate_keydata(data, &[], &[], &[], &[], &[], &max);
+        assert_eq!(refusal(check(&rotation(&max.email, 599_999))), TOO_FEW);
+        assert!(check(&rotation(&max.email, 600_000)).is_ok());
     }
 }
