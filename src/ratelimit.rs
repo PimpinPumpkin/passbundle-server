@@ -18,8 +18,8 @@ use crate::{
 type Limiter<T = IpAddr> = RateLimiter<T, DashMapStateStore<T>, DefaultClock>;
 
 static LIMITER_LOGIN: LazyLock<Limiter> = LazyLock::new(|| {
-    let seconds = Duration::from_secs(CONFIG.login_ratelimit_seconds());
-    let burst = NonZeroU32::new(CONFIG.login_ratelimit_max_burst()).expect("Non-zero login ratelimit burst");
+    let seconds = Duration::from_secs(u64::from(CONFIG.login_ratelimit_seconds()));
+    let burst = NonZeroU32::new(u32::from(CONFIG.login_ratelimit_max_burst())).expect("Non-zero login ratelimit burst");
     RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero login ratelimit seconds").allow_burst(burst))
 });
 
@@ -102,8 +102,8 @@ fn check_address(limiter: &Limiter, ip: &IpAddr) -> bool {
 // only says how to derive the key, the same way for an email without an
 // account.
 static LIMITER_PRELOGIN: LazyLock<Limiter> = LazyLock::new(|| {
-    let seconds = Duration::from_secs(CONFIG.login_ratelimit_seconds());
-    let burst = NonZeroU32::new(CONFIG.login_ratelimit_max_burst()).expect("Non-zero login ratelimit burst");
+    let seconds = Duration::from_secs(u64::from(CONFIG.login_ratelimit_seconds()));
+    let burst = NonZeroU32::new(u32::from(CONFIG.login_ratelimit_max_burst())).expect("Non-zero login ratelimit burst");
     RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero login ratelimit seconds").allow_burst(burst))
 });
 
@@ -135,14 +135,14 @@ pub fn check_limit_auth_request_device(user: &UserId, device: &DeviceId) -> Resu
 }
 
 static LIMITER_ADMIN: LazyLock<Limiter> = LazyLock::new(|| {
-    let seconds = Duration::from_secs(CONFIG.admin_ratelimit_seconds());
-    let burst = NonZeroU32::new(CONFIG.admin_ratelimit_max_burst()).expect("Non-zero admin ratelimit burst");
+    let seconds = Duration::from_secs(u64::from(CONFIG.admin_ratelimit_seconds()));
+    let burst = NonZeroU32::new(u32::from(CONFIG.admin_ratelimit_max_burst())).expect("Non-zero admin ratelimit burst");
     RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero admin ratelimit seconds").allow_burst(burst))
 });
 
 static LIMITER_UNAUTHENTICATED: LazyLock<Limiter> = LazyLock::new(|| {
-    let seconds = Duration::from_secs(CONFIG.unauthenticated_ratelimit_seconds());
-    let burst = NonZeroU32::new(CONFIG.unauthenticated_ratelimit_max_burst())
+    let seconds = Duration::from_secs(u64::from(CONFIG.unauthenticated_ratelimit_seconds()));
+    let burst = NonZeroU32::new(u32::from(CONFIG.unauthenticated_ratelimit_max_burst()))
         .expect("Non-zero unauthenticated ratelimit burst");
     RateLimiter::keyed(
         Quota::with_period(seconds).expect("Non-zero unauthenticated ratelimit seconds").allow_burst(burst),

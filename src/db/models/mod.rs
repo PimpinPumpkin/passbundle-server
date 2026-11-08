@@ -43,7 +43,9 @@ pub use self::auth_request::{AuthRequest, AuthRequestId, MAX_PENDING_AUTH_REQUES
 pub use self::cipher::{Cipher, CipherId, RepromptType};
 pub use self::collection::{Collection, CollectionCipher, CollectionId, CollectionUser};
 pub use self::device::{Device, DeviceId, DeviceType, DeviceWithAuthRequest, PushId};
-pub use self::emergency_access::{EmergencyAccess, EmergencyAccessId, EmergencyAccessStatus, EmergencyAccessType};
+pub use self::emergency_access::{
+    EMERGENCY_ACCESS_TIMEOUT_RANGE, EmergencyAccess, EmergencyAccessId, EmergencyAccessStatus, EmergencyAccessType,
+};
 pub use self::event::{Event, EventType};
 pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
@@ -93,7 +95,7 @@ pub use self::keykeeper_two_step::{
     qualifying_two_step,
 };
 pub use self::keykeeper_user_settings::{UserSettings, valid_settings};
-pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
+pub use self::org_policy::{FillAssistPolicyData, OrgPolicy, OrgPolicyId, OrgPolicyType};
 pub use self::organization::{
     Membership, MembershipId, MembershipStatus, MembershipType, OrgApiKeyId, Organization, OrganizationApiKey,
     OrganizationId,
