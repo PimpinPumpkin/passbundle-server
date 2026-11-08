@@ -574,7 +574,8 @@ async fn post_organization_collections(
         folder_permissions::save_user(&member.user_uuid, &collection.uuid, &user.grid()?, &conn).await?;
     }
 
-    Ok(Json(collection.to_json_details(&headers.membership.user_uuid, None, &conn).await))
+    // Keykeeper: with `assigned`, which upstream's web vault reads.
+    Ok(Json(collection.to_json_saved(&headers.membership.user_uuid, &conn).await))
 }
 
 #[derive(Deserialize)]
@@ -736,7 +737,8 @@ async fn put_organization_collection_update(
         folder_permissions::save_user(&member.user_uuid, &col_id, &grid, &conn).await?;
     }
 
-    Ok(Json(collection.to_json_details(&headers.user.uuid, None, &conn).await))
+    // Keykeeper: with `assigned`, which upstream's web vault reads.
+    Ok(Json(collection.to_json_saved(&headers.user.uuid, &conn).await))
 }
 
 async fn delete_organization_collection_impl(
