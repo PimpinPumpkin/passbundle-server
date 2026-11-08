@@ -228,6 +228,31 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                     .await;
                 }
             }
+            // Keykeeper: an assisted password change saved a new password to an
+            // organization's item, or someone put its earlier one back after one
+            // (keykeeper_password_change). Only for an item the person can edit and
+            // see the password of, in an organization that allows it.
+            t if t == EventType::KeykeeperCipherPasswordChanged as i32
+                || t == EventType::KeykeeperCipherPasswordPutBack as i32 =>
+            {
+                if let Some(cipher_uuid) = &event.cipher_id
+                    && let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await
+                    && let Some(org_id) =
+                        super::keykeeper_password_change::takes_cipher_event(&cipher, &headers.user.uuid, &conn).await
+                {
+                    log_event_impl(
+                        event.r#type,
+                        cipher_uuid,
+                        &org_id,
+                        &headers.user.uuid,
+                        headers.device.atype,
+                        Some(event_date),
+                        &headers.ip.ip,
+                        &conn,
+                    )
+                    .await;
+                }
+            }
             // Client-side cipher events (viewed, copied, toggled, autofilled, HTTP auth).
             1107..=1114 | 1117 | 1119..=1133 => {
                 // The cipher determines the organization the event is logged to, so make sure the

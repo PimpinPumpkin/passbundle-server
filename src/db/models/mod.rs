@@ -20,6 +20,7 @@ mod keykeeper_msp;
 pub mod keykeeper_msp_seats;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
+mod keykeeper_password_change;
 pub mod keykeeper_roles;
 mod keykeeper_scim;
 mod keykeeper_script_access;
@@ -74,6 +75,7 @@ pub use self::keykeeper_msp::{
 pub use self::keykeeper_msp_seats::ClientSeats;
 pub use self::keykeeper_offboarding::RemovedMember;
 pub use self::keykeeper_orgs::OrgSetup;
+pub use self::keykeeper_password_change::OrgPasswordChange;
 pub use self::keykeeper_scim::{
     ScimGroup, ScimPerson, ScimToken, ScimUser, looks_like_scim_token, remove_group_member,
 };

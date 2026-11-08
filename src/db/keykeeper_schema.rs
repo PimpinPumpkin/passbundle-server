@@ -546,6 +546,13 @@ table! {
 }
 
 table! {
+    org_password_change (org_uuid) {
+        org_uuid -> Text,
+        allowed -> Bool,
+    }
+}
+
+table! {
     msp_staff_two_step (msp_uuid) {
         msp_uuid -> Text,
         required -> Bool,
