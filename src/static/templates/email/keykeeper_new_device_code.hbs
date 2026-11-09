@@ -1,0 +1,18 @@
+Your code to sign in on a new device
+<!---------------->
+Someone is signing in to your PassBundle account on a new device, and asked for a code by email:
+
+{{code}}
+
+* Device: {{device}}
+* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}
+* When: {{datetime}}
+{{#if location_source}}
+
+{{location_source}}{{#if location_source_url}} ({{location_source_url}}){{/if}}
+{{/if}}
+
+The code works for 10 minutes, on that device only.
+
+If this wasn't you, don't give this code to anyone: someone knows your master password. Change it now in the web vault ( {{url}} ), and turn on two-step login.
+{{> email/email_footer_text }}

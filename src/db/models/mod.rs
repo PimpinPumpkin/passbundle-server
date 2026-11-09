@@ -19,6 +19,7 @@ mod keykeeper_joining;
 mod keykeeper_member_health;
 mod keykeeper_msp;
 pub mod keykeeper_msp_seats;
+mod keykeeper_new_device;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_password_change;
@@ -75,6 +76,7 @@ pub use self::keykeeper_msp::{
     exempt_from_member_policies, exempt_from_two_step_policy, parse_enrollment_domains,
 };
 pub use self::keykeeper_msp_seats::ClientSeats;
+pub use self::keykeeper_new_device::{KnownDeviceToken, NewDeviceCheck};
 pub use self::keykeeper_offboarding::RemovedMember;
 pub use self::keykeeper_orgs::OrgSetup;
 pub use self::keykeeper_password_change::OrgPasswordChange;

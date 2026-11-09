@@ -1,0 +1,16 @@
+Someone asked to sign in on a new device with a code by email
+<!---------------->
+Someone is signing in to your PassBundle account on a new device. Instead of approving it from one of your devices, they asked for a code by email. It can be sent after {{email_after}}.
+
+* Device: {{device}}
+* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}
+* When: {{datetime}}
+{{#if location_source}}
+
+{{location_source}}{{#if location_source_url}} ({{location_source_url}}){{/if}}
+{{/if}}
+
+If this wasn't you, open PassBundle on a device where you're signed in and deny it, then change your master password in the web vault ( {{url}} ): someone knows it.
+
+If it was you, sign in again on that device after that time to get the code.
+{{> email/email_footer_text }}

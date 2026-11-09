@@ -18,6 +18,7 @@ mod keykeeper_msp;
 mod keykeeper_msp_policies;
 mod keykeeper_msp_seats;
 mod keykeeper_msp_templates;
+pub mod keykeeper_new_device;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_password_change;
@@ -38,7 +39,7 @@ mod sends;
 pub use accounts::purge_auth_requests;
 pub use ciphers::{CipherData, CipherSyncData, CipherSyncType, purge_trashed_ciphers};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
-pub use events::{event_cleanup_job, log_event, log_user_event};
+pub use events::{event_cleanup_job, log_event, log_user_event, log_user_event_detail};
 // Keykeeper: an event destination sends only while its maker has access.
 pub use keykeeper_offboarding::destination_may_send;
 // Keykeeper: the daily reading of MSP clients' seats.
@@ -87,6 +88,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_msp_policies::routes());
     routes.append(&mut keykeeper_msp_seats::routes());
     routes.append(&mut keykeeper_msp_templates::routes());
+    routes.append(&mut keykeeper_new_device::routes());
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
     routes.append(&mut keykeeper_password_change::routes());
