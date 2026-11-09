@@ -19,6 +19,7 @@ mod keykeeper_msp_seats;
 mod keykeeper_msp_templates;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
+mod keykeeper_password_change;
 mod keykeeper_provisioning;
 mod keykeeper_reload_keys;
 pub mod keykeeper_scim;
@@ -87,6 +88,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_msp_templates::routes());
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
+    routes.append(&mut keykeeper_password_change::routes());
     routes.append(&mut keykeeper_provisioning::routes());
     routes.append(&mut keykeeper_reload_keys::routes());
     routes.append(&mut keykeeper_seals::routes());

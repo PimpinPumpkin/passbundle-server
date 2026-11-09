@@ -1188,8 +1188,8 @@ pub fn backoff(attempts: i32) -> TimeDelta {
 }
 
 /// What kind of thing an event is about, its name in words, and how much a
-/// security team should care, by upstream's event type codes. Codes 1190,
-/// 1191, 1590, 1591, and 1690 to 1698 are ours.
+/// security team should care, by upstream's event type codes. Codes 1190 to
+/// 1193, 1590, 1591, 1680, 1681, and 1690 to 1698 are ours.
 pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
     let (name, severity) = match code {
         1000 => ("Logged in", "low"),
@@ -1238,6 +1238,10 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         1132 => ("Showed a national ID number", "low"),
         1190 => ("Cleared an item's history", "medium"),
         1191 => ("Deleted a past version of an item", "medium"),
+        // Medium, above a plain edit: a shared password changed on its site,
+        // and the people who use it need the new one.
+        1192 => ("Changed an item's password on its website", "medium"),
+        1193 => ("Put back an item's earlier password after a password change", "medium"),
         1300 => ("Created a shared folder", "low"),
         1301 => ("Edited a shared folder", "low"),
         1302 => ("Deleted a shared folder", "medium"),
@@ -1269,6 +1273,9 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         1602 => ("Exported the organization's vault", "high"),
         1604 => ("Turned on single sign-on", "high"),
         1605 => ("Turned off single sign-on", "high"),
+        // Medium: it gives nobody more than their folders let them do by hand.
+        1680 => ("Turned on assisted password change", "medium"),
+        1681 => ("Turned off assisted password change", "medium"),
         1690 => ("Added a place events are sent", "high"),
         1691 => ("Changed a place events are sent", "high"),
         1692 => ("Removed a place events are sent", "high"),
@@ -1555,6 +1562,7 @@ fn msp_code(action: &str) -> (i32, &'static str, &'static str) {
         "client_everyone_two_step_set" => {
             (9193, "Changed whether everyone in a client must use two-step login", "high")
         }
+        "client_password_change_set" => (9194, "Changed whether a client allows assisted password change", "medium"),
         "admin_two_step_default_set" => {
             (9192, "Changed whether clients' admins must use two-step login by default", "high")
         }
@@ -1759,6 +1767,22 @@ mod tests {
             assert_eq!((c, s), (code, "high"), "{action}");
             assert_eq!(priority(c, s), KEPT, "{action}");
         }
+    }
+
+    #[test]
+    fn assisted_password_change_is_medium_and_never_merged() {
+        assert_eq!(describe(1192), ("item", "Changed an item's password on its website", "medium"));
+        assert_eq!(describe(1193), ("item", "Put back an item's earlier password after a password change", "medium"));
+        assert_eq!(describe(1680), ("organization", "Turned on assisted password change", "medium"));
+        assert_eq!(describe(1681), ("organization", "Turned off assisted password change", "medium"));
+        for code in [1192, 1193, 1680, 1681] {
+            // Each one is someone's change: never merged with another.
+            assert!(!merges(code), "{code}");
+        }
+        assert_eq!(
+            msp_code("client_password_change_set"),
+            (9194, "Changed whether a client allows assisted password change", "medium")
+        );
     }
 
     #[test]
