@@ -627,6 +627,9 @@ pub async fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult
 
 pub async fn send_new_device_logged_in(address: &str, ip: &str, dt: &NaiveDateTime, device: &Device) -> EmptyResult {
     let fmt = "%A, %B %_d, %Y at %r %Z";
+    // Keykeeper: roughly where it came from, from this server's own database
+    // file, and who to credit for it (DESIGN.md, "New-device check").
+    let (location, location_source, location_source_url) = location_fields(ip);
     let (subject, body_html, body_text) = get_text(
         "email/new_device_logged_in",
         json!({
@@ -636,9 +639,77 @@ pub async fn send_new_device_logged_in(address: &str, ip: &str, dt: &NaiveDateTi
             "device_name": upcase_first(&device.name),
             "device_type": DeviceType::from_i32(device.atype).to_string(),
             "datetime": crate::util::format_naive_datetime_local(dt, fmt),
+            "location": location,
+            "location_source": location_source,
+            "location_source_url": location_source_url,
         }),
     )?;
 
+    send_email(address, &subject, body_html, body_text).await
+}
+
+/// Keykeeper: where an address is, in words, and who to credit for it, for
+/// the new-device emails (crate::keykeeper_location).
+fn location_fields(ip: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let location = crate::keykeeper_location::describe(ip);
+    let source = location.as_ref().and(crate::keykeeper_location::attribution());
+    let name = source.as_ref().and_then(|s| s["name"].as_str().map(str::to_owned));
+    let url = source.as_ref().and_then(|s| s["url"].as_str().map(str::to_owned));
+    (location, name, url)
+}
+
+/// Keykeeper: the new-device check's emails (DESIGN.md, "New-device check"):
+/// a code to sign in with when no device can approve; that a sign-in was
+/// denied; and that someone asked for a code by email instead of approving
+/// it from a device. Each names the device, where it came from, and when.
+pub enum NewDeviceMail<'a> {
+    Code(&'a str),
+    Denied {
+        wrong_number: bool,
+    },
+    Waiting {
+        email_after: &'a NaiveDateTime,
+    },
+}
+
+pub async fn send_new_device_check(
+    address: &str,
+    mail: NewDeviceMail<'_>,
+    device: &str,
+    ip: &str,
+    dt: &NaiveDateTime,
+) -> EmptyResult {
+    let fmt = "%A, %B %_d, %Y at %r %Z";
+    let (location, location_source, location_source_url) = location_fields(ip);
+    let mut data = json!({
+        "url": CONFIG.domain(),
+        "img_src": CONFIG._smtp_img_src(),
+        "ip": ip,
+        "device": device,
+        "datetime": crate::util::format_naive_datetime_local(dt, fmt),
+        "location": location,
+        "location_source": location_source,
+        "location_source_url": location_source_url,
+    });
+    let template = match mail {
+        NewDeviceMail::Code(code) => {
+            data["code"] = json!(code);
+            "email/keykeeper_new_device_code"
+        }
+        NewDeviceMail::Denied {
+            wrong_number,
+        } => {
+            data["wrong_number"] = json!(wrong_number);
+            "email/keykeeper_new_device_denied"
+        }
+        NewDeviceMail::Waiting {
+            email_after,
+        } => {
+            data["email_after"] = json!(crate::util::format_naive_datetime_local(email_after, fmt));
+            "email/keykeeper_new_device_waiting"
+        }
+    };
+    let (subject, body_html, body_text) = get_text(template, data)?;
     send_email(address, &subject, body_html, body_text).await
 }
 

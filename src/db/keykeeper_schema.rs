@@ -620,6 +620,40 @@ table! {
 }
 
 table! {
+    new_device_checks (uuid) {
+        uuid -> Text,
+        user_uuid -> Text,
+        device_uuid -> Text,
+        device_type -> Integer,
+        device_name -> Text,
+        ip -> Text,
+        token_hash -> Text,
+        number -> Integer,
+        created_at -> Timestamp,
+        expires_at -> Timestamp,
+        approved_at -> Nullable<Timestamp>,
+        approved_how -> Nullable<Text>,
+        approved_by -> Nullable<Text>,
+        denied_at -> Nullable<Timestamp>,
+        denied_why -> Nullable<Text>,
+        email_after -> Nullable<Timestamp>,
+        code_hash -> Nullable<Text>,
+        code_sends -> Integer,
+        code_tries -> Integer,
+        used_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    known_device_tokens (user_uuid, device_uuid) {
+        user_uuid -> Text,
+        device_uuid -> Text,
+        token_hash -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
     org_member_health (org_uuid) {
         org_uuid -> Text,
         enabled -> Bool,

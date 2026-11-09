@@ -134,6 +134,49 @@ pub fn check_limit_auth_request_device(user: &UserId, device: &DeviceId) -> Resu
     }
 }
 
+// Keykeeper: the new-device check (DESIGN.md, "New-device check"). New
+// checks from one device of one account, five an hour, so signing in again
+// and again can't keep the account's other devices prompting; and the new
+// device's own status calls, every few seconds while it waits, by address,
+// apart from the shared unauthenticated allowance they'd use up.
+static LIMITER_NEW_DEVICE_CHECK: LazyLock<Limiter<AccountKey>> =
+    LazyLock::new(|| RateLimiter::keyed(Quota::per_hour(NonZeroU32::new(5).expect("five"))));
+static LIMITER_NEW_DEVICE_STATUS: LazyLock<Limiter> = LazyLock::new(|| {
+    RateLimiter::keyed(
+        Quota::per_second(NonZeroU32::new(2).expect("two")).allow_burst(NonZeroU32::new(60).expect("sixty")),
+    )
+});
+static NEW_DEVICE_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+pub fn check_limit_new_device_check(user: &UserId, device: &DeviceId) -> Result<(), Error> {
+    if NEW_DEVICE_CHECKS.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {
+        LIMITER_NEW_DEVICE_CHECK.retain_recent();
+        LIMITER_NEW_DEVICE_CHECK.shrink_to_fit();
+        LIMITER_NEW_DEVICE_STATUS.retain_recent();
+        LIMITER_NEW_DEVICE_STATUS.shrink_to_fit();
+    }
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(user.to_string().as_bytes());
+    ctx.update(&[0]);
+    ctx.update(device.to_string().as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(ctx.finish().as_ref());
+    match LIMITER_NEW_DEVICE_CHECK.check_key(&key) {
+        Ok(()) => Ok(()),
+        Err(_e) => {
+            err_code!("This device started too many sign-ins that need approval. Wait a while, then try again.", 429);
+        }
+    }
+}
+
+pub fn check_limit_new_device_status(ip: &IpAddr) -> Result<(), Error> {
+    if LIMITER_NEW_DEVICE_STATUS.check_key(&ip_key(ip)).is_ok() {
+        Ok(())
+    } else {
+        err_code!("Too many requests", 429);
+    }
+}
+
 static LIMITER_ADMIN: LazyLock<Limiter> = LazyLock::new(|| {
     let seconds = Duration::from_secs(u64::from(CONFIG.admin_ratelimit_seconds()));
     let burst = NonZeroU32::new(u32::from(CONFIG.admin_ratelimit_max_burst())).expect("Non-zero admin ratelimit burst");

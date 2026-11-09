@@ -51,6 +51,14 @@ impl SignInMethod {
         matches!(self.0, Some(AuthMethod::Password | AuthMethod::Sso))
     }
 
+    /// Whether the session may answer a new device's sign-in (DESIGN.md,
+    /// "New-device check"): one that began with the master password, single
+    /// sign-on, or a device's approval. Not an API key's, or one that doesn't
+    /// say. No key moves, so a session from an approval may answer too.
+    pub fn may_approve_new_device(&self) -> bool {
+        matches!(self.0, Some(AuthMethod::Password | AuthMethod::Sso | AuthMethod::AuthRequest))
+    }
+
     /// A session that signed in with the master password, for tests that
     /// call a route needing one.
     #[cfg(test)]
@@ -165,6 +173,17 @@ mod tests {
             assert!(!SignInMethod(Some(method)).proved_who_they_are());
         }
         assert!(!SignInMethod(None).proved_who_they_are());
+    }
+
+    #[test]
+    fn a_new_devices_sign_in_is_answered_by_a_signed_in_session_but_not_an_api_keys() {
+        for method in [AuthMethod::Password, AuthMethod::Sso, AuthMethod::AuthRequest] {
+            assert!(SignInMethod(Some(method)).may_approve_new_device());
+        }
+        for method in [AuthMethod::UserApiKey, AuthMethod::OrgApiKey] {
+            assert!(!SignInMethod(Some(method)).may_approve_new_device());
+        }
+        assert!(!SignInMethod(None).may_approve_new_device());
     }
 
     #[test]

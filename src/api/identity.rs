@@ -13,6 +13,8 @@ use crate::{
     CONFIG,
     // Keykeeper: signing in with a device's approval.
     api::core::keykeeper_device_approval,
+    // Keykeeper: the new-device check.
+    api::core::keykeeper_new_device,
     // Keykeeper: each organization's own single sign-on.
     api::core::keykeeper_sso,
     // Keykeeper: two-step login for admins.
@@ -603,6 +605,10 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
 
     let mut device = get_device(&data, conn, &user).await?;
 
+    // Keykeeper: whether the account has two-step login, before a recovery
+    // code can turn it off: that's a second step too.
+    let two_step_on = TwoFactor::find_by_user(&user.uuid, conn).await.iter().any(|tf| tf.enabled);
+
     let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
 
     // Keykeeper: the organizations' rules for a sign-in with a device's
@@ -613,6 +619,36 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     if data.auth_request.is_some() {
         keykeeper_device_approval::approved_sign_in_rules(&user, &device, conn).await?;
     }
+
+    // Keykeeper: the new-device check. An account without two-step login
+    // signing in with its password on a device it has never used waits
+    // until the person approves it from another of their devices (typing
+    // the number this one shows), or with a code by email. Before the
+    // linking and setup sessions below, so neither is reached with a
+    // password alone on a new device. A device that's in gets a token of its
+    // own, in two-step login's TwoFactorToken answer, which upstream's
+    // clients send back next time as the "remember" token. A device's
+    // approval comes only from a device that has signed in before, so it
+    // isn't asked. See keykeeper_new_device.
+    let device_token = if data.auth_request.is_none() {
+        keykeeper_new_device::check_sign_in(
+            keykeeper_new_device::SignIn {
+                user: &user,
+                device: &device,
+                ip: &ip.ip,
+                two_step_on,
+                remembered: data
+                    .two_factor_token
+                    .as_deref()
+                    .filter(|_| data.two_factor_provider == Some(TwoFactorType::Remember as i32)),
+                otp: data.new_device_otp.as_deref(),
+            },
+            conn,
+        )
+        .await?
+    } else {
+        None
+    };
 
     // Keykeeper: required to use single sign-on and not linked yet: their
     // password and two-step login checked out, so they get a linking session,
@@ -665,7 +701,7 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     };
     let auth_tokens = auth::AuthTokens::new(&device, &user, method, data.client_id);
 
-    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token.or(device_token), conn, ip).await
 }
 
 async fn authenticated_response(
@@ -1367,6 +1403,11 @@ struct ConnectData {
     two_factor_remember: Option<i32>,
     #[field(name = uncased("authrequest"))]
     auth_request: Option<AuthRequestId>,
+    // Keykeeper: upstream's field for its new device verification's code,
+    // which carries the new-device check's token once it's approved, or the
+    // code sent by email (keykeeper_new_device).
+    #[field(name = uncased("newdeviceotp"))]
+    new_device_otp: Option<String>,
 
     // Needed for authorization code
     #[field(name = uncased("code"))]

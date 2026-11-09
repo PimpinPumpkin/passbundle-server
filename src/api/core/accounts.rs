@@ -1636,7 +1636,9 @@ async fn rotate_api_key(data: Json<PasswordOrOtpData>, headers: Headers, conn: D
 #[get("/devices/knowndevice")]
 async fn get_known_device(device: KnownDevice, conn: DbConn) -> JsonResult {
     let result = if let Some(user) = User::find_by_mail(&device.email, &conn).await {
-        Device::find_by_uuid_and_user(&device.uuid, &user.uuid, &conn).await.is_some()
+        // Keykeeper: a device that has finished signing in, as asking for a
+        // device's approval needs (post_auth_request).
+        Device::find_by_uuid_and_user(&device.uuid, &user.uuid, &conn).await.is_some_and(|d| !d.is_new())
     } else {
         false
     };
@@ -1816,8 +1818,12 @@ async fn post_auth_request(
     };
 
     // Validate device uuid and type
+    // Keykeeper: and that it has finished signing in to the account before,
+    // not only reached the password: a sign-in the new-device check holds
+    // leaves a device that never finished, which mustn't turn to a device's
+    // approval instead (DESIGN.md, "New-device check").
     let device = match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &conn).await {
-        Some(device) if device.atype == client_headers.device_type => device,
+        Some(device) if device.atype == client_headers.device_type && !device.is_new() => device,
         _ => err!("AuthRequest doesn't exist", "Device verification failed"),
     };
 
