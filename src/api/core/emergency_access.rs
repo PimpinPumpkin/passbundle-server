@@ -975,3 +975,90 @@ pub async fn emergency_notification_reminder_job(pool: DbPool) {
         }
     }
 }
+
+// Keykeeper: the KDF settings an account can have (DESIGN.md, "KDF settings
+// an account can have").
+#[cfg(test)]
+mod keykeeper_tests {
+    use super::*;
+    use crate::{
+        auth::ClientIp,
+        db::models::{Device, DeviceId},
+    };
+
+    /// An account with this master password hash. The server's own rounds on
+    /// the hash (not the KDF) are fewer than its default, to keep the test quick.
+    async fn account(email: &str, hash: &str, conn: &DbConn) -> User {
+        let mut user = User::new(email, None);
+        user.password_iterations = 1_000;
+        user.set_password(hash, Some("2.key".to_owned()), false, None, conn).await.unwrap();
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    async fn headers(user_id: &UserId, conn: &DbConn) -> Headers {
+        Headers {
+            host: "https://127.0.0.1".to_owned(),
+            device: Device::new(DeviceId::from(format!("device-{user_id}")), user_id.clone(), "test".to_owned(), 9),
+            user: User::find_by_uuid(user_id, conn).await.unwrap(),
+            ip: ClientIp {
+                ip: "127.0.0.1".parse().unwrap(),
+            },
+        }
+    }
+
+    fn new_password(email: &str, iterations: i32) -> Json<EmergencyAccessPasswordData> {
+        let kdf = json!({"kdfType": 0, "iterations": iterations});
+        Json(
+            serde_json::from_value(json!({
+                "authenticationData": {"salt": email, "kdf": kdf, "masterPasswordAuthenticationHash": "new"},
+                "unlockData": {"salt": email, "kdf": kdf, "masterKeyWrappedUserKey": "2.new-key"}
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// A takeover sets the grantor's new master password with their KDF
+    /// settings: with 599,999 iterations it's refused with the shared check's
+    /// message and their password stays; with their 600,000 it's set.
+    #[rocket::async_test]
+    async fn a_takeover_password_needs_600000_iterations() {
+        let pool = DbPool::for_test_pool();
+        let conn = pool.get().await.unwrap();
+        let grantor = account("grantor@example.test", "hash", &conn).await;
+        let grantee = account("grantee@example.test", "grantee-hash", &conn).await;
+        let mut access = EmergencyAccess::new(
+            grantor.uuid.clone(),
+            grantee.email.clone(),
+            EmergencyAccessStatus::RecoveryApproved as i32,
+            EmergencyAccessType::Takeover as i32,
+            1,
+        );
+        access.grantee_uuid = Some(grantee.uuid.clone());
+        access.save(&conn).await.unwrap();
+
+        let refused = password_emergency_access(
+            access.uuid.clone(),
+            new_password(&grantor.email, 599_999),
+            headers(&grantee.uuid, &conn).await,
+            SignInMethod::master_password(),
+            conn,
+        )
+        .await;
+        assert_eq!(refused.unwrap_err().message(), "PBKDF2 needs at least 600,000 iterations.");
+        let conn = pool.get().await.unwrap();
+        assert!(User::find_by_uuid(&grantor.uuid, &conn).await.unwrap().check_valid_password("hash"));
+
+        password_emergency_access(
+            access.uuid.clone(),
+            new_password(&grantor.email, 600_000),
+            headers(&grantee.uuid, &conn).await,
+            SignInMethod::master_password(),
+            conn,
+        )
+        .await
+        .unwrap();
+        let conn = pool.get().await.unwrap();
+        assert!(User::find_by_uuid(&grantor.uuid, &conn).await.unwrap().check_valid_password("new"));
+    }
+}

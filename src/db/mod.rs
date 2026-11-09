@@ -237,6 +237,13 @@ impl DbPool {
     /// test's.
     #[cfg(all(test, sqlite))]
     pub async fn for_test() -> DbConn {
+        Self::for_test_pool().get().await.expect("a connection to the test's database")
+    }
+
+    /// Keykeeper: the same database as a pool, for a test that hands a
+    /// route its connection and then checks the rows with another.
+    #[cfg(all(test, sqlite))]
+    pub fn for_test_pool() -> DbPool {
         let path = std::env::temp_dir().join(format!("keykeeper-test-{}.sqlite3", crate::util::get_uuid()));
         let url = path.to_string_lossy().into_owned();
         sqlite_migrations::run_migrations(&url).expect("the migrations run");
@@ -248,11 +255,10 @@ impl DbPool {
             }))
             .build(DbConnManager::new(&url))
             .expect("a pool for the test's database");
-        let pool = DbPool {
+        DbPool {
             pool: Some(pool),
             semaphore: Arc::new(Semaphore::new(1)),
-        };
-        pool.get().await.expect("a connection to the test's database")
+        }
     }
 
     // Get a connection from the pool
