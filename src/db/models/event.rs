@@ -171,6 +171,12 @@ pub enum EventType {
     // are ours too.
     KeykeeperPasswordChangeOn = 1680,
     KeykeeperPasswordChangeOff = 1681,
+    // Keykeeper: the organization left the browsers' own card and address
+    // autofill as they are, turned them off, or turned them off and offered
+    // its people to bring theirs into PassBundle (keykeeper_browser_autofill).
+    KeykeeperBrowserAutofillUnchanged = 1682,
+    KeykeeperBrowserAutofillOff = 1683,
+    KeykeeperBrowserAutofillOffAndImport = 1684,
     // OrganizationVaultAccessed = 1603,
     // Keykeeper: the organization's single sign-on turned on or off.
     OrganizationEnabledSso = 1604,

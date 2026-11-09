@@ -553,6 +553,13 @@ table! {
 }
 
 table! {
+    org_browser_autofill (org_uuid) {
+        org_uuid -> Text,
+        mode -> Text,
+    }
+}
+
+table! {
     msp_staff_two_step (msp_uuid) {
         msp_uuid -> Text,
         required -> Bool,

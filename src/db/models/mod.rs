@@ -10,6 +10,7 @@ mod favorite;
 mod folder;
 mod group;
 // Keykeeper
+mod keykeeper_browser_autofill;
 mod keykeeper_cipher_versions;
 mod keykeeper_event_streaming;
 pub mod keykeeper_folder_permissions;
@@ -51,6 +52,7 @@ pub use self::event::{Event, EventType};
 pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
+pub use self::keykeeper_browser_autofill::{BrowserAutofillMode, OrgBrowserAutofill};
 pub use self::keykeeper_cipher_versions::{
     CipherVersion, History, ItemSave, MAX_ITEM_BYTES, MAX_PASSWORD_HISTORY, encrypted_size,
 };

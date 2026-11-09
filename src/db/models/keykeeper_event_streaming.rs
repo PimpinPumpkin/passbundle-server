@@ -1189,7 +1189,7 @@ pub fn backoff(attempts: i32) -> TimeDelta {
 
 /// What kind of thing an event is about, its name in words, and how much a
 /// security team should care, by upstream's event type codes. Codes 1190 to
-/// 1193, 1590, 1591, 1680, 1681, and 1690 to 1698 are ours.
+/// 1193, 1590, 1591, 1680 to 1684, and 1690 to 1698 are ours.
 pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
     let (name, severity) = match code {
         1000 => ("Logged in", "low"),
@@ -1276,6 +1276,10 @@ pub fn describe(code: i32) -> (&'static str, &'static str, &'static str) {
         // Medium: it gives nobody more than their folders let them do by hand.
         1680 => ("Turned on assisted password change", "medium"),
         1681 => ("Turned off assisted password change", "medium"),
+        // Medium: a browser feature, not who gets in or what they see.
+        1682 => ("Left the browsers' card and address autofill as they are", "medium"),
+        1683 => ("Turned off the browsers' card and address autofill", "medium"),
+        1684 => ("Turned off the browsers' card and address autofill, offering to bring them in", "medium"),
         1690 => ("Added a place events are sent", "high"),
         1691 => ("Changed a place events are sent", "high"),
         1692 => ("Removed a place events are sent", "high"),
@@ -1563,6 +1567,9 @@ fn msp_code(action: &str) -> (i32, &'static str, &'static str) {
             (9193, "Changed whether everyone in a client must use two-step login", "high")
         }
         "client_password_change_set" => (9194, "Changed whether a client allows assisted password change", "medium"),
+        "client_browser_autofill_set" => {
+            (9195, "Changed what a client does with the browsers' card and address autofill", "medium")
+        }
         "admin_two_step_default_set" => {
             (9192, "Changed whether clients' admins must use two-step login by default", "high")
         }
@@ -1782,6 +1789,26 @@ mod tests {
         assert_eq!(
             msp_code("client_password_change_set"),
             (9194, "Changed whether a client allows assisted password change", "medium")
+        );
+    }
+
+    #[test]
+    fn the_browsers_autofill_setting_is_medium_and_never_merged() {
+        assert_eq!(
+            describe(1682),
+            ("organization", "Left the browsers' card and address autofill as they are", "medium")
+        );
+        assert_eq!(describe(1683), ("organization", "Turned off the browsers' card and address autofill", "medium"));
+        assert_eq!(
+            describe(1684),
+            ("organization", "Turned off the browsers' card and address autofill, offering to bring them in", "medium")
+        );
+        for code in [1682, 1683, 1684] {
+            assert!(!merges(code), "{code}");
+        }
+        assert_eq!(
+            msp_code("client_browser_autofill_set"),
+            (9195, "Changed what a client does with the browsers' card and address autofill", "medium")
         );
     }
 

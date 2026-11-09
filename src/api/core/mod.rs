@@ -6,6 +6,7 @@ mod emergency_access;
 mod events;
 mod folders;
 // Keykeeper
+pub mod keykeeper_browser_autofill;
 mod keykeeper_cipher_history;
 pub mod keykeeper_device_approval;
 mod keykeeper_enrollment;
@@ -89,6 +90,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
     routes.append(&mut keykeeper_password_change::routes());
+    routes.append(&mut keykeeper_browser_autofill::routes());
     routes.append(&mut keykeeper_provisioning::routes());
     routes.append(&mut keykeeper_reload_keys::routes());
     routes.append(&mut keykeeper_seals::routes());
