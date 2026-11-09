@@ -1,8 +1,9 @@
 // Keykeeper: how healthy each person's own passwords are, in numbers only. A
 // member's apps count the logins in their Personal items (how many, how many
-// weak, reused, and exposed) and send just those numbers; their
-// organizations' owners and admins see them, never which items. Counts
-// aren't vault contents, so they're kept as they are. See DESIGN.md,
+// weak, reused, and exposed) and send just those numbers; the owners and
+// admins of their organizations that have "Members' own passwords" on see
+// them, never which items. Counts aren't vault contents, so they're kept as
+// they are, and only while such an organization sees them. See DESIGN.md,
 // "Members' own passwords".
 
 use chrono::{NaiveDateTime, Utc};
@@ -11,14 +12,15 @@ use diesel::prelude::*;
 use std::collections::HashSet;
 
 use crate::{
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
-        keykeeper_schema::{keykeeper_member_health, msp_memberships},
+        keykeeper_schema::{keykeeper_member_health, msp_memberships, org_member_health},
     },
     error::MapResult,
 };
 
-use super::{MembershipId, UserId};
+use super::{Membership, MembershipId, OrganizationId, UserId};
 
 /// The most logins a report may count: more than any vault holds.
 pub const MAX_LOGINS: i32 = 100_000;
@@ -131,6 +133,94 @@ impl MemberHealth {
                 other => other,
             }
             .map_res("Error saving your numbers")
+        })
+        .await
+    }
+
+    /// The organizations whose owners and admins see this person's numbers:
+    /// those they're a confirmed member of, not through an MSP (a client sees
+    /// nothing about its MSP's people), that have "Members' own passwords"
+    /// on. Their apps send the numbers only while there's one, and the server
+    /// keeps them only then.
+    pub async fn seen_by(user: &UserId, conn: &DbConn) -> ApiResult<Vec<OrganizationId>> {
+        let confirmed = Membership::find_confirmed_by_user(user, conn).await;
+        let from_msp = msp_memberships_among(confirmed.iter().map(|m| m.uuid.clone()).collect(), conn).await?;
+        let orgs = confirmed.into_iter().filter(|m| !from_msp.contains(&m.uuid)).map(|m| m.org_uuid).collect();
+        OrgMemberHealth::enabled_among(orgs, conn).await
+    }
+
+    /// Deletes someone's numbers.
+    pub async fn delete_for_user(user: &UserId, conn: &DbConn) -> EmptyResult {
+        let user = user.clone();
+        conn.run(move |conn| {
+            diesel::delete(keykeeper_member_health::table.filter(keykeeper_member_health::user_uuid.eq(user)))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error deleting your numbers")
+        })
+        .await
+    }
+
+    /// Deletes someone's numbers once no organization sees them: when the
+    /// last one that has it on turns it off, or they leave it, are removed,
+    /// or are revoked there. True when they were deleted, or there were none.
+    pub async fn forget_unless_seen(user: &UserId, conn: &DbConn) -> ApiResult<bool> {
+        if !Self::seen_by(user, conn).await?.is_empty() {
+            return Ok(false);
+        }
+        Self::delete_for_user(user, conn).await?;
+        Ok(true)
+    }
+}
+
+/// An organization's "Members' own passwords": whether its owners and admins
+/// see how many of its members' own passwords are weak, reused, or exposed.
+/// Without a row they don't, so an organization made the upstream way (a
+/// family or a group) has it off; the Business preset and an MSP's default
+/// policies turn it on.
+#[derive(Identifiable, Queryable, Insertable)]
+#[diesel(table_name = org_member_health)]
+#[diesel(primary_key(org_uuid))]
+pub struct OrgMemberHealth {
+    pub org_uuid: OrganizationId,
+    pub enabled: bool,
+}
+
+impl OrgMemberHealth {
+    /// Whether the organization has it on. Without a row, it doesn't.
+    pub async fn enabled(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
+        Ok(!Self::enabled_among(vec![org_uuid.clone()], conn).await?.is_empty())
+    }
+
+    /// Which of these organizations have it on.
+    pub async fn enabled_among(orgs: Vec<OrganizationId>, conn: &DbConn) -> ApiResult<Vec<OrganizationId>> {
+        if orgs.is_empty() {
+            return Ok(Vec::new());
+        }
+        conn.run(move |conn| {
+            org_member_health::table
+                .filter(org_member_health::org_uuid.eq_any(orgs))
+                .filter(org_member_health::enabled.eq(true))
+                .select(org_member_health::org_uuid)
+                .load::<OrganizationId>(conn)
+                .map_res("Error reading organizations' Members' own passwords setting")
+        })
+        .await
+    }
+
+    pub async fn set(org_uuid: &OrganizationId, enabled: bool, conn: &DbConn) -> EmptyResult {
+        let row = Self {
+            org_uuid: org_uuid.clone(),
+            enabled,
+        };
+        conn.run(move |conn| {
+            conn.transaction(|conn| {
+                diesel::delete(org_member_health::table.filter(org_member_health::org_uuid.eq(&row.org_uuid)))
+                    .execute(conn)?;
+                diesel::insert_into(org_member_health::table).values(&row).execute(conn)
+            })
+            .map(|_| ())
+            .map_res("Error saving an organization's Members' own passwords setting")
         })
         .await
     }
