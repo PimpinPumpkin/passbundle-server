@@ -19,6 +19,7 @@ mod keykeeper_msp_seats;
 mod keykeeper_msp_templates;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
+mod keykeeper_password_change;
 mod keykeeper_provisioning;
 mod keykeeper_reload_keys;
 pub mod keykeeper_scim;
@@ -87,6 +88,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_msp_templates::routes());
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
+    routes.append(&mut keykeeper_password_change::routes());
     routes.append(&mut keykeeper_provisioning::routes());
     routes.append(&mut keykeeper_reload_keys::routes());
     routes.append(&mut keykeeper_seals::routes());
@@ -271,6 +273,8 @@ fn config() -> Json<Value> {
         &FeatureFlagFilter::ValidOnly,
     );
     feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
+    // Keykeeper: no Fill Assist rules feed (the default) means Fill Assist is off.
+    crate::config::fill_assist_flag_for_clients(&CONFIG.fill_assist_rules_url(), &mut feature_states);
 
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
@@ -299,6 +303,7 @@ fn config() -> Json<Value> {
           "notifications": format!("{domain}/notifications"),
           "sso": "",
           "cloudRegion": null,
+          // Keykeeper: empty unless the operator sets a feed.
           "fillAssistRules": CONFIG.fill_assist_rules_url(),
         },
         // Bitwarden uses this for the self-hosted servers to indicate the default push technology

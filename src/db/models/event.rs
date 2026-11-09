@@ -91,6 +91,14 @@ pub enum EventType {
     // (keykeeper_cipher_versions). Upstream's cipher events end at 1133.
     KeykeeperCipherHistoryCleared = 1190,
     KeykeeperCipherVersionDeleted = 1191,
+    // Keykeeper: an assisted password change saved a new password to an
+    // organization's item before submitting it on the item's site, and
+    // someone put an item's earlier password back after one (DESIGN.md,
+    // "Assisted password change"). The extension sends them; the server
+    // takes them only for an item the sender can edit and see the password
+    // of, in an organization that allows it (keykeeper_password_change).
+    KeykeeperCipherPasswordChanged = 1192,
+    KeykeeperCipherPasswordPutBack = 1193,
 
     // Collection
     CollectionCreated = 1300,
@@ -163,6 +171,11 @@ pub enum EventType {
     // to its admins only (DESIGN.md, "Two-step login for everyone").
     KeykeeperEveryoneTwoStepOn = 1697,
     KeykeeperEveryoneTwoStepOff = 1698,
+    // Keykeeper: the organization allowed assisted password change on its
+    // items again, or turned it off (keykeeper_password_change). 1680 and up
+    // are ours too.
+    KeykeeperPasswordChangeOn = 1680,
+    KeykeeperPasswordChangeOff = 1681,
     // OrganizationVaultAccessed = 1603,
     // Keykeeper: the organization's single sign-on turned on or off.
     OrganizationEnabledSso = 1604,

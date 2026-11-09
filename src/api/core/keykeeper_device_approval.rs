@@ -50,6 +50,13 @@ impl SignInMethod {
     pub fn proved_who_they_are(&self) -> bool {
         matches!(self.0, Some(AuthMethod::Password | AuthMethod::Sso))
     }
+
+    /// A session that signed in with the master password, for tests that
+    /// call a route needing one.
+    #[cfg(test)]
+    pub fn master_password() -> Self {
+        Self(Some(AuthMethod::Password))
+    }
 }
 
 #[rocket::async_trait]
