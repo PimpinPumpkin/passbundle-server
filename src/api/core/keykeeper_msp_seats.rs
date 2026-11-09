@@ -8,12 +8,13 @@
 // The server records each client's seats once a day (the MSP_SEATS_SCHEDULE
 // job; a reading counts for the UTC day it's taken on, and a later reading
 // the same day replaces it), and counts today's live, as a reading taken now.
-// For a month, each
-// client gets its most seats on any day and its average over the days
-// recorded for the MSP that month, a day it wasn't a client counting as none,
-// so the column adds up to the total. This month's figures count today as it
-// is now. MSP admins only; everyone else gets "not found", never 403, which
-// would sign the web vault out. See DESIGN.md, "Seats by client".
+// Seats are billed by the day: a seat counts for each day it's there at that
+// day's reading. For a month (in UTC), each client gets its seat-days (its
+// seats on each day, added up), its prorated seats (seat-days divided by the
+// days in the month, to two decimals), and its peak (most seats on any day),
+// for reference. This month counts through today, as it is now. MSP admins
+// only; everyone else gets "not found", never 403, which would sign the web
+// vault out. See DESIGN.md, "Seats by client".
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -98,6 +99,16 @@ fn next_month(first: NaiveDate) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(first)
 }
 
+/// The month's last day.
+fn last_of_month(first: NaiveDate) -> NaiveDate {
+    next_month(first).pred_opt().unwrap_or(first)
+}
+
+/// 28 to 31: what a month's seat-days are divided by.
+fn days_in_month(first: NaiveDate) -> i64 {
+    (last_of_month(first) - first).num_days() + 1
+}
+
 /// `YYYY-MM`, and nothing else.
 fn parse_month(text: &str) -> Option<NaiveDate> {
     let bytes = text.as_bytes();
@@ -152,9 +163,10 @@ struct Line {
     name: String,
     /// Whether it's a client now.
     current: bool,
+    /// Its seats on each day the month counts, added up: what it's billed on.
+    seat_days: i64,
+    /// Its most seats on any day, for reference.
     most: i64,
-    /// The seats on each day the month counts, added up.
-    sum: i64,
     /// This month only, and only for a client now.
     today: Option<i64>,
 }
@@ -162,19 +174,20 @@ struct Line {
 /// A month's seats, by client.
 #[derive(Debug, PartialEq, Eq)]
 struct Summary {
-    /// The days the figures cover: those recorded for the MSP, and today in
-    /// this month while it has clients.
-    days: i64,
+    /// 28 to 31: what seat-days are divided by, even while the month runs.
+    days_in_month: i64,
+    /// The last day counted: today in this month, the month's last day before.
+    through: NaiveDate,
     lines: Vec<Line>,
 }
 
 impl Summary {
-    fn most(&self) -> i64 {
-        self.lines.iter().map(|l| l.most).sum()
+    fn seat_days(&self) -> i64 {
+        self.lines.iter().map(|l| l.seat_days).sum()
     }
 
-    fn sum(&self) -> i64 {
-        self.lines.iter().map(|l| l.sum).sum()
+    fn most(&self) -> i64 {
+        self.lines.iter().map(|l| l.most).sum()
     }
 
     fn today(&self) -> Option<i64> {
@@ -182,45 +195,71 @@ impl Summary {
         todays.peek()?;
         Some(todays.sum())
     }
-}
 
-/// An average in tenths, rounded half up: `sum / days`, to one decimal.
-fn tenths(sum: i64, days: i64) -> i64 {
-    if days <= 0 {
-        0
-    } else {
-        (20 * sum + days) / (2 * days)
+    /// Prorated seats in hundredths: seat-days over the days in the month.
+    fn prorated(&self, seat_days: i64) -> i64 {
+        hundredths(seat_days, self.days_in_month)
     }
 }
 
-/// `4.7` for 47 tenths.
-fn tenths_text(tenths: i64) -> String {
-    format!("{}.{}", tenths / 10, tenths % 10)
+/// `sum / days` in hundredths, rounded half up: to two decimals.
+fn hundredths(sum: i64, days: i64) -> i64 {
+    if days <= 0 {
+        0
+    } else {
+        (200 * sum + days) / (2 * days)
+    }
 }
 
-fn tenths_value(tenths: i64) -> Value {
-    // Exact for any count of seats a client has: tenths below 2^53.
-    #[expect(clippy::cast_precision_loss, reason = "tenths of a seat count stay far below 2^53")]
-    let value = tenths as f64 / 10.0;
+/// `10.37` for 1037 hundredths.
+fn hundredths_text(hundredths: i64) -> String {
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+fn hundredths_value(hundredths: i64) -> Value {
+    // The nearest double to two decimals, which JSON writes as those two
+    // decimals, for any count of seats a client has.
+    #[expect(clippy::cast_precision_loss, reason = "hundredths of seat-days stay far below 2^53")]
+    let value = hundredths as f64 / 100.0;
     json!(value)
 }
 
-/// A month's lines from what the server recorded (`rows`) and the clients
-/// now (`now`). `today` is today's date when the month is this month: a
-/// client now then counts today as it is now, in place of a reading already
-/// taken today, while one that left since keeps that reading.
-fn summarize(rows: &[ClientSeats], now: &[Reading], today: Option<&str>) -> Summary {
+/// Where a day's seats come from.
+enum Source {
+    /// The day's reading: a client without one wasn't a client that day.
+    Reading(String),
+    /// No reading that day (the server was down at that time): each client
+    /// counts the lower of its readings on the closest days either side.
+    Between(String, String),
+    /// No reading that day, and none before or after it that month.
+    Nothing,
+}
+
+/// A month's lines from what the server recorded for the MSP (`rows`) and
+/// its clients now (`now`). `today` is today's date when the month is this
+/// month: a client now then counts today as it is now, in place of a reading
+/// already taken today, while one that left since keeps that reading, and
+/// the month counts through today.
+fn summarize(first: NaiveDate, rows: &[ClientSeats], now: &[Reading], today: Option<NaiveDate>) -> Summary {
     struct Client {
         id: OrganizationId,
         name: String,
         name_day: String,
         days: BTreeMap<String, i64>,
     }
+    let through = today.unwrap_or_else(|| last_of_month(first));
+    let (first_text, through_text) = (day_text(first), day_text(through));
+    let today_text = today.map(day_text);
     // By the organization's id.
     let mut clients: BTreeMap<String, Client> = BTreeMap::new();
-    let mut days: BTreeSet<String> = BTreeSet::new();
-    for row in rows {
-        days.insert(row.day.clone());
+    // The days with a reading. The job reads every client of an MSP at once,
+    // so a day with none was missed, or had no clients. Only a client with
+    // readings on both sides counts on it, and it never left in between: a
+    // client that leaves its MSP can't be added back (add client always makes
+    // a new organization).
+    let mut read: BTreeSet<String> = BTreeSet::new();
+    for row in rows.iter().filter(|r| r.day >= first_text && r.day <= through_text) {
+        read.insert(row.day.clone());
         let client = clients.entry(row.org_uuid.to_string()).or_insert_with(|| Client {
             id: row.org_uuid.clone(),
             name: row.org_name.clone(),
@@ -233,29 +272,52 @@ fn summarize(rows: &[ClientSeats], now: &[Reading], today: Option<&str>) -> Summ
         }
         client.days.insert(row.day.clone(), i64::from(row.seats));
     }
-    if let Some(today) = today {
+    if let Some(today) = &today_text {
+        read.insert(today.clone());
         for reading in now {
-            days.insert(today.to_owned());
             let client = clients.entry(reading.org.to_string()).or_insert_with(|| Client {
                 id: reading.org.clone(),
                 name: reading.name.clone(),
-                name_day: today.to_owned(),
+                name_day: today.clone(),
                 days: BTreeMap::new(),
             });
             client.name.clone_from(&reading.name);
-            today.clone_into(&mut client.name_day);
-            client.days.insert(today.to_owned(), reading.seats);
+            client.name_day.clone_from(today);
+            client.days.insert(today.clone(), reading.seats);
         }
     }
+    let sources: Vec<Source> = first
+        .iter_days()
+        .take_while(|day| *day <= through)
+        .map(|day| {
+            let day = day_text(day);
+            if read.contains(&day) {
+                return Source::Reading(day);
+            }
+            match (read.range(..day.clone()).next_back(), read.range(day..).next()) {
+                (Some(before), Some(after)) => Source::Between(before.clone(), after.clone()),
+                _ => Source::Nothing,
+            }
+        })
+        .collect();
     let current: HashSet<&OrganizationId> = now.iter().map(|r| &r.org).collect();
     let mut lines: Vec<Line> = clients
         .into_values()
         .map(|client| {
+            let on = |day: &String| client.days.get(day).copied().unwrap_or(0);
+            let seat_days = sources
+                .iter()
+                .map(|source| match source {
+                    Source::Reading(day) => on(day),
+                    Source::Between(before, after) => on(before).min(on(after)),
+                    Source::Nothing => 0,
+                })
+                .sum();
             let is_current = current.contains(&client.id);
             Line {
+                seat_days,
                 most: client.days.values().copied().max().unwrap_or(0),
-                sum: client.days.values().sum(),
-                today: today.filter(|_| is_current).and_then(|t| client.days.get(t).copied()),
+                today: today_text.as_ref().filter(|_| is_current).and_then(|t| client.days.get(t).copied()),
                 current: is_current,
                 name: client.name,
                 id: client.id,
@@ -264,7 +326,8 @@ fn summarize(rows: &[ClientSeats], now: &[Reading], today: Option<&str>) -> Summ
         .collect();
     lines.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| (*a.id).cmp(&*b.id)));
     Summary {
-        days: i64::try_from(days.len()).unwrap_or(i64::MAX),
+        days_in_month: days_in_month(first),
+        through,
         lines,
     }
 }
@@ -285,26 +348,32 @@ fn csv_field(text: &str) -> String {
 }
 
 /// The month as CSV, with a byte order mark so spreadsheets read names with
-/// accents right. Today's column is empty for earlier months.
+/// accents right. Each line has what its prorated seats come from (seat-days
+/// and the days in the month) and the last day counted, so a file saved
+/// partway through a month says so. Today's column is empty for earlier
+/// months.
 fn csv(month: &str, summary: &Summary) -> String {
-    let days = summary.days;
+    let through = day_text(summary.through);
+    let days = summary.days_in_month;
     let today = |t: Option<i64>| t.map(|n| n.to_string()).unwrap_or_default();
-    let mut out = String::from("\u{feff}Month,Client,Most on any day,Average,Today\r\n");
+    let mut out = String::from("\u{feff}Month,Through,Client,Seat-days,Days in month,Prorated seats,Peak,Today\r\n");
     for line in &summary.lines {
         let _ = write!(
             out,
-            "{month},{},{},{},{}\r\n",
+            "{month},{through},{},{},{days},{},{},{}\r\n",
             csv_field(&line.name),
+            line.seat_days,
+            hundredths_text(summary.prorated(line.seat_days)),
             line.most,
-            tenths_text(tenths(line.sum, days)),
             today(line.today),
         );
     }
     let _ = write!(
         out,
-        "{month},Total,{},{},{}\r\n",
+        "{month},{through},Total,{},{days},{},{},{}\r\n",
+        summary.seat_days(),
+        hundredths_text(summary.prorated(summary.seat_days())),
         summary.most(),
-        tenths_text(tenths(summary.sum(), days)),
         today(summary.today()),
     );
     out
@@ -331,8 +400,9 @@ enum SeatsAnswer {
     Csv(Csv),
 }
 
-/// A month's seats by client: each client's most on any day, its average
-/// (one decimal), and today's (this month only), with totals, and the months
+/// A month's seats by client: each client's seat-days, its prorated seats
+/// (seat-days over the days in the month, two decimals), its peak (most on
+/// any day), and today's (this month only), with totals, and the months
 /// there are figures for. `format=csv` gives the same as a CSV file.
 #[get("/keykeeper/msp/<msp_id>/seats?<month>&<format>")]
 async fn seats(
@@ -367,8 +437,7 @@ async fn seats(
 
     let rows = ClientSeats::find_between(&msp_id, &day_text(first), &day_text(next_month(first)), &conn).await?;
     let now = read_now(&msp_id, &conn).await?;
-    let today_text = day_text(today);
-    let summary = summarize(&rows, &now, is_this_month.then_some(today_text.as_str()));
+    let summary = summarize(first, &rows, &now, is_this_month.then_some(today));
     let month_name = month_text(first);
 
     if as_csv {
@@ -387,7 +456,7 @@ async fn seats(
         .collect();
     months.insert(this_month_text);
 
-    let days = summary.days;
+    let prorated = |seat_days| hundredths_value(summary.prorated(seat_days));
     let clients: Vec<Value> = summary
         .lines
         .iter()
@@ -396,8 +465,9 @@ async fn seats(
                 "id": line.id,
                 "name": line.name,
                 "current": line.current,
+                "seatDays": line.seat_days,
+                "prorated": prorated(line.seat_days),
                 "most": line.most,
-                "average": tenths_value(tenths(line.sum, days)),
                 "today": line.today,
             })
         })
@@ -406,11 +476,13 @@ async fn seats(
         "month": month_name,
         "thisMonth": is_this_month,
         "months": months.into_iter().rev().collect::<Vec<_>>(),
-        "days": days,
+        "daysInMonth": summary.days_in_month,
+        "through": day_text(summary.through),
         "clients": clients,
         "totals": {
+            "seatDays": summary.seat_days(),
+            "prorated": prorated(summary.seat_days()),
             "most": summary.most(),
-            "average": tenths_value(tenths(summary.sum(), days)),
             "today": if is_this_month { Some(summary.today().unwrap_or(0)) } else { None },
         },
     }))))
@@ -430,6 +502,11 @@ mod tests {
         }
     }
 
+    /// A client's readings on days `from` to `to` of `month` (`YYYY-MM`).
+    fn readings(org: &str, month: &str, from: u32, to: u32, seats: i32, name: &str) -> Vec<ClientSeats> {
+        (from..=to).map(|d| row(org, &format!("{month}-{d:02}"), seats, name)).collect()
+    }
+
     fn now(org: &str, name: &str, seats: i64) -> Reading {
         Reading {
             org: OrganizationId::from(org.to_owned()),
@@ -438,21 +515,119 @@ mod tests {
         }
     }
 
-    #[test]
-    fn averages_round_half_up_to_one_decimal() {
-        assert_eq!(tenths(14, 3), 47); // 4.666…
-        assert_eq!(tenths(2, 3), 7); // 0.666…
-        assert_eq!(tenths(1, 4), 3); // 0.25
-        assert_eq!(tenths(12, 3), 40);
-        assert_eq!(tenths(5, 0), 0);
-        assert_eq!(tenths_text(47), "4.7");
-        assert_eq!(tenths_text(40), "4.0");
-        assert_eq!(tenths_text(3), "0.3");
-        assert_eq!(tenths_value(47), json!(4.7));
+    fn month(text: &str) -> NaiveDate {
+        parse_month(text).unwrap()
+    }
+
+    fn day(text: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+    }
+
+    /// A line as the report shows it: name, seat-days, prorated seats, peak,
+    /// today, and whether it's a client now.
+    type Figures<'a> = (&'a str, i64, String, i64, Option<i64>, bool);
+
+    fn figures(summary: &Summary) -> Vec<Figures<'_>> {
+        summary
+            .lines
+            .iter()
+            .map(|l| {
+                let prorated = hundredths_text(summary.prorated(l.seat_days));
+                (l.name.as_str(), l.seat_days, prorated, l.most, l.today, l.current)
+            })
+            .collect()
     }
 
     #[test]
-    fn a_past_month_has_each_clients_most_and_average_over_the_msps_days() {
+    fn months_have_their_own_number_of_days_and_leap_februaries_29() {
+        assert_eq!(days_in_month(month("2026-02")), 28);
+        assert_eq!(days_in_month(month("2028-02")), 29);
+        assert_eq!(days_in_month(month("2000-02")), 29);
+        assert_eq!(days_in_month(month("2100-02")), 28);
+        assert_eq!(days_in_month(month("2026-04")), 30);
+        assert_eq!(days_in_month(month("2026-11")), 30);
+        assert_eq!(days_in_month(month("2026-12")), 31);
+        assert_eq!(days_in_month(month("2027-01")), 31);
+        assert_eq!(last_of_month(month("2026-12")), day("2026-12-31"));
+        assert_eq!(last_of_month(month("2028-02")), day("2028-02-29"));
+    }
+
+    #[test]
+    fn prorated_seats_round_half_up_to_two_decimals() {
+        assert_eq!(hundredths(311, 30), 1037); // 10.366…
+        assert_eq!(hundredths(1, 3), 33);
+        assert_eq!(hundredths(2, 3), 67);
+        assert_eq!(hundredths(1, 8), 13); // 0.125
+        assert_eq!(hundredths(60, 30), 200);
+        assert_eq!(hundredths(5, 0), 0);
+        assert_eq!(hundredths_text(1037), "10.37");
+        assert_eq!(hundredths_text(200), "2.00");
+        assert_eq!(hundredths_text(7), "0.07");
+        assert_eq!(hundredths_value(1037), json!(10.37));
+        // JSON never writes more than the two decimals.
+        for h in 0..=200_000 {
+            let text = hundredths_value(h).to_string();
+            assert!(text.split('.').nth(1).is_none_or(|d| d.len() <= 2), "{h}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_seat_added_on_the_20th_of_a_30_day_month_pays_11_30ths() {
+        // November 2026: ten seats, and an eleventh from the 20th.
+        let mut rows = readings("a", "2026-11", 1, 19, 10, "Acme");
+        rows.extend(readings("a", "2026-11", 20, 30, 11, "Acme"));
+        let summary = summarize(month("2026-11"), &rows, &[now("a", "Acme", 11)], None);
+        assert_eq!(summary.days_in_month, 30);
+        assert_eq!(summary.through, day("2026-11-30"));
+        // 19 × 10 + 11 × 11 = 311 seat-days: ten seats, and 11/30 of one.
+        assert_eq!(figures(&summary), vec![("Acme", 311, "10.37".to_owned(), 11, None, true)]);
+    }
+
+    #[test]
+    fn a_seat_removed_mid_month_stops_counting_on_its_day_in_a_31_day_month() {
+        // December 2026: five seats, one removed on the 16th, before its reading.
+        let mut rows = readings("a", "2026-12", 1, 15, 5, "Acme");
+        rows.extend(readings("a", "2026-12", 16, 31, 4, "Acme"));
+        let summary = summarize(month("2026-12"), &rows, &[], None);
+        assert_eq!(summary.days_in_month, 31);
+        // 15 × 5 + 16 × 4 = 139 seat-days over 31 days.
+        assert_eq!(figures(&summary), vec![("Acme", 139, "4.48".to_owned(), 5, None, false)]);
+    }
+
+    #[test]
+    fn a_client_added_mid_month_counts_from_its_first_day_in_a_28_day_month() {
+        // February 2026: Acme all month, Bolt from the 15th.
+        let mut rows = readings("a", "2026-02", 1, 28, 2, "Acme");
+        rows.extend(readings("b", "2026-02", 15, 28, 3, "Bolt"));
+        let summary = summarize(month("2026-02"), &rows, &[], None);
+        assert_eq!(summary.days_in_month, 28);
+        assert_eq!(
+            figures(&summary),
+            vec![("Acme", 56, "2.00".to_owned(), 2, None, false), ("Bolt", 42, "1.50".to_owned(), 3, None, false)]
+        );
+        assert_eq!(summary.seat_days(), 98);
+        assert_eq!(summary.prorated(summary.seat_days()), 350);
+        // The peaks added up, for reference.
+        assert_eq!(summary.most(), 5);
+    }
+
+    #[test]
+    fn a_leap_february_divides_by_29() {
+        // February 2028: two seats, and a third on the 29th only.
+        let mut rows = readings("a", "2028-02", 1, 28, 2, "Acme");
+        rows.push(row("a", "2028-02-29", 3, "Acme"));
+        let summary = summarize(month("2028-02"), &rows, &[], None);
+        assert_eq!(summary.days_in_month, 29);
+        assert_eq!(summary.through, day("2028-02-29"));
+        // 28 × 2 + 3 = 59 seat-days, and 59 / 29 = 2.034…
+        assert_eq!(figures(&summary), vec![("Acme", 59, "2.03".to_owned(), 3, None, false)]);
+        // The same seats every day are exactly those seats.
+        let summary = summarize(month("2028-02"), &readings("a", "2028-02", 1, 29, 4, "Acme"), &[], None);
+        assert_eq!(figures(&summary), vec![("Acme", 116, "4.00".to_owned(), 4, None, false)]);
+    }
+
+    #[test]
+    fn a_past_month_names_each_client_as_on_its_last_day_and_one_that_left_keeps_its_days() {
         let rows = [
             row("a", "2026-10-01", 3, "Acme"),
             row("a", "2026-10-02", 5, "Acme"),
@@ -460,8 +635,7 @@ mod tests {
             // Left after one day: its other days count as none.
             row("b", "2026-10-01", 2, "Bolt"),
         ];
-        let summary = summarize(&rows, &[now("a", "Acme Dental Group", 9)], None);
-        assert_eq!(summary.days, 3);
+        let summary = summarize(month("2026-10"), &rows, &[now("a", "Acme Dental Group", 9)], None);
         assert_eq!(
             summary.lines,
             vec![
@@ -470,56 +644,96 @@ mod tests {
                     // The name on its last day that month, not today's.
                     name: "Acme Dental".to_owned(),
                     current: true,
+                    seat_days: 12,
                     most: 5,
-                    sum: 12,
                     today: None,
                 },
                 Line {
                     id: OrganizationId::from("b".to_owned()),
                     name: "Bolt".to_owned(),
                     current: false,
+                    seat_days: 2,
                     most: 2,
-                    sum: 2,
                     today: None,
                 },
             ]
         );
-        assert_eq!(tenths(summary.lines[0].sum, summary.days), 40);
-        assert_eq!(tenths(summary.lines[1].sum, summary.days), 7);
+        // Over October's 31 days, the days after the last reading counting
+        // as none.
+        assert_eq!(summary.days_in_month, 31);
+        assert_eq!(summary.prorated(12), 39);
+        assert_eq!(summary.prorated(2), 6);
+        assert_eq!(summary.seat_days(), 14);
+        assert_eq!(summary.prorated(summary.seat_days()), 45);
         assert_eq!(summary.most(), 7);
-        assert_eq!(tenths(summary.sum(), summary.days), 47);
         assert_eq!(summary.today(), None);
     }
 
     #[test]
-    fn this_month_counts_today_as_it_is_now() {
-        let rows = [
-            row("a", "2026-11-01", 3, "Acme"),
-            // Taken earlier today: today counts as it is now instead.
-            row("a", "2026-11-02", 1, "Acme"),
-            row("gone", "2026-11-01", 4, "Gone Ltd"),
-            // Left after this morning's reading, which stays.
-            row("gone", "2026-11-02", 5, "Gone Ltd"),
-        ];
-        let summary = summarize(&rows, &[now("a", "Acme 2", 6), now("new", "New Co", 2)], Some("2026-11-02"));
-        assert_eq!(summary.days, 2);
-        let names: Vec<_> =
-            summary.lines.iter().map(|l| (l.name.as_str(), l.most, l.sum, l.today, l.current)).collect();
+    fn a_day_with_no_reading_counts_the_lower_of_the_days_either_side() {
+        // November 2026: the server missed the 10th and 11th, and the 29th
+        // and 30th.
+        let mut rows = readings("a", "2026-11", 1, 9, 4, "Acme");
+        rows.extend(readings("a", "2026-11", 12, 28, 6, "Acme"));
+        // Bolt left before the 12th's reading, and Cara joined by it.
+        rows.extend(readings("b", "2026-11", 1, 9, 3, "Bolt"));
+        rows.extend(readings("c", "2026-11", 12, 28, 1, "Cara"));
+        let summary = summarize(month("2026-11"), &rows, &[], None);
         assert_eq!(
-            names,
-            vec![("Acme 2", 6, 9, Some(6), true), ("Gone Ltd", 5, 9, None, false), ("New Co", 2, 2, Some(2), true)]
+            figures(&summary),
+            vec![
+                // 9 × 4, the 10th and 11th at the lower 4, and 17 × 6: no
+                // reading after the 28th, so nothing then.
+                ("Acme", 146, "4.87".to_owned(), 6, None, false),
+                ("Bolt", 27, "0.90".to_owned(), 3, None, false),
+                ("Cara", 17, "0.57".to_owned(), 1, None, false),
+            ]
         );
+    }
+
+    #[test]
+    fn this_month_counts_through_today_as_it_is_now_over_all_its_days() {
+        let rows = [
+            // The MSP's first reading: nothing before it counts.
+            row("a", "2026-11-03", 3, "Acme"),
+            row("a", "2026-11-04", 3, "Acme"),
+            // Taken earlier today: today counts as it is now instead.
+            row("a", "2026-11-06", 1, "Acme"),
+            row("gone", "2026-11-03", 4, "Gone Ltd"),
+            // Left after this morning's reading, which stays.
+            row("gone", "2026-11-06", 5, "Gone Ltd"),
+        ];
+        let summary = summarize(
+            month("2026-11"),
+            &rows,
+            &[now("a", "Acme 2", 6), now("new", "New Co", 2)],
+            Some(day("2026-11-06")),
+        );
+        assert_eq!(summary.days_in_month, 30);
+        assert_eq!(summary.through, day("2026-11-06"));
+        assert_eq!(
+            figures(&summary),
+            vec![
+                // The 5th had no reading: the lower of the 4th's and today's.
+                ("Acme 2", 15, "0.50".to_owned(), 6, Some(6), true),
+                ("Gone Ltd", 9, "0.30".to_owned(), 5, None, false),
+                ("New Co", 2, "0.07".to_owned(), 2, Some(2), true),
+            ]
+        );
+        assert_eq!(summary.seat_days(), 26);
+        assert_eq!(summary.prorated(summary.seat_days()), 87);
         assert_eq!(summary.most(), 13);
         assert_eq!(summary.today(), Some(8));
     }
 
     #[test]
-    fn a_month_with_nothing_has_no_days() {
-        let summary = summarize(&[], &[], Some("2026-11-02"));
-        assert_eq!(summary.days, 0);
+    fn a_month_with_nothing_has_no_seat_days() {
+        let summary = summarize(month("2026-11"), &[], &[], Some(day("2026-11-02")));
+        assert_eq!(summary.days_in_month, 30);
+        assert_eq!(summary.through, day("2026-11-02"));
         assert!(summary.lines.is_empty());
         assert_eq!(summary.today(), None);
-        assert_eq!(tenths(summary.sum(), summary.days), 0);
+        assert_eq!(summary.prorated(summary.seat_days()), 0);
     }
 
     #[test]
@@ -558,18 +772,20 @@ mod tests {
             row("a", "2026-10-02", 5, "Acme"),
             row("b", "2026-10-01", 2, "Bolt, Inc"),
         ];
-        let summary = summarize(&rows, &[], None);
+        let summary = summarize(month("2026-10"), &rows, &[], None);
         assert_eq!(
             csv("2026-10", &summary),
-            "\u{feff}Month,Client,Most on any day,Average,Today\r\n\
-             2026-10,Acme,5,4.0,\r\n\
-             2026-10,\"Bolt, Inc\",2,1.0,\r\n\
-             2026-10,Total,7,5.0,\r\n"
+            "\u{feff}Month,Through,Client,Seat-days,Days in month,Prorated seats,Peak,Today\r\n\
+             2026-10,2026-10-31,Acme,8,31,0.26,5,\r\n\
+             2026-10,2026-10-31,\"Bolt, Inc\",2,31,0.06,2,\r\n\
+             2026-10,2026-10-31,Total,10,31,0.32,7,\r\n"
         );
-        let summary = summarize(&[], &[now("a", "Acme", 3)], Some("2026-11-06"));
+        let summary = summarize(month("2026-11"), &[], &[now("a", "Acme", 3)], Some(day("2026-11-06")));
         assert_eq!(
             csv("2026-11", &summary),
-            "\u{feff}Month,Client,Most on any day,Average,Today\r\n2026-11,Acme,3,3.0,3\r\n2026-11,Total,3,3.0,3\r\n"
+            "\u{feff}Month,Through,Client,Seat-days,Days in month,Prorated seats,Peak,Today\r\n\
+             2026-11,2026-11-06,Acme,3,30,0.10,3,3\r\n\
+             2026-11,2026-11-06,Total,3,30,0.10,3,3\r\n"
         );
     }
 }
