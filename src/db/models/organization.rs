@@ -446,6 +446,10 @@ impl Membership {
         // Keykeeper: whether the organization allows assisted password change
         // on its items (keykeeper_password_change). Off when it can't be read.
         let password_change = super::OrgPasswordChange::allowed(&self.org_uuid, conn).await.unwrap_or(false);
+        // Keykeeper: what the organization does with the browsers' own card
+        // and address autofill (keykeeper_browser_autofill). Left as is when
+        // it can't be read.
+        let browser_autofill = crate::api::core::keykeeper_browser_autofill::mode(&self.org_uuid, conn).await.as_str();
 
         // HACK: Convert the manager type to a custom type
         // It will be converted back on other locations
@@ -512,6 +516,11 @@ impl Membership {
             // organization's items on their sites (DESIGN.md, "Assisted password
             // change"). Upstream's apps ignore it.
             "keykeeperPasswordChange": password_change,
+            // Keykeeper: "unchanged", "off", or "offAndImport". The browser
+            // extension turns the browser's own card and address autofill off
+            // in work profiles (DESIGN.md, "Addresses and cards"). Upstream's
+            // apps ignore it.
+            "keykeeperBrowserAutofill": browser_autofill,
 
             "organizationUserId": self.uuid,
             "providerId": null,

@@ -106,6 +106,10 @@ async fn install_json(
         "joins": MspEnrollmentJoin::count_by_org(org_id, conn).await,
         "domains": EnrollmentDomains::for_org(org_id, conn).await,
         "removedSinceToken": removed,
+        // Keykeeper: what the organization does with the browsers' own card
+        // and address autofill, so the command carries it to the install
+        // scripts' policies (DESIGN.md, "Addresses and cards").
+        "browserAutofill": super::keykeeper_browser_autofill::mode(org_id, conn).await.as_str(),
     })
 }
 
