@@ -443,6 +443,9 @@ impl Membership {
         // SSO and Unlink SSO.
         let (sso_identifier, sso_bound) =
             crate::api::core::keykeeper_sso::profile_fields(&self.org_uuid, &self.user_uuid, conn).await;
+        // Keykeeper: whether the organization allows assisted password change
+        // on its items (keykeeper_password_change). Off when it can't be read.
+        let password_change = super::OrgPasswordChange::allowed(&self.org_uuid, conn).await.unwrap_or(false);
 
         // HACK: Convert the manager type to a custom type
         // It will be converted back on other locations
@@ -505,6 +508,10 @@ impl Membership {
             "useOrganizationDomains": false, // Not supported (Linked to SSO)
             "usePam": false, // Not supported
             "usePhishingBlocker": false,
+            // Keykeeper: the browser extension may change the passwords of the
+            // organization's items on their sites (DESIGN.md, "Assisted password
+            // change"). Upstream's apps ignore it.
+            "keykeeperPasswordChange": password_change,
 
             "organizationUserId": self.uuid,
             "providerId": null,

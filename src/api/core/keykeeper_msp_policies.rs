@@ -17,6 +17,12 @@
 // never an upstream policy, since upstream's apps refuse every policy when one
 // has a type they don't know.
 //
+// Another isn't one either: "Turn off assisted password change" (type
+// PASSWORD_CHANGE_OFF), whose client setting is keykeeper_password_change's
+// row. On means the client turns it off, as upstream's policies restrict
+// when on, so an MSP without the default, and a client without the row, both
+// allow it.
+//
 // A default can also be required for every client: it reaches every client,
 // those with their own setting too, and nobody can change that policy in a
 // client's admin console until the MSP stops requiring it (refuse_if_required,
@@ -40,7 +46,7 @@ use crate::{
         DbConn,
         models::{
             Membership, MembershipType, Msp, MspClient, MspId, MspPolicy, MspRequiredHadOwn, OrgAdminTwoStep,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationId, TwoStepScope,
+            OrgPasswordChange, OrgPolicy, OrgPolicyType, Organization, OrganizationId, TwoStepScope,
             keykeeper_roles::{self, Permission},
         },
     },
@@ -48,6 +54,7 @@ use crate::{
 
 use super::{
     keykeeper_msp::{Audit, require_admin, staff_member},
+    keykeeper_password_change,
     keykeeper_two_step::{self, SessionFacts},
     organizations::{PolicyData, set_policy},
 };
@@ -60,6 +67,11 @@ pub fn routes() -> Vec<Route> {
 /// login for each client's admins (keykeeper_two_step). Upstream's policy
 /// types are small numbers; this one is never sent to the apps as a policy.
 pub const ADMIN_TWO_STEP: i32 = 1000;
+
+/// The type number of "Turn off assisted password change", which isn't an
+/// upstream policy either: on, the client turns it off for its items
+/// (keykeeper_password_change). Never sent to the apps as a policy.
+pub const PASSWORD_CHANGE_OFF: i32 = 1001;
 
 /// Two-step login for admins' one option, as its data: everyone else too.
 /// Without it, the data is null, as it always was.
@@ -78,18 +90,22 @@ fn admin_level(effect: Option<&Value>) -> TwoStepScope {
     }
 }
 
-/// What an MSP default sets in a client: an upstream policy, or two-step
-/// login for its admins.
+/// What an MSP default sets in a client: an upstream policy, two-step login
+/// for its admins, or turning off assisted password change.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Policy(OrgPolicyType),
     AdminTwoStep,
+    PasswordChangeOff,
 }
 
 impl Kind {
     fn from_i32(t: i32) -> Option<Self> {
         if t == ADMIN_TWO_STEP {
             return Some(Self::AdminTwoStep);
+        }
+        if t == PASSWORD_CHANGE_OFF {
+            return Some(Self::PasswordChangeOff);
         }
         OrgPolicyType::from_i32(t).map(Self::Policy)
     }
@@ -98,14 +114,16 @@ impl Kind {
         match self {
             Self::Policy(t) => t as i32,
             Self::AdminTwoStep => ADMIN_TWO_STEP,
+            Self::PasswordChangeOff => PASSWORD_CHANGE_OFF,
         }
     }
 }
 
 /// The policies an MSP can set defaults for: every upstream policy this server
 /// supports, in the order the admin console lists them, with two-step login
-/// for admins after upstream's two-step login.
-const OFFERED: [Kind; 14] = [
+/// for admins after upstream's two-step login, and turning off assisted
+/// password change last.
+const OFFERED: [Kind; 15] = [
     Kind::Policy(OrgPolicyType::TwoFactorAuthentication),
     Kind::AdminTwoStep,
     Kind::Policy(OrgPolicyType::MasterPassword),
@@ -120,6 +138,7 @@ const OFFERED: [Kind; 14] = [
     Kind::Policy(OrgPolicyType::RestrictedItemTypes),
     Kind::Policy(OrgPolicyType::UriMatchDefaults),
     Kind::Policy(OrgPolicyType::OrganizationUserNotification),
+    Kind::PasswordChangeOff,
 ];
 
 /// The policies offered on this server. Account recovery needs email, since a
@@ -157,8 +176,10 @@ fn prerequisites_where(t: Kind, single_org_for_recovery: bool) -> Vec<Kind> {
 /// A policy's name as the admin console shows it, for the audit log and a
 /// client's owners.
 fn policy_name(kind: Kind) -> &'static str {
-    let Kind::Policy(t) = kind else {
-        return "Two-step login for admins";
+    let t = match kind {
+        Kind::Policy(t) => t,
+        Kind::AdminTwoStep => return "Two-step login for admins",
+        Kind::PasswordChangeOff => return "Turn off assisted password change",
     };
     match t {
         OrgPolicyType::TwoFactorAuthentication => "Require two-step login",
@@ -370,11 +391,13 @@ pub async fn is_locked(org_id: &OrganizationId, pol_type: i32, conn: &DbConn) ->
     locked_by(org_id, pol_type, conn).await.is_some()
 }
 
-/// What a client has now for each kind of default: its upstream policies, and
-/// whom it requires two-step login of (its admins, or everyone).
+/// What a client has now for each kind of default: its upstream policies,
+/// whom it requires two-step login of (its admins, or everyone), and whether
+/// it allows assisted password change.
 struct ClientPolicies {
     policies: Vec<OrgPolicy>,
     admin_two_step: TwoStepScope,
+    password_change: bool,
 }
 
 impl ClientPolicies {
@@ -382,6 +405,7 @@ impl ClientPolicies {
         Ok(Self {
             policies: OrgPolicy::find_by_org(org_id, conn).await,
             admin_two_step: OrgAdminTwoStep::scope(org_id, conn).await?,
+            password_change: OrgPasswordChange::allowed(org_id, conn).await?,
         })
     }
 
@@ -392,6 +416,8 @@ impl ClientPolicies {
                 self.policies.iter().find(|p| p.atype == t as i32).map_or((false, None), |p| (p.enabled, Some(&p.data)))
             }
             Kind::AdminTwoStep => (self.admin_two_step.required(), self.admin_two_step.everyone().then_some(EVERYONE)),
+            // On: the client turned it off.
+            Kind::PasswordChangeOff => (!self.password_change, None),
         }
     }
 
@@ -469,7 +495,8 @@ async fn client_effect(org_id: &OrganizationId, t: Kind, conn: &DbConn) -> ApiRe
 
 /// Sets one kind of default in a client: an upstream policy through
 /// upstream's own policy code, as if the caller had saved it in the client's
-/// admin console, or the client's two-step login for admins.
+/// admin console, the client's two-step login for admins, or whether it
+/// allows assisted password change.
 async fn set_in_client(
     org_id: &OrganizationId,
     t: Kind,
@@ -486,6 +513,17 @@ async fn set_in_client(
             keykeeper_two_step::set_org_scope(
                 org_id,
                 TwoStepScope::of(data.enabled, everyone),
+                &headers.user.uuid,
+                headers.device.atype,
+                &headers.ip.ip,
+                conn,
+            )
+            .await?;
+        }
+        Kind::PasswordChangeOff => {
+            keykeeper_password_change::set_org_allowed(
+                org_id,
+                !data.enabled,
                 &headers.user.uuid,
                 headers.device.atype,
                 &headers.ip.ip,
@@ -1131,6 +1169,7 @@ mod tests {
         let client = |scope| ClientPolicies {
             policies: Vec::new(),
             admin_two_step: scope,
+            password_change: true,
         };
         assert_eq!(client(TwoStepScope::Everyone).effect(t), kind_effect(t, true, EVERYONE));
         assert_eq!(client(TwoStepScope::Admins).effect(t), kind_effect(t, true, "null"));
@@ -1162,7 +1201,7 @@ mod tests {
             .iter()
             .filter_map(|(t, data)| match t {
                 Kind::Policy(t) => Some((*t, data)),
-                Kind::AdminTwoStep => None,
+                Kind::AdminTwoStep | Kind::PasswordChangeOff => None,
             })
             .collect();
         assert_eq!(policies.len(), migrated.len());
@@ -1185,5 +1224,50 @@ mod tests {
         // new Business organization.
         assert!(business_policies().iter().any(|(t, _)| *t == Kind::AdminTwoStep));
         assert_eq!(policy_name(Kind::AdminTwoStep), "Two-step login for admins");
+    }
+
+    #[test]
+    fn turning_off_assisted_password_change_is_a_default_upstream_never_sees_as_a_policy() {
+        assert!(OrgPolicyType::from_i32(PASSWORD_CHANGE_OFF).is_none());
+        assert!(Kind::from_i32(PASSWORD_CHANGE_OFF) == Some(Kind::PasswordChangeOff));
+        assert_eq!(Kind::PasswordChangeOff.as_i32(), PASSWORD_CHANGE_OFF);
+        assert!(offered().contains(&Kind::PasswordChangeOff));
+        // Off by default: it isn't in the Business preset, so new MSPs and new
+        // Business organizations allow assisted password change.
+        assert!(!business_policies().iter().any(|(t, _)| *t == Kind::PasswordChangeOff));
+        assert_eq!(policy_name(Kind::PasswordChangeOff), "Turn off assisted password change");
+    }
+
+    #[rocket::async_test]
+    async fn a_client_follows_the_default_until_it_turns_assisted_password_change_off() {
+        let conn = DbPool::for_test().await;
+        let (msp, org) = msp_with_client(false, &conn).await;
+        let defaults = defaults(&msp.uuid, &conn).await;
+        let t = Kind::PasswordChangeOff;
+        // No default and no row: both allow it, so the client follows.
+        let current = ClientPolicies::of(&org.uuid, &conn).await.unwrap();
+        assert_eq!(current.state(t), (false, None));
+        assert!(!current.is_own(&defaults, t));
+
+        OrgPasswordChange::set(&org.uuid, false, &conn).await.unwrap();
+        let current = ClientPolicies::of(&org.uuid, &conn).await.unwrap();
+        assert_eq!(current.state(t), (true, None));
+        assert!(current.is_own(&defaults, t));
+        // Listed with its other own settings (it lacks the helper's two-step login default).
+        let own = own_policies(&msp.uuid, &org.uuid, &conn).await.unwrap();
+        assert!(own.contains(&json!({ "type": PASSWORD_CHANGE_OFF, "name": "Turn off assisted password change" })));
+    }
+
+    #[rocket::async_test]
+    async fn a_client_cant_change_it_while_its_msp_requires_it() {
+        let conn = DbPool::for_test().await;
+        let (msp, org) = msp_with_client(false, &conn).await;
+        let mut default = MspPolicy::new(msp.uuid.clone(), PASSWORD_CHANGE_OFF, true, "null".to_owned());
+        default.required = true;
+        default.save(&conn).await.unwrap();
+        for enabled in [false, true] {
+            assert!(refuse_if_required(&org.uuid, PASSWORD_CHANGE_OFF, enabled, &conn).await.is_err());
+        }
+        assert!(is_locked(&org.uuid, PASSWORD_CHANGE_OFF, &conn).await);
     }
 }
