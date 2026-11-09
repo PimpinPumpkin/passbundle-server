@@ -154,6 +154,11 @@ pub enum EventType {
     OrganizationUpdated = 1600,
     OrganizationPurgedVault = 1601,
     OrganizationClientExportedVault = 1602,
+    // Keykeeper: the organization turned "Members' own passwords" on or off:
+    // whether its owners and admins see how many of its members' own
+    // passwords are weak, reused, or exposed (keykeeper_member_health).
+    KeykeeperMemberHealthOn = 1688,
+    KeykeeperMemberHealthOff = 1689,
     // Keykeeper: a place the organization's events are sent was added,
     // changed, removed, or stopped (keykeeper_event_streaming). 1690 and up
     // are ours.

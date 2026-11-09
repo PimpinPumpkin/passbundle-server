@@ -31,9 +31,9 @@ use crate::{
         models::{
             CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, JoiningSealSource, Membership,
             MembershipStatus, MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole,
-            OrgJoining, OrgPolicy, OrgSetup, Organization, OrganizationId, RemovedMember, ScimUser, User,
-            effective_joining, email_in_domains, joining_seal_source, parse_enrollment_domains, valid_encrypted_secret,
-            valid_expiring_seal, valid_seal,
+            OrgJoining, OrgMemberHealth, OrgPolicy, OrgSetup, Organization, OrganizationId, RemovedMember, ScimUser,
+            User, effective_joining, email_in_domains, joining_seal_source, parse_enrollment_domains,
+            valid_encrypted_secret, valid_expiring_seal, valid_seal,
         },
     },
     mail,
@@ -464,7 +464,10 @@ struct EnrollmentTokenData {
 }
 
 /// Which organization a token joins, and what's needed to join it. The
-/// public key is for account recovery enrollment.
+/// public key is for account recovery enrollment. The extension's question
+/// says what joining lets the organization's admins see: account recovery,
+/// and how many of the person's own passwords are weak, reused, or exposed
+/// (`memberHealth`; DESIGN.md, "Members' own passwords").
 #[post("/keykeeper/enrollment/info", data = "<data>")]
 async fn enrollment_info(data: Json<EnrollmentTokenData>, headers: Headers, conn: DbConn) -> JsonResult {
     let Some(target) = target_by_token(&data.token, &conn).await else {
@@ -488,6 +491,7 @@ async fn enrollment_info(data: Json<EnrollmentTokenData>, headers: Headers, conn
         "organizationName": org.name,
         "publicKey": org.public_key,
         "accountRecovery": OrgPolicy::org_is_reset_password_auto_enroll(&org.uuid, &conn).await,
+        "memberHealth": OrgMemberHealth::enabled(&org.uuid, &conn).await?,
     })))
 }
 

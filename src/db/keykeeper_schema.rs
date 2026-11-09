@@ -652,3 +652,10 @@ table! {
         created_at -> Timestamp,
     }
 }
+
+table! {
+    org_member_health (org_uuid) {
+        org_uuid -> Text,
+        enabled -> Bool,
+    }
+}
