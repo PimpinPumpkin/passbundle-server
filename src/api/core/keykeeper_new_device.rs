@@ -120,6 +120,28 @@ pub async fn check_sign_in(s: SignIn<'_>, conn: &DbConn) -> ApiResult<Option<Str
         }
     }
 
+    // A check has one holder: whoever has its token. Signing in again from
+    // the same device continues it only with that token (sent as
+    // `newDeviceOtp` while it waits). Without it, the open check ends, with
+    // no denial (nobody said no), and a new one starts with a new number, so
+    // someone with the password and the device's identifier can't take over
+    // a sign-in in progress, or an approval given to it.
+    let presented = s.otp.map(str::trim).filter(|o| !o.is_empty() && !is_code(o));
+    let mut held_token = None;
+    let mut carried_wait = None;
+    let open = match open {
+        Some(check) if continues(&check, presented) => {
+            held_token = presented.map(str::to_owned);
+            Some(check)
+        }
+        Some(old) => {
+            carried_wait = carried_email_wait(&old);
+            old.delete(conn).await?;
+            None
+        }
+        None => None,
+    };
+
     let approvers = devices.iter().any(|d| d.uuid != device.uuid && can_approve(d, now));
     let covered = !keykeeper_two_step::requirements(user, conn).await?.is_empty();
 
@@ -153,11 +175,14 @@ pub async fn check_sign_in(s: SignIn<'_>, conn: &DbConn) -> ApiResult<Option<Str
                 .await;
                 return Ok(Some(KnownDeviceToken::issue(user, &device.uuid, now, conn).await));
             }
-            start(s.user, device, s.ip, now, conn).await?
+            start(s.user, device, s.ip, now, carried_wait, conn).await?
         }
     };
 
-    let token = check.new_token();
+    let token = match held_token {
+        Some(token) => token,
+        None => check.new_token(),
+    };
     settle_waiting(&mut check, s.user, now, conn).await;
     check.save(conn).await?;
     let state = state_json(&check, approvers, covered, now);
@@ -175,12 +200,29 @@ pub async fn check_sign_in(s: SignIn<'_>, conn: &DbConn) -> ApiResult<Option<Str
 /// upstream's clients keep the sign-in waiting as they do for that.
 pub const NEW_DEVICE_MESSAGE: &str = "new device verification required";
 
-/// A new check for this device: its number, and its time.
+/// Whether signing in again continues this open check: only with its own
+/// token, never a code (that finishes it) or nothing.
+fn continues(check: &NewDeviceCheck, presented: Option<&str>) -> bool {
+    presented.is_some_and(|token| check.token_matches(token))
+}
+
+/// What a check that ends because its device signed in again without its
+/// token hands to the new one: a wait for a code by email, still waiting.
+/// It isn't an approval, and the code goes only to the account's email, so
+/// someone who comes back after the day without the token (the page closed
+/// long ago) can still finish it. Nothing else carries over.
+fn carried_email_wait(old: &NewDeviceCheck) -> Option<NaiveDateTime> {
+    old.email_after.filter(|_| old.approved_at.is_none() && old.denied_at.is_none())
+}
+
+/// A new check for this device: its number, its time, and a wait for a code
+/// by email it carries over (`carried_email_wait`).
 async fn start(
     user: &User,
     device: &Device,
     ip: &IpAddr,
     now: NaiveDateTime,
+    email_after: Option<NaiveDateTime>,
     conn: &DbConn,
 ) -> ApiResult<NewDeviceCheck> {
     NewDeviceCheck::delete_ended(now - TimeDelta::hours(AFTER_DELAY_HOURS), conn).await?;
@@ -203,13 +245,15 @@ async fn start(
         token_hash: String::new(),
         number: new_number(),
         created_at: now,
-        expires_at: now + TimeDelta::minutes(CHECK_MINUTES),
+        expires_at: email_after.map_or(now + TimeDelta::minutes(CHECK_MINUTES), |after| {
+            (after + TimeDelta::hours(AFTER_DELAY_HOURS)).max(now + TimeDelta::minutes(CHECK_MINUTES))
+        }),
         approved_at: None,
         approved_how: None,
         approved_by: None,
         denied_at: None,
         denied_why: None,
-        email_after: None,
+        email_after,
         code_hash: None,
         code_sends: 0,
         code_tries: 0,
@@ -825,6 +869,37 @@ mod tests {
         asked.email_after = Some(now + TimeDelta::hours(EMAIL_DELAY_HOURS));
         assert_eq!(email_state(&asked, true, false, now), "waiting");
         assert_eq!(email_state(&asked, true, false, now + TimeDelta::hours(EMAIL_DELAY_HOURS)), "now");
+    }
+
+    #[test]
+    fn signing_in_again_continues_a_check_only_with_its_token() {
+        let now = Utc::now().naive_utc();
+        let mut c = check(now);
+        let token = c.new_token();
+        assert!(continues(&c, Some(&token)));
+        assert!(!continues(&c, None));
+        assert!(!continues(&c, Some("x".repeat(43).as_str())));
+        assert!(!continues(&c, Some("12345678")));
+        // Approved, it's still its token alone.
+        c.approved_at = Some(now);
+        assert!(continues(&c, Some(&token)));
+        assert!(!continues(&c, None));
+    }
+
+    #[test]
+    fn only_a_wait_for_an_emailed_code_carries_over() {
+        let now = Utc::now().naive_utc();
+        let mut c = check(now);
+        assert_eq!(carried_email_wait(&c), None);
+        let after = now + TimeDelta::hours(EMAIL_DELAY_HOURS);
+        c.email_after = Some(after);
+        assert_eq!(carried_email_wait(&c), Some(after));
+        let mut approved = c.clone();
+        approved.approved_at = Some(now);
+        assert_eq!(carried_email_wait(&approved), None);
+        let mut denied = c;
+        denied.denied_at = Some(now);
+        assert_eq!(carried_email_wait(&denied), None);
     }
 
     #[test]
