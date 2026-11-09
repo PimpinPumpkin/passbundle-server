@@ -68,7 +68,7 @@ pub use self::keykeeper_joining::{
     INVITE_HOURS, Joining, JoiningSource, MspJoining, OrgJoining, confirms_automatically, effective_joining,
     invite_hours, msp_default,
 };
-pub use self::keykeeper_member_health::{MemberHealth, OwnCounts, msp_memberships_among};
+pub use self::keykeeper_member_health::{MemberHealth, OrgMemberHealth, OwnCounts, msp_memberships_among};
 pub use self::keykeeper_msp::{
     CustomRole, EnrollmentDomains, Msp, MspClient, MspEnrollmentJoin, MspEvent, MspId, MspInvite, MspMembership,
     MspPolicy, MspRequiredHadOwn, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,

@@ -23,6 +23,11 @@
 // when on, so an MSP without the default, and a client without the row, both
 // allow it.
 //
+// Nor is "Members' own passwords" (MEMBER_HEALTH): whether each client's
+// owners and admins see how many of its members' own passwords are weak,
+// reused, or exposed (keykeeper_member_health). It's kept the same way, and a
+// client's setting is its own row too.
+//
 // Nor is "Turn off the browsers' card and address autofill" (type
 // BROWSER_AUTOFILL_OFF), with one option, "Offer to bring them into
 // PassBundle" (`{"offer": true}`), whose client setting is
@@ -53,15 +58,15 @@ use crate::{
         DbConn,
         models::{
             BrowserAutofillMode, Membership, MembershipType, Msp, MspClient, MspId, MspPolicy, MspRequiredHadOwn,
-            OrgAdminTwoStep, OrgBrowserAutofill, OrgPasswordChange, OrgPolicy, OrgPolicyType, Organization,
-            OrganizationId, TwoStepScope,
+            OrgAdminTwoStep, OrgBrowserAutofill, OrgMemberHealth, OrgPasswordChange, OrgPolicy, OrgPolicyType,
+            Organization, OrganizationId, TwoStepScope,
             keykeeper_roles::{self, Permission},
         },
     },
 };
 
 use super::{
-    keykeeper_browser_autofill,
+    keykeeper_browser_autofill, keykeeper_member_health,
     keykeeper_msp::{Audit, require_admin, staff_member},
     keykeeper_password_change,
     keykeeper_two_step::{self, SessionFacts},
@@ -82,11 +87,16 @@ pub const ADMIN_TWO_STEP: i32 = 1000;
 /// (keykeeper_password_change). Never sent to the apps as a policy.
 pub const PASSWORD_CHANGE_OFF: i32 = 1001;
 
+/// The type number of "Members' own passwords", which isn't an upstream
+/// policy either: on, the client's owners and admins see how many of its
+/// members' own passwords are weak, reused, or exposed
+/// (keykeeper_member_health). Never sent to the apps as a policy.
+pub const MEMBER_HEALTH: i32 = 1002;
+
 /// The type number of "Turn off the browsers' card and address autofill",
 /// which isn't an upstream policy either: on, the client turns off Chrome's,
 /// Edge's, and Firefox's own card and address autofill for its people
-/// (keykeeper_browser_autofill). Never sent to the apps as a policy. 1002 is
-/// "Members' own passwords" (keykeeper_member_health).
+/// (keykeeper_browser_autofill). Never sent to the apps as a policy.
 pub const BROWSER_AUTOFILL_OFF: i32 = 1003;
 
 /// Its one option, as its data: offer to bring saved cards and addresses
@@ -126,13 +136,14 @@ fn admin_level(effect: Option<&Value>) -> TwoStepScope {
 }
 
 /// What an MSP default sets in a client: an upstream policy, two-step login
-/// for its admins, turning off assisted password change, or turning off the
-/// browsers' card and address autofill.
+/// for its admins, turning off assisted password change, "Members' own
+/// passwords", or turning off the browsers' card and address autofill.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Policy(OrgPolicyType),
     AdminTwoStep,
     PasswordChangeOff,
+    MemberHealth,
     BrowserAutofillOff,
 }
 
@@ -143,6 +154,9 @@ impl Kind {
         }
         if t == PASSWORD_CHANGE_OFF {
             return Some(Self::PasswordChangeOff);
+        }
+        if t == MEMBER_HEALTH {
+            return Some(Self::MemberHealth);
         }
         if t == BROWSER_AUTOFILL_OFF {
             return Some(Self::BrowserAutofillOff);
@@ -155,6 +169,7 @@ impl Kind {
             Self::Policy(t) => t as i32,
             Self::AdminTwoStep => ADMIN_TWO_STEP,
             Self::PasswordChangeOff => PASSWORD_CHANGE_OFF,
+            Self::MemberHealth => MEMBER_HEALTH,
             Self::BrowserAutofillOff => BROWSER_AUTOFILL_OFF,
         }
     }
@@ -163,8 +178,9 @@ impl Kind {
 /// The policies an MSP can set defaults for: every upstream policy this server
 /// supports, in the order the admin console lists them, with two-step login
 /// for admins after upstream's two-step login, then turning off assisted
-/// password change and the browsers' card and address autofill.
-const OFFERED: [Kind; 16] = [
+/// password change, "Members' own passwords", and turning off the browsers'
+/// card and address autofill.
+const OFFERED: [Kind; 17] = [
     Kind::Policy(OrgPolicyType::TwoFactorAuthentication),
     Kind::AdminTwoStep,
     Kind::Policy(OrgPolicyType::MasterPassword),
@@ -180,6 +196,7 @@ const OFFERED: [Kind; 16] = [
     Kind::Policy(OrgPolicyType::UriMatchDefaults),
     Kind::Policy(OrgPolicyType::OrganizationUserNotification),
     Kind::PasswordChangeOff,
+    Kind::MemberHealth,
     Kind::BrowserAutofillOff,
 ];
 
@@ -222,6 +239,7 @@ fn policy_name(kind: Kind) -> &'static str {
         Kind::Policy(t) => t,
         Kind::AdminTwoStep => return "Two-step login for admins",
         Kind::PasswordChangeOff => return "Turn off assisted password change",
+        Kind::MemberHealth => return "Members' own passwords",
         Kind::BrowserAutofillOff => return "Turn off the browsers' card and address autofill",
     };
     match t {
@@ -287,6 +305,11 @@ fn business_policies() -> Vec<(Kind, Value)> {
         // authenticator app, a security key or passkey, or Duo (DESIGN.md,
         // "Two-step login for admins").
         (Kind::AdminTwoStep, Value::Null),
+        // Members' own passwords: the client's owners and admins see how
+        // many of each member's own passwords are weak, reused, or exposed,
+        // never which ones, and members are told (DESIGN.md, "Members' own
+        // passwords").
+        (Kind::MemberHealth, Value::Null),
     ]
 }
 
@@ -310,8 +333,11 @@ fn effect(enabled: bool, data: &str) -> Option<Value> {
 
 /// What one kind of default does (effect). Two-step login for admins has one
 /// option, everyone else too, which only `true` turns on: anything else is
-/// the same as none.
+/// the same as none. "Members' own passwords" has no options.
 fn kind_effect(t: Kind, enabled: bool, data: &str) -> Option<Value> {
+    if t == Kind::MemberHealth {
+        return enabled.then(|| json!({}));
+    }
     // The browsers' card and address autofill has one option too, the offer.
     if t == Kind::BrowserAutofillOff {
         return enabled.then(|| {
@@ -445,13 +471,15 @@ pub async fn is_locked(org_id: &OrganizationId, pol_type: i32, conn: &DbConn) ->
 }
 
 /// What a client has now for each kind of default: its upstream policies,
-/// whom it requires two-step login of (its admins, or everyone), whether it
-/// allows assisted password change, and what it does with the browsers' card
-/// and address autofill.
+/// whom it requires two-step login of (its admins, or everyone), and whether
+/// it allows assisted password change, whether it has "Members' own
+/// passwords" on, and what it does with the browsers' card and address
+/// autofill.
 struct ClientPolicies {
     policies: Vec<OrgPolicy>,
     admin_two_step: TwoStepScope,
     password_change: bool,
+    member_health: bool,
     browser_autofill: BrowserAutofillMode,
 }
 
@@ -461,6 +489,7 @@ impl ClientPolicies {
             policies: OrgPolicy::find_by_org(org_id, conn).await,
             admin_two_step: OrgAdminTwoStep::scope(org_id, conn).await?,
             password_change: OrgPasswordChange::allowed(org_id, conn).await?,
+            member_health: OrgMemberHealth::enabled(org_id, conn).await?,
             browser_autofill: OrgBrowserAutofill::mode(org_id, conn).await?,
         })
     }
@@ -474,6 +503,7 @@ impl ClientPolicies {
             Kind::AdminTwoStep => (self.admin_two_step.required(), self.admin_two_step.everyone().then_some(EVERYONE)),
             // On: the client turned it off.
             Kind::PasswordChangeOff => (!self.password_change, None),
+            Kind::MemberHealth => (self.member_health, None),
             // On: the client turned them off.
             Kind::BrowserAutofillOff => (
                 self.browser_autofill.is_off(),
@@ -557,8 +587,8 @@ async fn client_effect(org_id: &OrganizationId, t: Kind, conn: &DbConn) -> ApiRe
 /// Sets one kind of default in a client: an upstream policy through
 /// upstream's own policy code, as if the caller had saved it in the client's
 /// admin console, the client's two-step login for admins, whether it allows
-/// assisted password change, or what it does with the browsers' card and
-/// address autofill.
+/// assisted password change, its "Members' own passwords", or what it does
+/// with the browsers' card and address autofill.
 async fn set_in_client(
     org_id: &OrganizationId,
     t: Kind,
@@ -586,6 +616,17 @@ async fn set_in_client(
             keykeeper_password_change::set_org_allowed(
                 org_id,
                 !data.enabled,
+                &headers.user.uuid,
+                headers.device.atype,
+                &headers.ip.ip,
+                conn,
+            )
+            .await?;
+        }
+        Kind::MemberHealth => {
+            keykeeper_member_health::set_org_member_health(
+                org_id,
+                data.enabled,
                 &headers.user.uuid,
                 headers.device.atype,
                 &headers.ip.ip,
@@ -816,10 +857,11 @@ async fn set_default(
         err!("Policy options must be an object")
     }
     // Two-step login for admins keeps its one option, and nothing else, so
-    // its data stays null without it, as it always was.
+    // its data stays null without it, as it always was. "Members' own
+    // passwords" has none.
     let options = if t == Kind::AdminTwoStep && everyone_option(&options.to_string()) {
         json!({ "everyone": true })
-    } else if t == Kind::AdminTwoStep {
+    } else if t == Kind::AdminTwoStep || t == Kind::MemberHealth {
         Value::Null
     // The browsers' card and address autofill keeps its one option the same way.
     } else if t == Kind::BrowserAutofillOff && offer_option(&options.to_string()) {
@@ -1249,6 +1291,7 @@ mod tests {
             policies: Vec::new(),
             admin_two_step: scope,
             password_change: true,
+            member_health: false,
             browser_autofill: BrowserAutofillMode::Unchanged,
         };
         assert_eq!(client(TwoStepScope::Everyone).effect(t), kind_effect(t, true, EVERYONE));
@@ -1281,7 +1324,7 @@ mod tests {
             .iter()
             .filter_map(|(t, data)| match t {
                 Kind::Policy(t) => Some((*t, data)),
-                Kind::AdminTwoStep | Kind::PasswordChangeOff | Kind::BrowserAutofillOff => None,
+                Kind::AdminTwoStep | Kind::PasswordChangeOff | Kind::MemberHealth | Kind::BrowserAutofillOff => None,
             })
             .collect();
         assert_eq!(policies.len(), migrated.len());
@@ -1290,7 +1333,9 @@ mod tests {
             assert_eq!(effect(true, &data.to_string()), effect(true, mdata));
         }
         assert_eq!(preset.iter().filter(|(t, _)| *t == Kind::AdminTwoStep).count(), 1);
-        assert_eq!(preset.len(), migrated.len() + 1);
+        // Members' own passwords came after them too.
+        assert_eq!(preset.iter().filter(|(t, _)| *t == Kind::MemberHealth).count(), 1);
+        assert_eq!(preset.len(), migrated.len() + 2);
     }
 
     #[test]
@@ -1352,6 +1397,50 @@ mod tests {
     }
 
     #[test]
+    fn members_own_passwords_is_a_default_with_no_options_upstream_never_sees_as_a_policy() {
+        assert!(OrgPolicyType::from_i32(MEMBER_HEALTH).is_none());
+        assert!(Kind::from_i32(MEMBER_HEALTH) == Some(Kind::MemberHealth));
+        assert_eq!(Kind::MemberHealth.as_i32(), MEMBER_HEALTH);
+        assert!(offered().contains(&Kind::MemberHealth));
+        assert_eq!(policy_name(Kind::MemberHealth), "Members' own passwords");
+        // On in the Business preset, so in every new MSP's defaults and every
+        // new Business organization.
+        assert!(business_policies().contains(&(Kind::MemberHealth, Value::Null)));
+        // On or off, whatever its data says.
+        let t = Kind::MemberHealth;
+        for data in ["null", "{}", r#"{"everyone":true}"#, r#"{"other":1}"#, "not json"] {
+            assert_eq!(kind_effect(t, true, data), Some(json!({})), "{data}");
+            assert_eq!(kind_effect(t, false, data), None, "{data}");
+        }
+        // A client's setting reads as the default's would.
+        let client = |on| ClientPolicies {
+            policies: Vec::new(),
+            admin_two_step: TwoStepScope::Off,
+            password_change: true,
+            member_health: on,
+            browser_autofill: BrowserAutofillMode::Unchanged,
+        };
+        assert_eq!(client(true).effect(t), kind_effect(t, true, "null"));
+        assert_eq!(client(false).effect(t), None);
+        assert_eq!(client(true).state(t), (true, None));
+    }
+
+    #[rocket::async_test]
+    async fn a_required_members_own_passwords_cant_be_changed_in_the_client() {
+        let conn = DbPool::for_test().await;
+        let (msp, org) = msp_with_client(false, &conn).await;
+        assert!(refuse_if_required(&org.uuid, MEMBER_HEALTH, false, &conn).await.is_ok());
+        let mut default = MspPolicy::new(msp.uuid.clone(), MEMBER_HEALTH, true, "null".to_owned());
+        default.required = true;
+        default.save(&conn).await.unwrap();
+        for enabled in [false, true] {
+            assert!(refuse_if_required(&org.uuid, MEMBER_HEALTH, enabled, &conn).await.is_err());
+        }
+        assert!(is_locked(&org.uuid, MEMBER_HEALTH, &conn).await);
+        assert!(!is_locked(&org.uuid, ADMIN_TWO_STEP, &conn).await);
+    }
+
+    #[test]
     fn turning_off_the_browsers_autofill_is_a_default_with_one_option_upstream_never_sees_as_a_policy() {
         assert!(OrgPolicyType::from_i32(BROWSER_AUTOFILL_OFF).is_none());
         assert!(Kind::from_i32(BROWSER_AUTOFILL_OFF) == Some(Kind::BrowserAutofillOff));
@@ -1374,6 +1463,7 @@ mod tests {
             policies: Vec::new(),
             admin_two_step: TwoStepScope::Off,
             password_change: true,
+            member_health: false,
             browser_autofill: mode,
         };
         assert_eq!(client(BrowserAutofillMode::Unchanged).effect(t), None);

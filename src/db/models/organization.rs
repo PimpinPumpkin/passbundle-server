@@ -728,7 +728,7 @@ impl Membership {
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         User::update_uuid_revision(&self.user_uuid, conn).await;
 
-        db_run! { conn:
+        let saved: EmptyResult = db_run! { conn:
             mysql {
                 diesel::insert_into(users_organizations::table)
                     .values(self)
@@ -747,7 +747,14 @@ impl Membership {
                     .execute(conn)
                     .map_res("Error adding user to organization")
             }
+        };
+        saved?;
+        // Keykeeper: a revoked member's own passwords' numbers go once no
+        // organization sees them (keykeeper_member_health).
+        if self.status <= MembershipStatus::Revoked as i32 {
+            super::MemberHealth::forget_unless_seen(&self.user_uuid, conn).await?;
         }
+        Ok(())
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
@@ -760,12 +767,19 @@ impl Membership {
         // and someone who comes back links again.
         super::SsoLink::delete(&self.org_uuid, &self.user_uuid, conn).await?;
 
-        conn.run(move |conn| {
-            diesel::delete(users_organizations::table.filter(users_organizations::uuid.eq(self.uuid)))
-                .execute(conn)
-                .map_res("Error removing user from organization")
-        })
-        .await
+        let user_uuid = self.user_uuid.clone();
+        let deleted: EmptyResult = conn
+            .run(move |conn| {
+                diesel::delete(users_organizations::table.filter(users_organizations::uuid.eq(self.uuid)))
+                    .execute(conn)
+                    .map_res("Error removing user from organization")
+            })
+            .await;
+        deleted?;
+        // Keykeeper: and their own passwords' numbers, once no organization
+        // sees them (keykeeper_member_health): leaving, being removed, the
+        // organization deleted.
+        super::MemberHealth::forget_unless_seen(&user_uuid, conn).await.map(|_| ())
     }
 
     pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {
