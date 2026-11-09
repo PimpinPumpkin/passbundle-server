@@ -886,6 +886,23 @@ impl EnrollmentDomains {
         Self::find_by_org(org_uuid, conn).await.map(|d| d.list()).unwrap_or_default()
     }
 
+    /// An organization's email domains, as its members' apps learn them in
+    /// sync (`keykeeperEmailDomains`): its install command's, then the ones
+    /// it verified for single sign-on, without repeats. The desktop app takes
+    /// a browser profile signed in at one of them for a work profile when it
+    /// offers to import passwords (meta repo DESIGN.md, "Which browser
+    /// profiles"). Never an unverified single sign-on domain, which anyone
+    /// can add.
+    pub async fn for_members(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<String> {
+        let mut domains = Self::for_org(org_uuid, conn).await;
+        for sso in super::SsoDomain::find_by_org(org_uuid, conn).await {
+            if sso.verified_at.is_some() && !domains.contains(&sso.domain) {
+                domains.push(sso.domain);
+            }
+        }
+        domains
+    }
+
     /// Sets a client's domains; none removes the limit.
     pub async fn set(org_uuid: &OrganizationId, domains: &[String], conn: &DbConn) -> EmptyResult {
         let org = org_uuid.clone();

@@ -450,6 +450,10 @@ impl Membership {
         // and address autofill (keykeeper_browser_autofill). Left as is when
         // it can't be read.
         let browser_autofill = crate::api::core::keykeeper_browser_autofill::mode(&self.org_uuid, conn).await.as_str();
+        // Keykeeper: the organization's email domains (the install command's,
+        // and those verified for single sign-on), for the desktop app's
+        // import from browsers (EnrollmentDomains::for_members).
+        let email_domains = super::EnrollmentDomains::for_members(&self.org_uuid, conn).await;
 
         // HACK: Convert the manager type to a custom type
         // It will be converted back on other locations
@@ -521,6 +525,11 @@ impl Membership {
             // in work profiles (DESIGN.md, "Addresses and cards"). Upstream's
             // apps ignore it.
             "keykeeperBrowserAutofill": browser_autofill,
+            // Keykeeper: the organization's email domains. The desktop app
+            // takes a browser profile signed in at one for a work profile
+            // when it offers to import passwords (DESIGN.md, "Which browser
+            // profiles"). Upstream's apps ignore it.
+            "keykeeperEmailDomains": email_domains,
 
             "organizationUserId": self.uuid,
             "providerId": null,
