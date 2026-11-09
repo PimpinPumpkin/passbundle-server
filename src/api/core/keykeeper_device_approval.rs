@@ -58,6 +58,13 @@ impl SignInMethod {
     pub fn may_approve_new_device(&self) -> bool {
         matches!(self.0, Some(AuthMethod::Password | AuthMethod::Sso | AuthMethod::AuthRequest))
     }
+
+    /// A session that signed in with the master password, for tests that
+    /// call a route needing one.
+    #[cfg(test)]
+    pub fn master_password() -> Self {
+        Self(Some(AuthMethod::Password))
+    }
 }
 
 #[rocket::async_trait]

@@ -3842,4 +3842,33 @@ mod keykeeper_tests {
         // The rule is still on.
         assert!(OrgAdminTwoStep::required(&org.uuid, &conn).await.unwrap());
     }
+
+    /// Account recovery sets someone's new master password with their own KDF
+    /// settings, through the shared check (`AuthenticationData::check`, which
+    /// `recover_account` runs before anything else about the new password):
+    /// 599,999 iterations is refused with its plain message; their 600,000
+    /// passes. (The route itself needs a server that sends email.)
+    #[test]
+    fn a_recovered_password_needs_600000_iterations() {
+        let member = User::new("member@example.test", None);
+        let request = |iterations: i32| -> (AuthenticationData, UnlockData) {
+            let kdf = json!({"kdfType": 0, "iterations": iterations});
+            let request: OrganizationUserRecoverAccountRequest = serde_json::from_value(json!({
+                "authenticationData": {"salt": member.email, "kdf": kdf, "masterPasswordAuthenticationHash": "new"},
+                "unlockData": {"salt": member.email, "kdf": kdf, "masterKeyWrappedUserKey": "2.new-key"},
+                "resetMasterPassword": true,
+                "resetTwoFactor": false
+            }))
+            .unwrap();
+            (request.authentication_data.unwrap(), request.unlock_data.unwrap())
+        };
+        let (authentication, unlock) = request(599_999);
+        assert_eq!(
+            authentication.check(&member, &unlock).unwrap_err().message(),
+            "PBKDF2 needs at least 600,000 iterations."
+        );
+        let (authentication, unlock) = request(600_000);
+        assert!(authentication.check(&member, &unlock).is_ok());
+        assert!(authentication.kdf.matches_user(&member));
+    }
 }
