@@ -33,6 +33,8 @@ use crate::{
     },
     auth,
     auth::{AuthMethod, ClientHeaders, ClientIp, Secure, generate_organization_api_key_login_claims},
+    // Keykeeper: the plain reason a new account is turned down.
+    config::NewAccountRefusal,
     crypto,
     db::{
         DbConn,
@@ -1276,6 +1278,27 @@ fn accepts_json(accept: Option<&Accept>) -> bool {
     accept.is_some_and(|accept| accept.preferred().media_type() == &MediaType::JSON)
 }
 
+/// Keykeeper: the answer to a refused first sign-up step. It has the shape of every other
+/// error, so an app that shows the server's `message` says the plain sentence, plus
+/// `keykeeperNewAccounts`, which the web vault and the extension read to say it in their own
+/// words. Nothing in it comes from the address that asked.
+fn new_account_refused(refusal: NewAccountRefusal) -> crate::Error {
+    let message = refusal.message();
+    let body = json!({
+        "message": message,
+        "validationErrors": { "": [message] },
+        "errorModel": { "message": message, "object": "error" },
+        "error": "",
+        "error_description": "",
+        "exceptionMessage": null,
+        "exceptionStackTrace": null,
+        "innerExceptionMessage": null,
+        "keykeeperNewAccounts": refusal.code(),
+        "object": "error",
+    });
+    (format!("Refused a new account. {message}"), body).into()
+}
+
 #[post("/accounts/register/send-verification-email", data = "<data>")]
 async fn register_verification_email(
     data: Json<RegisterVerificationData>,
@@ -1288,10 +1311,16 @@ async fn register_verification_email(
     let data = data.into_inner();
 
     // the registration can only continue if signup is allowed or there exists an invitation
-    if !(CONFIG.is_signup_allowed(&data.email)
-        || (!CONFIG.mail_enabled() && Invitation::find_by_mail(&data.email, &conn).await.is_some()))
+    //
+    // Keykeeper: a refused address is told why in plain words. Which reason it gets is settled
+    // by the server's settings and the address's domain alone, before anything is looked up
+    // about the address, so the answer is the same whether or not an account exists for it.
+    // Who gets through is as upstream has it: sign-up allowed for the address, or, on a
+    // server that sends no email, an invitation waiting for it.
+    if let Some(refusal) = CONFIG.new_account_refusal(&data.email)
+        && (CONFIG.mail_enabled() || Invitation::find_by_mail(&data.email, &conn).await.is_none())
     {
-        err!("Registration not allowed or user already exists")
+        return Err(new_account_refused(refusal));
     }
 
     let should_send_mail = CONFIG.mail_enabled() && CONFIG.signups_verify();

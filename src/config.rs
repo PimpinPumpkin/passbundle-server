@@ -1826,6 +1826,35 @@ pub const SUPPORTED_FEATURE_FLAGS: &[&str] = &[
     "pm-32009-new-item-types",
 ];
 
+/// Keykeeper: the two plain reasons the first sign-up step gives for turning an address down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewAccountRefusal {
+    /// Sign-ups are off and no email domain is allowed: nobody can make an account here.
+    Closed,
+    /// Some email domains are allowed, and this address is outside them.
+    Address,
+}
+
+impl NewAccountRefusal {
+    /// What the answer carries as `keykeeperNewAccounts`, for clients that say it in their
+    /// own words.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Address => "address",
+        }
+    }
+
+    /// The sentence for clients that show the server's own message. It never names the
+    /// allowed domains.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Closed => "This server isn't taking new accounts.",
+            Self::Address => "New accounts aren't open for that address.",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Serialize)]
 pub enum ConfigFileStatus {
     NotFound,
@@ -1943,6 +1972,20 @@ impl Config {
         } else {
             // The whitelist setting overrides the signups_allowed setting.
             self.is_email_domain_allowed(email)
+        }
+    }
+
+    /// Keykeeper: why this server turns down a new account for an address, as far as its
+    /// settings and the address's domain say. `None` exactly when `is_signup_allowed` lets
+    /// the address through. Nothing is looked up about the address, so the answer is the
+    /// same whether or not an account exists for it.
+    pub fn new_account_refusal(&self, email: &str) -> Option<NewAccountRefusal> {
+        if self.is_signup_allowed(email) {
+            None
+        } else if self.signups_domains_whitelist().is_empty() {
+            Some(NewAccountRefusal::Closed)
+        } else {
+            Some(NewAccountRefusal::Address)
         }
     }
 
@@ -2275,6 +2318,60 @@ mod keykeeper_tests {
         };
         more(&mut builder);
         builder.build()
+    }
+
+    /// A whole `Config` with these settings, for the checks that are methods on it.
+    fn config(more: impl FnOnce(&mut ConfigBuilder)) -> Config {
+        Config {
+            inner: RwLock::new(Inner {
+                rocket_shutdown_handle: None,
+                templates: Handlebars::new(),
+                config: built("http://localhost", more),
+                _env: ConfigBuilder::default(),
+                _usr: ConfigBuilder::default(),
+                _overrides: Vec::new(),
+                _config_file_status: ConfigFileStatus::NotFound,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_refused_new_account_is_told_why_from_the_settings_and_the_domain_alone() {
+        use NewAccountRefusal::{Address, Closed};
+        let addresses = ["alex@example.com", "alex@EXAMPLE.ORG", "alex@example.net", "alex@sub.example.com", "alex"];
+
+        // Open to everyone: nobody is refused.
+        let open = config(|_| {});
+        // Closed to everyone: one reason for every address.
+        let closed = config(|b| b.signups_allowed = Some(false));
+        for address in addresses {
+            assert_eq!(open.new_account_refusal(address), None, "{address}");
+            assert_eq!(closed.new_account_refusal(address), Some(Closed), "{address}");
+        }
+
+        // Some domains allowed: the list decides, whichever way the switch is set.
+        for switch in [true, false] {
+            let some = config(|b| {
+                b.signups_allowed = Some(switch);
+                b.signups_domains_whitelist = Some("Example.com, example.org".to_owned());
+            });
+            assert_eq!(some.new_account_refusal("alex@example.com"), None);
+            assert_eq!(some.new_account_refusal("alex@EXAMPLE.ORG"), None);
+            for outside in ["alex@example.net", "alex@sub.example.com", "alex"] {
+                assert_eq!(some.new_account_refusal(outside), Some(Address), "{outside}");
+            }
+            // Who gets through is `is_signup_allowed`'s call and nothing else's.
+            for address in addresses {
+                assert_eq!(some.new_account_refusal(address).is_none(), some.is_signup_allowed(address), "{address}");
+            }
+        }
+
+        // The words say nothing about which domains are allowed.
+        for refusal in [Closed, Address] {
+            assert!(!refusal.message().contains("example"), "{}", refusal.message());
+            assert!(!refusal.code().contains("example"));
+        }
+        assert_ne!(Closed.code(), Address.code());
     }
 
     #[test]
