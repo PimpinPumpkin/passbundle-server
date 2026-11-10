@@ -454,6 +454,10 @@ impl Membership {
         // and those verified for single sign-on), for the desktop app's
         // import from browsers (EnrollmentDomains::for_members).
         let email_domains = super::EnrollmentDomains::for_members(&self.org_uuid, conn).await;
+        // Keykeeper: whether this membership came from an MSP, which is what
+        // exempt_from_member_policies goes by. Off when it can't be read, so
+        // the apps keep applying the organization's member policies.
+        let from_msp = super::MspMembership::find_by_membership(&self.uuid, conn).await.is_some();
 
         // HACK: Convert the manager type to a custom type
         // It will be converted back on other locations
@@ -530,6 +534,13 @@ impl Membership {
             // when it offers to import passwords (DESIGN.md, "Which browser
             // profiles"). Upstream's apps ignore it.
             "keykeeperEmailDomains": email_domains,
+            // Keykeeper: this membership came from an MSP, so the apps leave
+            // it out of the organization's policies exactly where the server
+            // does: its member policies (exempt_from_member_policies) and
+            // "Require single sign-on" (keykeeper_sso). Never two-step login,
+            // which an MSP's staff aren't exempt from. See DESIGN.md, "MSP
+            // console". Upstream's apps ignore it.
+            "keykeeperFromMsp": from_msp,
 
             "organizationUserId": self.uuid,
             "providerId": null,
@@ -1269,6 +1280,13 @@ pub struct OrgApiKeyId(String);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{
+        DbPool,
+        models::{
+            Msp, MspMembership, exempt_from_member_policies,
+            keykeeper_roles::{self, CustomPermissions},
+        },
+    };
 
     #[test]
     #[allow(non_snake_case)]
@@ -1277,5 +1295,51 @@ mod tests {
         assert!(MembershipType::Admin > MembershipType::Manager);
         assert!(MembershipType::Manager > MembershipType::User);
         assert!(MembershipType::Manager == MembershipType::from_str("4").unwrap());
+    }
+
+    async fn join(name: &str, org: &Organization, custom_role: bool, conn: &DbConn) -> Membership {
+        let mut user = User::new(&format!("{name}@example.test"), None);
+        user.save(conn).await.unwrap();
+        let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
+        member.status = MembershipStatus::Confirmed as i32;
+        member.save(conn).await.unwrap();
+        if custom_role {
+            let role = CustomPermissions {
+                manage_users: true,
+                ..Default::default()
+            };
+            keykeeper_roles::set(&member.uuid, Some(&role), conn).await.unwrap();
+        }
+        member
+    }
+
+    /// The apps go by `keykeeperFromMsp` to leave an MSP's technician out of
+    /// a client's member policies, so it has to say what the server's own
+    /// exemption goes by, and nothing about the role.
+    #[rocket::async_test]
+    async fn the_profile_says_which_memberships_came_from_an_msp() {
+        let conn = DbPool::for_test().await;
+        let org = Organization::new("Contoso".to_owned(), "billing@example.test", None, None);
+        org.save(&conn).await.unwrap();
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(&conn).await.unwrap();
+
+        let technician = join("technician", &org, true, &conn).await;
+        MspMembership::new(technician.uuid.clone(), msp.uuid.clone()).insert(&conn).await.unwrap();
+        let own_custom = join("own-custom", &org, true, &conn).await;
+        let own_member = join("own-member", &org, false, &conn).await;
+
+        // The type the apps see: 4 with a custom role, 2 without.
+        for (member, client_type, from_msp) in
+            [(&technician, 4, true), (&own_custom, 4, false), (&own_member, 2, false)]
+        {
+            let json = member.to_json(&conn).await;
+            assert_eq!(json["keykeeperFromMsp"], from_msp, "{}", member.uuid);
+            // Neither the role nor the type the apps see says it.
+            assert_eq!(json["type"], client_type, "{}", member.uuid);
+            assert_eq!(member.atype, MembershipType::User as i32);
+            // All three are regular members, so it's the server's exemption.
+            assert_eq!(exempt_from_member_policies(member, &conn).await, from_msp, "{}", member.uuid);
+        }
     }
 }
