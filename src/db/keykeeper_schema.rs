@@ -666,3 +666,25 @@ table! {
         enabled -> Bool,
     }
 }
+
+table! {
+    plans (uuid) {
+        uuid -> Text,
+        user_uuid -> Nullable<Text>,
+        org_uuid -> Nullable<Text>,
+        msp_uuid -> Nullable<Text>,
+        plan -> Text,
+        free_until -> Nullable<Timestamp>,
+        free_why -> Nullable<Text>,
+        standing -> Text,
+        until -> Nullable<Timestamp>,
+        renews -> Bool,
+        billed -> Text,
+        set_by -> Text,
+        provider -> Nullable<Text>,
+        provider_customer -> Nullable<Text>,
+        provider_subscription -> Nullable<Text>,
+        checked_at -> Nullable<Timestamp>,
+        updated_at -> Timestamp,
+    }
+}

@@ -666,6 +666,18 @@ make_config! {
         org_creation_users:     String, true,   def,    String::new();
         /// Allow creating MSPs |> PassBundle: whether users can create an MSP, which manages client organizations. Off by default on self-hosted servers.
         msp_signups_allowed:    bool,   true,   def,    false;
+        /// Enforce plans |> PassBundle: whether what an account or an organization gets depends on its plan. Off, the default, everyone gets everything, as on any self-hosted server, and no plan is looked up. Set only in the environment.
+        plans_enforced:         bool,   false,  def,    false;
+        /// Plan grace (days) |> PassBundle: how many days a plan that was set to renew stays in effect past the date it was good through, while a failed payment is retried. Only where plans are enforced.
+        plan_grace_days:        i64,    true,   def,    14;
+        /// Premium storage (GB) |> PassBundle: the attachments a Premium plan gives a person, in GB. Only where plans are enforced.
+        plan_premium_storage_gb: i64,   true,   def,    5;
+        /// Families plan people |> PassBundle: how many people a Families plan covers. Only where plans are enforced.
+        plan_families_people:   i64,    true,   def,    6;
+        /// Organization storage a person (GB) |> PassBundle: the attachments an organization's plan gives for each person in it, in GB, pooled across the organization. Only where plans are enforced.
+        plan_org_storage_gb_per_person: i64, true, def, 1;
+        /// Organization storage at least (GB) |> PassBundle: the least an organization's plan gives for attachments, in GB, however few people are in it. Only where plans are enforced.
+        plan_org_storage_min_gb: i64,   true,   def,    5;
         /// Private networks events may go to |> PassBundle: private networks, addresses, or host names that organizations may send their events to, separated by commas, each with an optional port, for a self-hosted server whose security tools share its network: 10.0.0.0/8, 192.168.1.20:6514, [fd00::5]:443, siem.corp.example:443. Loopback only when a loopback address or network is listed itself (127.0.0.1). Link-local addresses and cloud metadata services are refused anyway. Empty: public addresses only.
         event_streaming_allowed_networks: String, false, def, String::new();
         /// Microsoft Entra sign-in for Sentinel |> PassBundle: where Sentinel destinations get their tokens, set only in the environment. https://login.microsoftonline.us for Azure Government, https://login.chinacloudapi.cn for Azure in China.
@@ -1527,6 +1539,19 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     // Keykeeper: the daily reading of MSP clients' seats.
     if !cfg.msp_seats_schedule.is_empty() && cfg.msp_seats_schedule.parse::<Schedule>().is_err() {
         err!("`MSP_SEATS_SCHEDULE` is not a valid cron expression")
+    }
+
+    // Keykeeper: what plans give (DESIGN.md, "Plans and billing").
+    if !(0..=366).contains(&cfg.plan_grace_days) {
+        err!("`PLAN_GRACE_DAYS` must be between 0 and 366")
+    }
+    if cfg.plan_families_people < 1 {
+        err!("`PLAN_FAMILIES_PEOPLE` must be at least 1")
+    }
+    if cfg.plan_premium_storage_gb < 0 || cfg.plan_org_storage_gb_per_person < 0 || cfg.plan_org_storage_min_gb < 0 {
+        err!(
+            "`PLAN_PREMIUM_STORAGE_GB`, `PLAN_ORG_STORAGE_GB_PER_PERSON`, and `PLAN_ORG_STORAGE_MIN_GB` can't be negative"
+        )
     }
 
     if !cfg.disable_admin_token {

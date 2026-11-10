@@ -313,7 +313,7 @@ impl User {
 
         let account_keys = self.account_keys_json();
 
-        json!({
+        let mut profile = json!({
             "_status": status as i32,
             "accountKeys": account_keys,
             "id": self.uuid,
@@ -336,7 +336,12 @@ impl User {
             "usesKeyConnector": false,
             "creationDate": format_date(&self.created_at),
             "object": "profile",
-        })
+        });
+        // Keykeeper: what the person's plans give, where PLANS_ENFORCED is
+        // set. With it off this adds `keykeeperPlan` and changes nothing
+        // (DESIGN.md, "Plans and billing").
+        super::put_in_profile(&mut profile, &self.uuid, conn).await;
+        profile
     }
 
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
