@@ -16,7 +16,7 @@ use crate::{
     CONFIG, VERSION,
     api::{
         ApiResult, EmptyResult, JsonResult, Notify,
-        core::{log_event, two_factor},
+        core::{keykeeper_plans::plan_changed, log_event, two_factor},
         push_logout_to_relay, unregister_push_device,
     },
     auth::{ClientIp, Secure, decode_admin, encode_jwt, generate_admin_claims},
@@ -24,8 +24,9 @@ use crate::{
     db::{
         ACTIVE_DB_TYPE, DbConn, DbConnType, backup_sqlite, get_sql_server_version,
         models::{
-            Attachment, Cipher, Collection, Device, Event, EventType, Group, Invitation, Membership, MembershipId,
-            MembershipType, OrgPolicy, Organization, OrganizationId, SsoUser, TwoFactor, User, UserId,
+            Attachment, Billed, Cipher, Collection, Device, Event, EventType, FreeWhy, Group, Invitation, Membership,
+            MembershipId, MembershipType, OrgPolicy, Organization, OrganizationId, Plan, PlanName, PlanOwner,
+            PlanState, PlanWrite, SetBy, SsoUser, Standing, TwoFactor, User, UserId, plan_at,
         },
     },
     error::{Error, MapResult},
@@ -68,6 +69,9 @@ pub fn routes() -> Vec<Route> {
         organizations_overview,
         sites_overview,
         approve_site_fix,
+        get_plan,
+        post_plan,
+        remove_plan,
         delete_organization,
         diagnostics,
         get_diagnostics_config,
@@ -430,6 +434,134 @@ async fn approve_site_fix(fix_id: &str, data: Json<SiteFixApproval>, _token: Adm
     if !crate::db::models::SiteFix::set_approved(fix_id, data.approved, &conn).await? {
         err_code!("Site fix not found", Status::NotFound.code)
     }
+    Ok(())
+}
+
+/// Keykeeper: what the operator sets on a plan (DESIGN.md, "Plans and
+/// billing"). The rest of a row is the server's or a provider's.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlanData {
+    /// `premium` for a person, `families` or `business` for an organization,
+    /// `msp` for an MSP.
+    plan: String,
+    /// Nothing has to be paid before then, and why: `trial` or `offer`.
+    free_until: Option<String>,
+    free_why: Option<String>,
+    /// `none`, `until` (good through the moment in `until`), or `open`.
+    standing: String,
+    until: Option<String>,
+    renews: bool,
+    /// `prepaid`, `by_the_day`, or `by_hand`, which is what's meant when it's
+    /// left out.
+    billed: Option<String>,
+}
+
+impl PlanData {
+    fn into_write(self) -> Result<PlanWrite, &'static str> {
+        fn date(value: Option<String>, problem: &'static str) -> Result<Option<chrono::NaiveDateTime>, &'static str> {
+            match value {
+                Some(value) => crate::util::parse_date(&value).map(Some).ok_or(problem),
+                None => Ok(None),
+            }
+        }
+        Ok(PlanWrite {
+            plan: PlanName::parse(&self.plan).ok_or("plan is premium, families, business, or msp")?,
+            free_until: date(self.free_until, "freeUntil is a date and time, like 2027-01-31T00:00:00Z")?,
+            free_why: match self.free_why.as_deref() {
+                Some(why) => Some(FreeWhy::parse(why).ok_or("freeWhy is trial or offer")?),
+                None => None,
+            },
+            standing: Standing::parse(&self.standing).ok_or("standing is none, until, or open")?,
+            until: date(self.until, "until is a date and time, like 2027-01-31T00:00:00Z")?,
+            renews: self.renews,
+            billed: match self.billed.as_deref() {
+                Some(billed) => Billed::parse(billed).ok_or("billed is prepaid, by_the_day, or by_hand")?,
+                None => Billed::ByHand,
+            },
+        })
+    }
+}
+
+/// Whose plan a path names: `users`, `organizations`, or `msps`, and an id.
+fn plan_owner(kind: &str, id: &str) -> ApiResult<PlanOwner> {
+    let Some(whose) = PlanOwner::parse(kind, id) else {
+        err_code!("Plan not found", Status::NotFound.code)
+    };
+    Ok(whose)
+}
+
+/// A plan as the operator reads it: the owner's own row, and what applies to
+/// it now, which for an MSP's client is the MSP's pool.
+async fn plan_for_operator(whose: &PlanOwner, conn: &DbConn) -> JsonResult {
+    let row = Plan::find(whose, conn).await?;
+    let now = plan_at(whose, None, chrono::Utc::now().naive_utc(), conn).await?;
+    Ok(Json(json!({
+        "enforced": CONFIG.plans_enforced(),
+        "plan": row.map(|row| row.to_json()),
+        "state": now.state.map(PlanState::as_str),
+        "coveredBy": now.covered_by.map(|(id, name)| json!({ "id": id, "name": name })),
+    })))
+}
+
+/// Keykeeper: a person's, an organization's, or an MSP's plan, for the
+/// operator. Like every route of the admin page, it exists only while the
+/// page is on, and takes the page's sign-in (`AdminToken`).
+#[get("/plans/<kind>/<id>")]
+async fn get_plan(kind: &str, id: &str, _token: AdminToken, conn: DbConn) -> JsonResult {
+    let whose = plan_owner(kind, id)?;
+    if !Plan::owner_exists(&whose, &conn).await? {
+        err_code!("Plan not found", Status::NotFound.code)
+    }
+    plan_for_operator(&whose, &conn).await
+}
+
+/// Keykeeper: the operator sets a plan by hand, for what no provider says:
+/// the first-MSPs offer, a customer who pays by bank transfer, a goodwill
+/// extension. This and `remove_plan` are the only routes that write a plan,
+/// and only the admin page's sign-in (`AdminToken`) reaches them. Each change
+/// is logged with the old and new values, and the people it reaches are told
+/// to sync.
+#[post("/plans/<kind>/<id>", format = "application/json", data = "<data>")]
+async fn post_plan(
+    kind: &str,
+    id: &str,
+    data: Json<PlanData>,
+    token: AdminToken,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> JsonResult {
+    let whose = plan_owner(kind, id)?;
+    let write = match data.into_inner().into_write() {
+        Ok(write) => write,
+        Err(problem) => err!(problem),
+    };
+    if let Some(problem) = write.refusal(&whose) {
+        err!(problem)
+    }
+    let Some((old, new)) = Plan::set(&whose, write, SetBy::Operator, &conn).await? else {
+        err_code!("Plan not found", Status::NotFound.code)
+    };
+    info!(
+        "The operator set the plan of {whose}. IP: {}. Before: {}. Now: {}.",
+        token.ip.ip,
+        old.map_or(Value::Null, |old| old.to_json()),
+        new.to_json()
+    );
+    plan_changed(&whose, &conn, nt).await;
+    plan_for_operator(&whose, &conn).await
+}
+
+/// Keykeeper: the operator removes a plan's row, such as one set by mistake.
+/// A person is then on Free, and an organization or an MSP has no plan.
+#[post("/plans/<kind>/<id>/remove", format = "application/json")]
+async fn remove_plan(kind: &str, id: &str, token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    let whose = plan_owner(kind, id)?;
+    let Some(old) = Plan::remove(&whose, &conn).await? else {
+        err_code!("Plan not found", Status::NotFound.code)
+    };
+    info!("The operator removed the plan of {whose}. IP: {}. Before: {}. Now: null.", token.ip.ip, old.to_json());
+    plan_changed(&whose, &conn, nt).await;
     Ok(())
 }
 
