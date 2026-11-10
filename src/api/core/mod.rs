@@ -22,6 +22,7 @@ pub mod keykeeper_new_device;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_password_change;
+mod keykeeper_plan_limits;
 pub mod keykeeper_plans;
 mod keykeeper_provisioning;
 mod keykeeper_reload_keys;
@@ -205,9 +206,15 @@ async fn put_settings_domains(
 }
 
 #[get("/hibp/breach?<username>")]
-async fn hibp_breach(username: &str, _headers: Headers) -> JsonResult {
+async fn hibp_breach(username: &str, headers: Headers, conn: DbConn) -> JsonResult {
     let username: String = url::form_urlencoded::byte_serialize(username.as_bytes()).collect();
     if let Some(api_key) = CONFIG.hibp_api_key() {
+        // Keykeeper: the report is Premium's, where plans are enforced. Checked
+        // here, where the server makes the lookup with its own key, and not
+        // for the answer below: that one is a link to the other site's free
+        // page, which a plan can't gate.
+        keykeeper_plan_limits::breach_report_needs_premium(&headers.user.uuid, &conn).await?;
+
         let url = format!(
             "https://haveibeenpwned.com/api/v3/breachedaccount/{username}?truncateResponse=false&includeUnverified=false"
         );
