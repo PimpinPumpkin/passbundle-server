@@ -22,6 +22,7 @@ pub mod keykeeper_new_device;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_password_change;
+pub mod keykeeper_plans;
 mod keykeeper_provisioning;
 mod keykeeper_reload_keys;
 pub mod keykeeper_scim;
@@ -92,6 +93,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_enrollment::routes());
     routes.append(&mut keykeeper_orgs::routes());
     routes.append(&mut keykeeper_password_change::routes());
+    routes.append(&mut keykeeper_plans::routes());
     routes.append(&mut keykeeper_browser_autofill::routes());
     routes.append(&mut keykeeper_provisioning::routes());
     routes.append(&mut keykeeper_reload_keys::routes());
