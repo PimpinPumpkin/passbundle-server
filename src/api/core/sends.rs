@@ -231,6 +231,9 @@ async fn post_send_file_v2(data: Json<SendData>, headers: Headers, conn: DbConn)
         err!("Send content is not a file");
     }
 
+    // Keykeeper: sending files is Premium's, where plans are enforced.
+    super::keykeeper_plan_limits::file_send_needs_premium(&headers.user.uuid, &conn).await?;
+
     enforce_disable_hide_email_policy(&data, &headers, &conn).await?;
 
     let file_length = if let Some(m) = &data.file_length {

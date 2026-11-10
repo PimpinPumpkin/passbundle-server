@@ -621,9 +621,9 @@ make_config! {
         /// HIBP Api Key |> HaveIBeenPwned API Key, request it here: https://haveibeenpwned.com/API/Key
         hibp_api_key:           Pass,   true,   option;
 
-        /// Per-user attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per user. When this limit is reached, the user will not be allowed to upload further attachments. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit.
+        /// Per-user attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per user. When this limit is reached, the user will not be allowed to upload further attachments. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit. Where plans are enforced there's no default: a person's attachments go by their plan, and a limit set here is the most any plan gives.
         user_attachment_limit:  i64,    true,   option;
-        /// Per-organization attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per org. When this limit is reached, org members will not be allowed to upload further attachments for ciphers owned by that org. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit.
+        /// Per-organization attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per org. When this limit is reached, org members will not be allowed to upload further attachments for ciphers owned by that org. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit. Where plans are enforced there's no default: an organization's attachments go by its plan, and a limit set here is the most any plan gives.
         org_attachment_limit:   i64,    true,   option;
         /// Per-user send storage limit (KB) |> Max kilobytes of sends storage allowed per user. When this limit is reached, the user will not be allowed to upload further sends. PassBundle: 1048576 (1 GB) by default on a public https DOMAIN, unlimited elsewhere; -1 for no limit.
         user_send_limit:        i64,    true,   option;
@@ -1682,17 +1682,24 @@ const HOSTED_STORAGE_KB: i64 = 1024 * 1024;
 /// signups verify their email address, and each person and each organization
 /// gets 1 GB for attachments, and each person 1 GB for Send files. A storage
 /// limit of -1 means none, on any server.
+///
+/// Where plans are enforced, attachments go by the plan of whoever owns the
+/// item ("Plans and billing"), so their 1 GB default gives way to it: the
+/// attachment limits are then only what the operator chose, which a plan
+/// never gives more than. What a person may keep in Send files stays the
+/// server's, whatever their plan.
 fn hosted_defaults(config: &mut ConfigItems, set: &ConfigBuilder) {
     let public = config._domain_public_https;
     if public && set.signups_verify.is_none() {
         config.signups_verify = true;
     }
-    for (limit, chosen) in [
-        (&mut config.user_attachment_limit, set.user_attachment_limit),
-        (&mut config.org_attachment_limit, set.org_attachment_limit),
-        (&mut config.user_send_limit, set.user_send_limit),
+    let by_plan = config.plans_enforced;
+    for (limit, chosen, has_default) in [
+        (&mut config.user_attachment_limit, set.user_attachment_limit, !by_plan),
+        (&mut config.org_attachment_limit, set.org_attachment_limit, !by_plan),
+        (&mut config.user_send_limit, set.user_send_limit, true),
     ] {
-        if public && chosen.is_none() {
+        if public && has_default && chosen.is_none() {
             *limit = Some(HOSTED_STORAGE_KB);
         }
         if limit.is_some_and(|l| l < 0) {
@@ -2356,6 +2363,44 @@ mod keykeeper_tests {
             assert_eq!(config.user_attachment_limit, None);
         }
         assert_eq!(built("http://localhost", |b| b.user_send_limit = Some(-1)).user_send_limit, None);
+    }
+
+    #[test]
+    fn where_plans_are_enforced_the_attachment_default_gives_way_to_the_plan() {
+        // No 1 GB for attachments: each plan says how much. Send files keep the server's 1 GB.
+        let hosted = built("https://vault.passbundle.com", |b| b.plans_enforced = Some(true));
+        assert!(hosted.plans_enforced);
+        assert_eq!(hosted.user_attachment_limit, None);
+        assert_eq!(hosted.org_attachment_limit, None);
+        assert_eq!(hosted.user_send_limit, Some(HOSTED_STORAGE_KB));
+        assert!(hosted.signups_verify);
+
+        // A limit the operator chose stays, to cap what a plan gives, and -1 still means none.
+        let chosen = built("https://vault.passbundle.com", |b| {
+            b.plans_enforced = Some(true);
+            b.user_attachment_limit = Some(2048);
+            b.org_attachment_limit = Some(0);
+            b.user_send_limit = Some(-1);
+        });
+        assert_eq!(chosen.user_attachment_limit, Some(2048));
+        assert_eq!(chosen.org_attachment_limit, Some(0));
+        assert_eq!(chosen.user_send_limit, None);
+        let unlimited = built("https://vault.passbundle.com", |b| {
+            b.plans_enforced = Some(true);
+            b.user_attachment_limit = Some(-1);
+        });
+        assert_eq!(unlimited.user_attachment_limit, None);
+
+        // A local server had no default to give way.
+        let local = built("https://127.0.0.1:8000", |b| b.plans_enforced = Some(true));
+        assert_eq!(local.user_attachment_limit, None);
+        assert_eq!(local.org_attachment_limit, None);
+        assert_eq!(local.user_send_limit, None);
+
+        // With plans not enforced, nothing changes: the test above.
+        let off = built("https://vault.passbundle.com", |b| b.plans_enforced = Some(false));
+        assert_eq!(off.user_attachment_limit, Some(HOSTED_STORAGE_KB));
+        assert_eq!(off.org_attachment_limit, Some(HOSTED_STORAGE_KB));
     }
 
     #[test]
