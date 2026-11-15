@@ -1433,6 +1433,9 @@ async fn post_attachment_v2(
         err!("Max file size is 525 MB.")
     }
 
+    // Keykeeper: by the plan of whoever owns the item, where plans are enforced.
+    super::keykeeper_plan_limits::attachment_must_fit(&cipher, file_size, 0, &conn).await?;
+
     if let Some(size_limit) = attachment_size_limit(&cipher, 0, &conn).await?
         && file_size > size_limit
     {
@@ -1505,6 +1508,9 @@ async fn save_attachment(
         None => 0,              // Legacy API
         Some(a) => a.file_size, // v2 API
     };
+
+    // Keykeeper: by the plan of whoever owns the item, where plans are enforced.
+    super::keykeeper_plan_limits::attachment_must_fit(&cipher, size, size_adjust, &conn).await?;
 
     if let Some(size_limit) = attachment_size_limit(&cipher, size_adjust, &conn).await?
         && size > size_limit
@@ -1659,6 +1665,20 @@ async fn post_attachment_share(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
+    // Keykeeper: where plans are enforced, a file the owner's plan has no room
+    // for is refused before the one it replaces is deleted, so a refusal never
+    // costs anyone a file. Only once the delete below would go through, so
+    // nobody who can't write the item learns anything about its owner's plan.
+    if CONFIG.plans_enforced()
+        && let Some(replaced) = Attachment::find_by_id(&attachment_id, &conn).await
+        && replaced.cipher_uuid == cipher_id
+        && let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await
+        && cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await
+    {
+        let size = data.data.len().to_i64().unwrap_or(i64::MAX);
+        super::keykeeper_plan_limits::attachment_must_fit(&cipher, size, replaced.file_size, &conn).await?;
+    }
+
     delete_cipher_attachment_by_id(&cipher_id, &attachment_id, &headers, &conn, &nt).await?;
     post_attachment(cipher_id, data, headers, conn, nt).await
 }

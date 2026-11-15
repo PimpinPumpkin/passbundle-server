@@ -85,6 +85,8 @@ pub use self::keykeeper_plans::{
     Billed, FreeWhy, Plan, PlanName, PlanOwner, PlanState, PlanWrite, SetBy, Standing, Terms, may_manage_plan,
     not_enforced_json, people_a_plan_reaches, plan_at, put_in_profile,
 };
+// Keykeeper: what the plan limits ask (`src/api/core/keykeeper_plan_limits.rs`).
+pub use self::keykeeper_plans::{PersonGets, what_a_person_gets};
 pub use self::keykeeper_scim::{
     ScimGroup, ScimPerson, ScimToken, ScimUser, looks_like_scim_token, remove_group_member,
 };
