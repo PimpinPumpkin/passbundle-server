@@ -24,6 +24,7 @@ mod keykeeper_new_device;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_password_change;
+mod keykeeper_plan_clock;
 mod keykeeper_plans;
 pub mod keykeeper_roles;
 mod keykeeper_scim;
@@ -88,6 +89,10 @@ pub use self::keykeeper_password_change::OrgPasswordChange;
 pub use self::keykeeper_plans::{
     Billed, FreeWhy, Plan, PlanName, PlanNow, PlanOwner, PlanState, PlanWrite, SetBy, Standing, Terms, may_manage_plan,
     not_enforced_json, people_a_plan_reaches, plan_at, put_in_profile,
+};
+// Keykeeper: the trial clock and the reminders (`src/api/core/keykeeper_plan_clock.rs`).
+pub use self::keykeeper_plan_clock::{
+    DueReminder, PlanNotice, Reminder, after_leaving_msp, run_clock, start_trial_now,
 };
 // Keykeeper: what the plan limits ask (`src/api/core/keykeeper_plan_limits.rs`).
 pub use self::keykeeper_plans::{PersonGets, what_a_person_gets};

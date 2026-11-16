@@ -10,7 +10,9 @@
 //
 // Nothing here refuses anything, takes a payment, or talks to a provider, and
 // no request from a signed-in person ever writes a plan. Rows are written by
-// the operator through the admin page (`src/api/admin.rs`).
+// the operator through the admin page (`src/api/admin.rs`), and trials by the
+// server itself (`keykeeper_plan_clock.rs`), including when the one function
+// finds an organization or an MSP with no row.
 
 use std::collections::{HashMap, HashSet};
 
@@ -276,6 +278,26 @@ impl Plan {
         self.free_why.as_deref().and_then(FreeWhy::parse)
     }
 
+    /// How long the plan's standing keeps it in effect, with `grace_days` of
+    /// grace (PLAN_GRACE_DAYS). `state_at` and `ends_at` both read it, so the
+    /// grace rule is written once.
+    fn standing_ends(&self, grace_days: i64) -> StandingEnds {
+        match (self.standing(), self.until) {
+            (Standing::Open, _) => StandingEnds::Never,
+            (Standing::Until, Some(until)) => {
+                // A plan someone canceled (`renews` false) gets no grace.
+                let grace = TimeDelta::try_days(grace_days).filter(|_| self.renews);
+                let grace_through = grace.and_then(|grace| until.checked_add_signed(grace)).unwrap_or(until);
+                StandingEnds::At {
+                    paid_through: until,
+                    grace_through,
+                }
+            }
+            // Never paid, or an "until" with no date, which is never read as paid.
+            _ => StandingEnds::Unpaid,
+        }
+    }
+
     /// The plan's state at `at`, with `grace_days` of grace (PLAN_GRACE_DAYS).
     ///
     /// - In good standing (`open`, or `until` with `at` no later than the
@@ -288,28 +310,69 @@ impl Plan {
     ///   (`renews` false) gets no grace, and a free period has none after it.
     /// - Past all three: ended.
     pub fn state_at(&self, at: NaiveDateTime, grace_days: i64) -> PlanState {
-        let standing = self.standing();
-        let good = match standing {
-            Standing::Open => true,
-            Standing::Until => self.until.is_some_and(|until| at <= until),
-            Standing::None => false,
-        };
-        if good {
-            return PlanState::Active;
+        let ends = self.standing_ends(grace_days);
+        match ends {
+            StandingEnds::Never => return PlanState::Active,
+            StandingEnds::At {
+                paid_through,
+                ..
+            } if at <= paid_through => return PlanState::Active,
+            _ => {}
         }
         if self.free_until.is_some_and(|free_until| at < free_until) {
             return PlanState::Trial;
         }
-        let grace_ends = match (standing, self.renews, self.until, TimeDelta::try_days(grace_days)) {
-            (Standing::Until, true, Some(until), Some(grace)) => until.checked_add_signed(grace),
-            _ => None,
-        };
-        if grace_ends.is_some_and(|ends| at <= ends) {
-            PlanState::PaymentDue
-        } else {
-            PlanState::Ended
+        match ends {
+            StandingEnds::At {
+                grace_through,
+                ..
+            } if at <= grace_through => PlanState::PaymentDue,
+            _ => PlanState::Ended,
         }
     }
+
+    /// When the plan stops being in effect, by the same rule as `state_at`:
+    /// the later of `free_until` and the end of its standing, which is
+    /// `until` for a plan someone canceled and `until` plus the grace for one
+    /// set to renew. None for a plan in good standing with no end set, and
+    /// for one that was never in effect at all.
+    pub fn ends_at(&self, grace_days: i64) -> Option<NaiveDateTime> {
+        match self.standing_ends(grace_days) {
+            StandingEnds::Never => None,
+            StandingEnds::At {
+                grace_through,
+                ..
+            } => Some(self.free_until.map_or(grace_through, |free_until| free_until.max(grace_through))),
+            StandingEnds::Unpaid => self.free_until,
+        }
+    }
+
+    /// For a plan set to renew and good until a date, the last moment of its
+    /// grace. None for any other plan, which has no grace.
+    pub fn grace_ends(&self, grace_days: i64) -> Option<NaiveDateTime> {
+        match self.standing_ends(grace_days) {
+            StandingEnds::At {
+                grace_through,
+                ..
+            } if self.renews => Some(grace_through),
+            _ => None,
+        }
+    }
+}
+
+/// How long a plan's standing keeps it in effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandingEnds {
+    /// Good with no end set.
+    Never,
+    /// Good through `paid_through`, then in grace through `grace_through`
+    /// (the same moment, for a plan someone canceled).
+    At {
+        paid_through: NaiveDateTime,
+        grace_through: NaiveDateTime,
+    },
+    /// Never paid, or over.
+    Unpaid,
 }
 
 /// The plans' figures, which are settings whose defaults are the site's
@@ -318,6 +381,13 @@ impl Plan {
 pub struct Terms {
     /// PLAN_GRACE_DAYS
     pub grace_days: i64,
+    /// PLAN_TRIAL_DAYS
+    pub trial_days: i64,
+    /// Whether an organization or an MSP found with no row gets a trial from
+    /// that moment ("The trial clock"): only where plans are enforced, so
+    /// turning enforcement on never ends anything on the spot. Off, nothing
+    /// is written.
+    pub starts_trials: bool,
     /// PLAN_PREMIUM_STORAGE_GB
     pub premium_storage_gb: i64,
     /// PLAN_FAMILIES_PEOPLE
@@ -335,6 +405,8 @@ impl Terms {
     pub fn from_config() -> Self {
         Self {
             grace_days: CONFIG.plan_grace_days(),
+            trial_days: CONFIG.plan_trial_days(),
+            starts_trials: CONFIG.plans_enforced(),
             premium_storage_gb: CONFIG.plan_premium_storage_gb(),
             families_people: CONFIG.plan_families_people(),
             org_storage_gb_per_person: CONFIG.plan_org_storage_gb_per_person(),
@@ -476,8 +548,31 @@ pub(super) fn find_row(conn: &mut DbConnInner, whose: &PlanOwner) -> Query<Optio
     }
 }
 
+/// The row that applies to `whose` at `at`: its own, or for an MSP's client
+/// its MSP's. An organization or an MSP found with no row, where trials are
+/// started (`Terms::starts_trials`), gets one from `at` (`start_trial` in
+/// keykeeper_plan_clock.rs), so turning enforcement on never ends anything on
+/// the spot.
+fn applying_row(
+    conn: &mut DbConnInner,
+    whose: &PlanOwner,
+    covered_by: Option<&MspId>,
+    at: NaiveDateTime,
+    terms: &Terms,
+) -> Query<Option<Plan>> {
+    let whose = match covered_by {
+        Some(msp) => &PlanOwner::Msp(msp.clone()),
+        None => whose,
+    };
+    match find_row(conn, whose)? {
+        Some(row) => Ok(Some(row)),
+        None if terms.starts_trials => super::keykeeper_plan_clock::start_trial(conn, whose, at, terms.trial_days),
+        None => Ok(None),
+    }
+}
+
 /// The MSP an organization is a client of now, and the MSP's name.
-fn covering_msp(conn: &mut DbConnInner, org: &OrganizationId) -> Query<Option<(MspId, String)>> {
+pub(super) fn covering_msp(conn: &mut DbConnInner, org: &OrganizationId) -> Query<Option<(MspId, String)>> {
     let msp = msp_clients::table
         .filter(msp_clients::org_uuid.eq(org))
         .select(msp_clients::msp_uuid)
@@ -571,10 +666,7 @@ fn plan_now(
         PlanOwner::Organization(org) => covering_msp(conn, org)?,
         _ => None,
     };
-    let row = match &covered_by {
-        Some((msp, _)) => find_row(conn, &PlanOwner::Msp(msp.clone()))?,
-        None => find_row(conn, whose)?,
-    };
+    let row = applying_row(conn, whose, covered_by.as_ref().map(|(msp, _)| msp), at, terms)?;
     let state = row.as_ref().map(|row| row.state_at(at, terms.grace_days));
     let gives = match (row.as_ref().and_then(Plan::name), whose) {
         (Some(name), PlanOwner::Organization(org)) => {
@@ -614,7 +706,7 @@ fn person_gets(conn: &mut DbConnInner, user: &UserId, at: NaiveDateTime, terms: 
         .select(msp_staff::msp_uuid)
         .load::<MspId>(conn)?;
     for msp in staff_of {
-        let pool = find_row(conn, &PlanOwner::Msp(msp))?;
+        let pool = applying_row(conn, &PlanOwner::Msp(msp), None, at, terms)?;
         if pool.is_some_and(|row| row.state_at(at, terms.grace_days).in_effect()) {
             premium_from_organization = true;
         }
@@ -682,6 +774,9 @@ impl PlanNow {
     /// The dates, whether it renews, and a payment that's due are for whoever
     /// manages the plan. Everyone else is told only what they get: a plan in
     /// grace reads as active to them, since grace changes nothing for them.
+    /// `endsAt` is when the plan stops being in effect, worked out by the one
+    /// rule `state_at` follows (`Plan::ends_at`), and null for a plan with no
+    /// end set.
     pub fn to_json(&self, terms: &Terms) -> Value {
         let plan = match (&self.row, &self.whose) {
             (Some(row), _) => Value::from(row.plan.as_str()),
@@ -701,6 +796,7 @@ impl PlanNow {
             "freeWhy": row.and_then(Plan::free_why).map(FreeWhy::as_str),
             "until": row.and_then(|row| row.until).map(|date| format_date(&date)),
             "renews": row.map(|row| row.renews),
+            "endsAt": row.and_then(|row| row.ends_at(terms.grace_days)).map(|date| format_date(&date)),
             "storageGb": self.storage_gb(terms),
             "people": self.gives.and_then(|gives| gives.people),
             "coveredBy": self.covered_by.as_ref().map(|(id, name)| json!({ "id": id, "name": name })),
@@ -818,7 +914,7 @@ impl PlanWrite {
     }
 }
 
-fn owner_exists(conn: &mut DbConnInner, whose: &PlanOwner) -> Query<bool> {
+pub(super) fn owner_exists(conn: &mut DbConnInner, whose: &PlanOwner) -> Query<bool> {
     let found = match whose {
         PlanOwner::User(id) => users::table.filter(users::uuid.eq(id)).count().get_result::<i64>(conn)?,
         PlanOwner::Organization(id) => {
@@ -1135,10 +1231,127 @@ mod tests {
         assert_eq!(no_date.state_at(end, days), PlanState::Ended);
     }
 
+    #[test]
+    fn when_a_plan_stops_being_in_effect() {
+        let days = 14;
+        let end = noon();
+        let grace = TimeDelta::days(days);
+
+        // A trial: when its free time ends, the first moment it isn't in effect.
+        let trial = Plan {
+            free_until: Some(end),
+            free_why: Some("trial".to_owned()),
+            ..row(PlanName::Business)
+        };
+        assert_eq!(trial.ends_at(days), Some(end));
+        assert_eq!(trial.state_at(end - second(), days), PlanState::Trial);
+        assert_eq!(trial.state_at(end, days), PlanState::Ended);
+
+        // A canceled plan: at until, with no grace.
+        let canceled = Plan {
+            standing: "until".to_owned(),
+            until: Some(end),
+            renews: false,
+            ..row(PlanName::Premium)
+        };
+        assert_eq!(canceled.ends_at(days), Some(end));
+        assert_eq!(canceled.state_at(end, days), PlanState::Active);
+        assert_eq!(canceled.state_at(end + second(), days), PlanState::Ended);
+
+        // Set to renew: until and the grace, whether it's in grace now or past it.
+        let renewing = Plan {
+            renews: true,
+            ..canceled.clone()
+        };
+        assert_eq!(renewing.ends_at(days), Some(end + grace));
+        assert_eq!(renewing.grace_ends(days), Some(end + grace));
+        assert_eq!(renewing.state_at(end + grace, days), PlanState::PaymentDue);
+        assert_eq!(renewing.state_at(end + grace + second(), days), PlanState::Ended);
+        // The grace is the setting's.
+        assert_eq!(renewing.ends_at(7), Some(end + TimeDelta::days(7)));
+        assert_eq!(renewing.ends_at(0), Some(end));
+        assert_eq!(canceled.grace_ends(days), None);
+
+        // Whichever is later, free time or the standing's end.
+        let free_later = Plan {
+            free_until: Some(end + TimeDelta::days(20)),
+            free_why: Some("offer".to_owned()),
+            ..renewing.clone()
+        };
+        assert_eq!(free_later.ends_at(days), Some(end + TimeDelta::days(20)));
+        let paid_later = Plan {
+            free_until: Some(end - TimeDelta::days(20)),
+            free_why: Some("trial".to_owned()),
+            ..renewing
+        };
+        assert_eq!(paid_later.ends_at(days), Some(end + grace));
+
+        // Good with no end set, and never in effect: none.
+        let open = Plan {
+            standing: "open".to_owned(),
+            renews: true,
+            ..row(PlanName::Msp)
+        };
+        assert_eq!(open.ends_at(days), None);
+        let open_after_a_trial = Plan {
+            free_until: Some(end),
+            free_why: Some("trial".to_owned()),
+            ..open
+        };
+        assert_eq!(open_after_a_trial.ends_at(days), None);
+        assert_eq!(row(PlanName::Business).ends_at(days), None);
+    }
+
+    #[test]
+    fn the_sync_says_when_a_plan_ends_to_whoever_manages_it() {
+        let terms = site_terms();
+        let ana = PlanOwner::User("ana".to_owned().into());
+        let acme = PlanOwner::Organization("acme".to_owned().into());
+        let until = noon();
+        let renewing = Plan {
+            standing: "until".to_owned(),
+            until: Some(until),
+            renews: true,
+            ..row(PlanName::Business)
+        };
+        let ends = |row: Option<Plan>, at: NaiveDateTime, manages: bool| {
+            as_it_stands(acme.clone(), row, at, 3, manages).to_json(&terms)["endsAt"].clone()
+        };
+        let grace_ends = json!(format_date(&(until + TimeDelta::days(14))));
+        // In grace, and past it: the same moment.
+        assert_eq!(ends(Some(renewing.clone()), until + second(), true), grace_ends);
+        assert_eq!(ends(Some(renewing.clone()), until + TimeDelta::days(30), true), grace_ends);
+        // Only whoever manages the plan is told, as with until.
+        assert_eq!(ends(Some(renewing.clone()), until + second(), false), Value::Null);
+        // A canceled plan, a trial, open standing, and no row.
+        let canceled = Plan {
+            renews: false,
+            ..renewing.clone()
+        };
+        assert_eq!(ends(Some(canceled), until, true), json!(format_date(&until)));
+        let trial = Plan {
+            free_until: Some(until),
+            free_why: Some("trial".to_owned()),
+            ..row(PlanName::Business)
+        };
+        assert_eq!(ends(Some(trial), until - second(), true), json!(format_date(&until)));
+        let open = Plan {
+            standing: "open".to_owned(),
+            ..renewing
+        };
+        assert_eq!(ends(Some(open), until, true), Value::Null);
+        assert_eq!(ends(None, until, true), Value::Null);
+        assert_eq!(as_it_stands(ana, None, until, 0, true).to_json(&terms)["endsAt"], Value::Null);
+    }
+
     /// The site's proposals, which are the settings' defaults.
     fn site_terms() -> Terms {
         Terms {
             grace_days: 14,
+            trial_days: 30,
+            // As on a server that doesn't enforce plans, so the tests here see
+            // the rows they wrote and no others. `trials` turns it on.
+            starts_trials: false,
             premium_storage_gb: 5,
             families_people: 6,
             org_storage_gb_per_person: 1,
@@ -1545,6 +1758,113 @@ mod tests {
         assert_eq!(state_in(&gets_at(&member, free_until, &conn).await, &clinic), Some(PlanState::Active));
     }
 
+    /// The terms where plans are enforced: an organization or an MSP found
+    /// with no row gets a trial.
+    fn trials() -> Terms {
+        Terms {
+            starts_trials: true,
+            ..Terms::from_config()
+        }
+    }
+
+    async fn gets_with(user: &User, at: NaiveDateTime, terms: Terms, conn: &DbConn) -> PersonGets {
+        conn.run(move |conn| person_gets(conn, &user.uuid, at, &terms)).await.unwrap()
+    }
+
+    #[rocket::async_test]
+    async fn an_organization_found_with_no_row_gets_a_trial_from_that_moment() {
+        let conn = DbPool::for_test().await;
+        let acme = organization("Acme", &conn).await;
+        let owner = person("owner", &conn).await;
+        join(&owner, &acme, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        let found = noon();
+        let ends = found + TimeDelta::days(CONFIG.plan_trial_days());
+
+        // Where plans aren't enforced, nothing is written: no plan.
+        let off = gets_with(&owner, found, Terms::from_config(), &conn).await;
+        assert_eq!(state_in(&off, &acme), None);
+        assert_eq!(Plan::find(&of_org(&acme), &conn).await.unwrap(), None);
+
+        // Enforced: a trial from the moment it's found, so nothing ends on the spot.
+        let gets = gets_with(&owner, found, trials(), &conn).await;
+        assert_eq!(state_in(&gets, &acme), Some(PlanState::Trial));
+        assert!(gets.premium_from_organization && !gets.premium);
+        let row = Plan::find(&of_org(&acme), &conn).await.unwrap().unwrap();
+        assert_eq!(
+            (row.plan.as_str(), row.free_until, row.free_why.as_deref()),
+            ("business", Some(ends), Some("trial"))
+        );
+        assert_eq!((row.standing.as_str(), row.set_by.as_str()), ("none", "server"));
+
+        // Found again later, it's the same trial: the second before it ends, and the second it does.
+        let before = gets_with(&owner, ends - second(), trials(), &conn).await;
+        assert_eq!(state_in(&before, &acme), Some(PlanState::Trial));
+        let after = gets_with(&owner, ends, trials(), &conn).await;
+        assert_eq!(state_in(&after, &acme), Some(PlanState::Ended));
+        assert!(!after.premium_from_organization);
+        assert_eq!(Plan::find(&of_org(&acme), &conn).await.unwrap(), Some(row));
+
+        // A person found with no row is on Free, and gets no trial.
+        assert_eq!(Plan::find(&of(&owner), &conn).await.unwrap(), None);
+    }
+
+    #[rocket::async_test]
+    async fn an_msp_found_with_no_row_gets_a_trial_for_its_pool_and_its_clients() {
+        let conn = DbPool::for_test().await;
+        let northwind = msp("Northwind IT", &conn).await;
+        let tech = person("tech", &conn).await;
+        staff(&northwind, &tech, MspRole::Technician, &conn).await;
+        let clinic = organization("Lakeside Clinic", &conn).await;
+        let nurse = person("nurse", &conn).await;
+        join(&nurse, &clinic, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        take_on(&northwind, &clinic, &conn).await;
+
+        let gets = gets_with(&nurse, noon(), trials(), &conn).await;
+        assert_eq!(state_in(&gets, &clinic), Some(PlanState::Trial));
+        assert!(gets.premium_from_organization);
+        // The pool has the trial, and the client none of its own.
+        let pool = Plan::find(&of_msp(&northwind), &conn).await.unwrap().unwrap();
+        assert_eq!((pool.plan.as_str(), pool.free_why.as_deref()), ("msp", Some("trial")));
+        assert_eq!(Plan::find(&of_org(&clinic), &conn).await.unwrap(), None);
+        assert_eq!(gets.organizations[&clinic.uuid].row.as_ref(), Some(&pool));
+        // Its staff are covered by it too.
+        let theirs = gets_with(&tech, noon(), trials(), &conn).await;
+        assert!(theirs.premium_from_organization);
+    }
+
+    #[rocket::async_test]
+    async fn the_moment_a_client_leaves_its_msp_its_30_days_start() {
+        let conn = DbPool::for_test().await;
+        let northwind = msp("Northwind IT", &conn).await;
+        let clinic = organization("Lakeside Clinic", &conn).await;
+        let owner = person("owner", &conn).await;
+        join(&owner, &clinic, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        take_on(&northwind, &clinic, &conn).await;
+        set(&of_msp(&northwind), open(PlanName::Msp), &conn).await;
+        // A plan of its own that ended long ago, ignored while it's a client.
+        set(&of_org(&clinic), paid(PlanName::Business, noon() - TimeDelta::days(400), false), &conn).await;
+        assert_eq!(state_in(&gets_with(&owner, noon(), trials(), &conn).await, &clinic), Some(PlanState::Active));
+
+        let left = noon();
+        let ends = left + TimeDelta::days(30);
+        leave(&clinic, &conn).await;
+        let id = clinic.uuid.clone();
+        conn.run(move |conn| super::super::keykeeper_plan_clock::left_msp(conn, &id, left, 30)).await.unwrap();
+
+        let gets = gets_with(&owner, left, trials(), &conn).await;
+        let plan = &gets.organizations[&clinic.uuid];
+        assert_eq!(plan.state, Some(PlanState::Trial));
+        assert_eq!(plan.covered_by, None);
+        assert!(plan.may_manage);
+        assert!(gets.premium_from_organization);
+        assert_eq!(plan.row.as_ref().and_then(|row| row.free_until), Some(ends));
+        assert_eq!(
+            state_in(&gets_with(&owner, ends - second(), trials(), &conn).await, &clinic),
+            Some(PlanState::Trial)
+        );
+        assert_eq!(state_in(&gets_with(&owner, ends, trials(), &conn).await, &clinic), Some(PlanState::Ended));
+    }
+
     #[rocket::async_test]
     async fn only_people_who_have_joined_hold_a_seat() {
         let conn = DbPool::for_test().await;
@@ -1858,6 +2178,7 @@ mod tests {
                 "freeWhy": null,
                 "until": null,
                 "renews": null,
+                "endsAt": null,
                 "storageGb": 0,
                 "people": null,
                 "coveredBy": null,
@@ -1894,6 +2215,7 @@ mod tests {
                 "freeWhy": "trial",
                 "until": format_date(&until),
                 "renews": true,
+                "endsAt": format_date(&(until + TimeDelta::days(14))),
                 "storageGb": 12,
                 "people": null,
                 "coveredBy": null,
@@ -1914,6 +2236,7 @@ mod tests {
                 "freeWhy": null,
                 "until": null,
                 "renews": null,
+                "endsAt": null,
                 "storageGb": 12,
                 "people": null,
                 "coveredBy": null,

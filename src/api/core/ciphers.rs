@@ -515,6 +515,12 @@ pub async fn update_cipher_from_data(
         match Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, conn).await {
             None => err!("You don't have permission to add item to organization"),
             Some(member) => {
+                // Keykeeper: no new shared item, and no item moved into it,
+                // for an organization whose plan has ended. Its items can
+                // still be edited (DESIGN.md, "What happens when payment stops").
+                if matches!(save, ItemSave::New) || transfer_cipher {
+                    super::keykeeper_plan_limits::refuse_if_ended(&org_id, conn).await?;
+                }
                 // A non-empty list of collections implies the caller already validated the user's write
                 // access to them, so we can move the cipher into the organization on that basis.
                 // Write access to the cipher itself only counts when it already belongs to this organization.

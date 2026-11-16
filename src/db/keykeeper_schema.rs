@@ -668,6 +668,15 @@ table! {
 }
 
 table! {
+    plan_notices (plan_uuid, notice, about) {
+        plan_uuid -> Text,
+        notice -> Text,
+        about -> Timestamp,
+        sent_at -> Timestamp,
+    }
+}
+
+table! {
     plans (uuid) {
         uuid -> Text,
         user_uuid -> Nullable<Text>,

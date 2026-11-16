@@ -66,6 +66,12 @@ pub async fn plan_changed(whose: &PlanOwner, conn: &DbConn, nt: Notify<'_>) {
     if !CONFIG.plans_enforced() {
         return;
     }
+    tell_people_to_sync(whose, conn, nt).await;
+}
+
+/// Sends the people a plan reaches the sync notice: for a change someone
+/// made (`plan_changed`), and for one the clock made (keykeeper_plan_clock.rs).
+pub async fn tell_people_to_sync(whose: &PlanOwner, conn: &DbConn, ws: &crate::api::notifications::WebSocketUsers) {
     let people = match people_a_plan_reaches(whose, conn).await {
         Ok(people) => people,
         Err(e) => {
@@ -76,7 +82,7 @@ pub async fn plan_changed(whose: &PlanOwner, conn: &DbConn, nt: Notify<'_>) {
     for uuid in people {
         User::update_uuid_revision(&uuid, conn).await;
         if let Some(user) = User::find_by_uuid(&uuid, conn).await {
-            nt.send_user_update(UpdateType::SyncVault, &user, None, conn).await;
+            ws.send_user_update(UpdateType::SyncVault, &user, None, conn).await;
         }
     }
 }

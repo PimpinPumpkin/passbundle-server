@@ -797,6 +797,14 @@ fn schedule_jobs(pool: db::DbPool) {
                 }));
             }
 
+            // Keykeeper: the plans' clock, which does nothing unless plans are
+            // enforced (default hourly, 20 minutes past the hour).
+            if !CONFIG.plan_reminders_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.plan_reminders_schedule().parse().unwrap(), || {
+                    runtime.spawn(api::plan_clock_job(pool.clone()));
+                }));
+            }
+
             // Keykeeper: ask the payment provider again about the plans it set (default
             // hourly), only where plans are enforced and a provider is set.
             if keykeeper_billing::billing().is_some() && !CONFIG.billing_look_schedule().is_empty() {

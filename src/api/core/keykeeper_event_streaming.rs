@@ -902,6 +902,9 @@ async fn list_org(org_id: OrganizationId, headers: Headers, conn: DbConn) -> Jso
 #[post("/keykeeper/organizations/<org_id>/event-streaming", data = "<data>")]
 async fn create_org(org_id: OrganizationId, data: Json<DestinationData>, headers: Headers, conn: DbConn) -> JsonResult {
     let scope = require_org_manager(&org_id, &headers, &conn).await?;
+    // Keykeeper: no new destination for an organization whose plan has ended
+    // (DESIGN.md, "What happens when payment stops"). Those it has keep sending.
+    super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
     create(scope, data.into_inner(), &headers, &conn).await
 }
 
@@ -952,6 +955,8 @@ async fn list_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
 #[post("/keykeeper/msp/<msp_id>/event-streaming", data = "<data>")]
 async fn create_msp(msp_id: MspId, data: Json<DestinationData>, headers: Headers, conn: DbConn) -> JsonResult {
     let scope = require_msp_admin(&msp_id, &headers, &conn).await?;
+    // Keykeeper: nor for an MSP whose pool has ended.
+    super::keykeeper_plan_limits::refuse_if_pool_ended(&msp_id, &conn).await?;
     create(scope, data.into_inner(), &headers, &conn).await
 }
 

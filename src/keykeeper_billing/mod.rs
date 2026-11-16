@@ -695,6 +695,9 @@ mod tests {
         }
         let terms = Terms {
             grace_days: 14,
+            trial_days: 30,
+            // As these tests ask only how a plan reads, never a trial started.
+            starts_trials: false,
             premium_storage_gb: 5,
             families_people: 6,
             org_storage_gb_per_person: 1,

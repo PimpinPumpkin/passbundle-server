@@ -886,6 +886,7 @@ async fn create_user(caller: &ScimCaller, body: Value, conn: &DbConn) -> ScimRes
         return Ok(ScimResponse::created(user_json(&person, &caller.base)));
     }
 
+    refuse_if_ended(org, conn).await?;
     if CREATES.check_key(org.as_ref()).is_err() {
         return Err(ScimError::new(Status::TooManyRequests, None, "Too many new people this minute; try again soon"));
     }
@@ -988,6 +989,7 @@ async fn update_user(caller: &ScimCaller, mut person: ScimPerson, fields: UserFi
                     "An owner or admin turned this person off in PassBundle; they turn them back on there.",
                 ));
             }
+            refuse_if_ended(org, conn).await?;
             scim.turned_off = false;
             // Keykeeper: a role they never accepted, where it requires
             // two-step login, comes back only when they accept it.
@@ -1237,8 +1239,24 @@ fn string_field(resource: &Value, name: &str) -> Result<Option<String>, ScimErro
     }
 }
 
+/// Keykeeper: nothing new is added to an organization whose plan has ended:
+/// no new people, nobody turned back on, and no new groups (DESIGN.md, "What
+/// happens when payment stops"). The directory still turns people off,
+/// removes them, and changes who's in a group.
+async fn refuse_if_ended(org: &OrganizationId, conn: &DbConn) -> Result<(), ScimError> {
+    if crate::api::core::keykeeper_plan_limits::organization_has_ended(org, conn).await? {
+        return Err(ScimError::new(
+            Status::BadRequest,
+            None,
+            crate::api::core::keykeeper_plan_limits::ORGANIZATION_ENDED,
+        ));
+    }
+    Ok(())
+}
+
 async fn create_group(caller: &ScimCaller, body: Value, conn: &DbConn) -> ScimResult {
     groups_enabled()?;
+    refuse_if_ended(&caller.org.uuid, conn).await?;
     let Some(name) = string_field(&body, "displayName")? else {
         return Err(ScimError::bad("invalidValue", "A group needs a displayName"));
     };

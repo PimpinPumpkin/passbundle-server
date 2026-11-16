@@ -255,6 +255,9 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
     org.save(&conn).await?;
     member.save(&conn).await?;
     collection.save(&conn).await?;
+    // Keykeeper: its trial starts now, where plans are enforced (DESIGN.md,
+    // "The trial clock").
+    crate::db::models::start_trial_now(&crate::db::models::PlanOwner::Organization(org.uuid.clone()), &conn).await?;
 
     Ok(Json(org.to_json()))
 }
@@ -542,6 +545,9 @@ async fn post_organization_collections(
     {
         err!("You don't have permission to create collections")
     }
+    // Keykeeper: nothing new is added to an organization whose plan has
+    // ended (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
 
     let collection = Collection::new(org_id.clone(), data.name, data.external_id);
     collection.save(&conn).await?;
@@ -1079,6 +1085,9 @@ async fn send_invite(
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
+    // Keykeeper: nothing new is added to an organization whose plan has
+    // ended (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
     let data: InviteData = data.into_inner();
     data.validate(&org_id, &conn).await?;
 
@@ -1350,6 +1359,9 @@ async fn reinvite_member_impl(
     invited_by_email: &str,
     conn: &DbConn,
 ) -> EmptyResult {
+    // Keykeeper: nothing new is added to an organization whose plan has
+    // ended (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(org_id, conn).await?;
     let Some(member) = Membership::find_by_uuid_and_org(member_id, org_id, conn).await else {
         err!("The user hasn't been invited to the organization.")
     };
@@ -1447,6 +1459,9 @@ async fn accept_invite(
         // In case the user was invited before the mail was saved in db.
         membership.invited_by_email = membership.invited_by_email.or(claims.invited_by_email);
 
+        // Keykeeper: nothing new is added to an organization whose plan has
+        // ended (DESIGN.md, "What happens when payment stops").
+        super::keykeeper_plan_limits::refuse_if_ended(&membership.org_uuid, &conn).await?;
         accept_org_invite(&headers.user, membership, reset_password_key, true, &conn).await?;
     } else if CONFIG.mail_enabled() {
         // User was invited from /admin, so they are automatically confirmed
@@ -1543,6 +1558,9 @@ async fn confirm_invite_impl(
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
+    // Keykeeper: nothing new is added to an organization whose plan has
+    // ended (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(org_id, conn).await?;
     if key.is_empty() || member_id.is_empty() {
         err!("Key or UserId is not set, unable to process request");
     }
@@ -2097,6 +2115,9 @@ async fn post_org_import(
     // Since we check for the size of the encrypted note length, we need to do that here to pre-validate it.
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
     Cipher::validate_cipher_data(&data.ciphers)?;
+    // Keykeeper: nothing new is added to an organization whose plan has
+    // ended (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
 
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
@@ -2841,6 +2862,9 @@ async fn restore_member_impl(
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
+    // Keykeeper: nothing new is added to an organization whose plan has
+    // ended (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(org_id, conn).await?;
     match Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
         Some(mut member) if member.status < MembershipStatus::Accepted as i32 => {
             if member.user_uuid == headers.user.uuid {
@@ -3078,6 +3102,9 @@ async fn post_groups(
     if !CONFIG.org_groups_enabled() {
         err!("Group support is disabled");
     }
+    // Keykeeper: nothing new is added to an organization whose plan has
+    // ended (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
 
     let group_request = data.into_inner();
     group_request.validate(&org_id, &conn).await?;
