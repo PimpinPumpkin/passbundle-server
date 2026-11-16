@@ -92,6 +92,9 @@ async fn create_organization(headers: Headers, data: Json<CreateOrgData>, conn: 
     org.save(&conn).await?;
     owner.save(&conn).await?;
     collection.save(&conn).await?;
+    // Keykeeper: its trial starts now, where plans are enforced (DESIGN.md,
+    // "The trial clock").
+    crate::db::models::start_trial_now(&crate::db::models::PlanOwner::Organization(org.uuid.clone()), &conn).await?;
     if business {
         if let Some(admins) = admins_collection {
             Collection::new(org.uuid.clone(), admins, None).save(&conn).await?;

@@ -1,7 +1,9 @@
 // Keykeeper: what a plan lets someone add, on a server that enforces plans
 // (DESIGN.md, "Plans and billing", "What the server refuses", in the meta
-// repo): attachments by the plan of whoever owns the item, file Sends, and
-// the data breach report.
+// repo): attachments by the plan of whoever owns the item, file Sends, the
+// data breach report, and anything new in an organization whose plan has
+// ended, or added by an MSP whose pool has ("What happens when payment
+// stops"). The routes call `refuse_if_ended` and `refuse_if_pool_ended`.
 //
 // Only adding is checked. Downloading and deleting never look at a plan, so
 // nothing here is called from those routes: a file attached while a plan was
@@ -24,12 +26,12 @@ use chrono::{NaiveDateTime, Utc};
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
         models::{
-            Attachment, Cipher, Organization, PersonGets, PlanOwner, PlanState, Terms, UserId, plan_at,
-            what_a_person_gets,
+            Attachment, Cipher, MspId, Organization, OrganizationId, PersonGets, PlanOwner, PlanState, Terms, UserId,
+            plan_at, what_a_person_gets,
         },
     },
 };
@@ -39,7 +41,9 @@ const SENDING_FILES_IS_PREMIUM: &str = "Sending files is part of Premium. Sendin
 const BREACH_REPORT_IS_PREMIUM: &str = "The data breach report is part of Premium.";
 /// The design's sentence for anything added to an organization whose plan has
 /// ended ("What happens when payment stops").
-const ORGANIZATION_ENDED: &str = "This organization's plan has ended, so nothing new can be added. Everything in it can still be opened, changed, exported, and deleted.";
+pub(super) const ORGANIZATION_ENDED: &str = "This organization's plan has ended, so nothing new can be added. Everything in it can still be opened, changed, exported, and deleted.";
+/// The same, in an MSP's console, for what it would add to its clients.
+const POOL_ENDED: &str = "This MSP's plan has ended, so nothing new can be added to its clients. Everything in them can still be opened, changed, exported, and deleted.";
 /// The server's own sentence where its operator turned attachments off for
 /// everyone (a cap of 0), whatever anyone's plan.
 const ATTACHMENTS_OFF: &str = "Attachments are disabled";
@@ -218,6 +222,49 @@ pub async fn attachment_must_fit(cipher: &Cipher, size: i64, credit: i64, conn: 
         organization_kb: CONFIG.org_attachment_limit(),
     };
     attachment_fits_at(cipher, size, credit, Utc::now().naive_utc(), caps, conn).await
+}
+
+/// Whether `whose` plan has ended at `at`: an organization's (for an MSP's
+/// client, its MSP's pool), or an MSP's pool. Only an ended plan counts: one
+/// in a trial, active, or in grace adds as it always has.
+async fn ended_at(whose: &PlanOwner, at: NaiveDateTime, conn: &DbConn) -> ApiResult<bool> {
+    Ok(plan_at(whose, None, at, conn).await?.state == Some(PlanState::Ended))
+}
+
+/// Whether the organization's plan has ended, so nothing new can be added to
+/// it ("What happens when payment stops"): new people by any route, new
+/// shared items and items moved or imported into it, new shared folders and
+/// groups, new attachments on shared items, and new event destinations.
+/// Everything else goes on: reading, editing, exporting, deleting, leaving,
+/// and removing and revoking people. Where plans aren't enforced, never.
+pub async fn organization_has_ended(org: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
+    if !CONFIG.plans_enforced() {
+        return Ok(false);
+    }
+    ended_at(&PlanOwner::Organization(org.clone()), Utc::now().naive_utc(), conn).await
+}
+
+/// Refuses an addition to an organization whose plan has ended, with the
+/// design's sentence.
+pub async fn refuse_if_ended(org: &OrganizationId, conn: &DbConn) -> EmptyResult {
+    if organization_has_ended(org, conn).await? {
+        err!(ORGANIZATION_ENDED)
+    }
+    Ok(())
+}
+
+/// Refuses what an MSP's console would add to its clients once its pool has
+/// ended: a new client, a new member of its staff (who would join its
+/// clients), and a new event destination. Removing staff, changing their
+/// access, and handing a client back go on.
+pub async fn refuse_if_pool_ended(msp: &MspId, conn: &DbConn) -> EmptyResult {
+    if !CONFIG.plans_enforced() {
+        return Ok(());
+    }
+    if ended_at(&PlanOwner::Msp(msp.clone()), Utc::now().naive_utc(), conn).await? {
+        err!(POOL_ENDED)
+    }
+    Ok(())
 }
 
 /// Refuses with `sentence` unless the person has Premium's features at `at`.

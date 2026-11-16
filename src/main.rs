@@ -793,6 +793,14 @@ fn schedule_jobs(pool: db::DbPool) {
                 }));
             }
 
+            // Keykeeper: the plans' clock, which does nothing unless plans are
+            // enforced (default hourly, 20 minutes past the hour).
+            if !CONFIG.plan_reminders_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.plan_reminders_schedule().parse().unwrap(), || {
+                    runtime.spawn(api::plan_clock_job(pool.clone()));
+                }));
+            }
+
             // Periodically check for jobs to run. We probably won't need any
             // jobs that run more often than once a minute, so a default poll
             // interval of 30 seconds should be sufficient. Users who want to

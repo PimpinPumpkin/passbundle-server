@@ -60,6 +60,12 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
 
     let org_id = token.0;
     let data = data.into_inner();
+    // Keykeeper: an organization whose plan has ended gets nobody new from its
+    // directory: no one added, restored, or put in a new group. Everyone the
+    // directory removes or turns off still goes, and the import then says
+    // what it couldn't add (DESIGN.md, "What happens when payment stops").
+    let ended = crate::api::core::keykeeper_plan_limits::organization_has_ended(&org_id, &conn).await?;
+    let mut refused = false;
 
     // Like upstream, the import never removes Owners, so it doesn't revoke or restore them either.
     for user_data in &data.members {
@@ -78,6 +84,14 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             }
         // If user is part of the organization, restore it
         } else if let Some(mut member) = Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await {
+            // Keykeeper: nobody revoked comes back while the plan has ended.
+            if ended && member.atype != MembershipType::Owner && member.status < MembershipStatus::Invited as i32 {
+                refused = true;
+                if member.set_external_id(Some(user_data.external_id.clone())) {
+                    member.save(&conn).await?;
+                }
+                continue;
+            }
             // Keykeeper: restored, they may come under two-step login for admins.
             let watch = crate::api::core::keykeeper_two_step::Watch::user(&member.user_uuid, &conn).await?;
             let mut restored = member.atype != MembershipType::Owner && member.restore();
@@ -97,6 +111,11 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             }
             watch.settle(&conn).await?;
         } else {
+            // Keykeeper: and nobody new joins.
+            if ended {
+                refused = true;
+                continue;
+            }
             // If user is not part of the organization
             let user = if let Some(user) = User::find_by_mail(&user_data.email, &conn).await {
                 user
@@ -165,6 +184,10 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                     group.save(&conn).await?;
                 }
                 group.uuid
+            } else if ended {
+                // Keykeeper: no new groups either.
+                refused = true;
+                continue;
             } else {
                 let mut group =
                     Group::new(org_id.clone(), group_data.name.clone(), false, Some(group_data.external_id.clone()));
@@ -200,6 +223,9 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
         }
     }
 
+    if refused {
+        err!(crate::api::core::keykeeper_plan_limits::ORGANIZATION_ENDED)
+    }
     Ok(())
 }
 
