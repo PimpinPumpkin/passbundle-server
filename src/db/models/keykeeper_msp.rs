@@ -754,8 +754,9 @@ impl MspClient {
     }
 }
 
-/// Whether a client's member policies skip this membership: two-step login,
-/// single organization, and the others upstream applies only below admin.
+/// Whether a client's member policies skip this membership: single
+/// organization and the others upstream applies only below admin. Not
+/// "Require two-step login", which goes by exempt_from_two_step_policy.
 /// Upstream exempts owners and admins. An MSP's staff are exempt too, whatever
 /// their role in the client, since they work in every client and a technician
 /// with a custom role is a regular member there. See DESIGN.md, "How an MSP
