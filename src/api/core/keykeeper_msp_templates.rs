@@ -350,6 +350,9 @@ async fn set_templates_collection(
     {
         err!("This client already has its Templates collection")
     }
+    // Keykeeper: no new shared folder in a client whose plan has ended
+    // (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
     let collection = Collection::new(org_id.clone(), name, None);
     collection.save(&conn).await?;
     client.set_templates_collection(collection.uuid.clone(), &conn).await?;

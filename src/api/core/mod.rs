@@ -22,6 +22,7 @@ pub mod keykeeper_new_device;
 mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_password_change;
+mod keykeeper_plan_clock;
 mod keykeeper_plan_limits;
 pub mod keykeeper_plans;
 mod keykeeper_provisioning;
@@ -46,6 +47,8 @@ pub use events::{event_cleanup_job, log_event, log_user_event, log_user_event_de
 pub use keykeeper_offboarding::destination_may_send;
 // Keykeeper: the daily reading of MSP clients' seats.
 pub use keykeeper_msp_seats::record_client_seats_job;
+// Keykeeper: the plans' clock: trials, sync notices, and reminders.
+pub use keykeeper_plan_clock::plan_clock_job;
 // Keykeeper: a tab's reload key goes when its account's sessions do.
 pub use keykeeper_reload_keys::forget_user as forget_reload_keys;
 // Keykeeper: provisioning (SCIM), mounted at /scim.

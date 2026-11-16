@@ -434,6 +434,22 @@ pub async fn send_event_stream_paused(
     send_email(address, &subject, body_html, body_text).await
 }
 
+/// Keykeeper: a plan's reminder (DESIGN.md, "What happens when payment
+/// stops"): a trial that's about to end, or a renewing plan whose grace is
+/// about to end or has. The words are the job's (`keykeeper_plan_clock.rs`).
+pub async fn send_plan_reminder(address: &str, subject: &str, paragraphs: &[String]) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/keykeeper_plan_reminder",
+        json!({
+            "url": CONFIG.domain(),
+            "img_src": CONFIG._smtp_img_src(),
+            "subject": subject,
+            "paragraphs": paragraphs,
+        }),
+    )?;
+    send_email(address, &subject, body_html, body_text).await
+}
+
 /// Keykeeper: an account was linked to an organization's single sign-on, so
 /// a link nobody expected is seen (DESIGN.md, "Sign in with Microsoft Entra ID").
 pub async fn send_sso_linked(address: &str, org_name: &str, microsoft_email: Option<&str>) -> EmptyResult {

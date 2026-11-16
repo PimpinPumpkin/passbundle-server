@@ -591,6 +591,8 @@ make_config! {
         purge_incomplete_sso_auth: String, false,  def,   "0 20 0 * * *".to_owned();
         /// MSP clients' seats schedule |> PassBundle: cron schedule of the job that records how many seats each MSP client has, once a day, for the MSP console's Seats section. The reading counts for the UTC day it's taken on, so the default takes it near the day's end (23:55 UTC). Set blank to disable this job.
         msp_seats_schedule:     String, false,  def,    "0 55 23 * * *".to_owned();
+        /// Plans' clock schedule |> PassBundle: cron schedule of the job that gives a trial to organizations and MSPs with no plan, tells people to sync when a plan's state changes by the clock, and sends owners the reminders: a trial ending in 7 days and in 1 day, and a renewing plan whose grace ends in 3 days or has ended. Each goes once. Only where plans are enforced. Set blank to disable this job.
+        plan_reminders_schedule: String, false, def,    "0 20 * * * *".to_owned();
     },
 
     /// General settings
@@ -670,6 +672,8 @@ make_config! {
         plans_enforced:         bool,   false,  def,    false;
         /// Plan grace (days) |> PassBundle: how many days a plan that was set to renew stays in effect past the date it was good through, while a failed payment is retried. Only where plans are enforced.
         plan_grace_days:        i64,    true,   def,    14;
+        /// Trial (days) |> PassBundle: how many days a new organization, a new MSP's pool, and a client that leaves its MSP have before anything has to be paid. Nothing is asked for and nothing is billed during them. Only where plans are enforced.
+        plan_trial_days:        i64,    true,   def,    30;
         /// Premium storage (GB) |> PassBundle: the attachments a Premium plan gives a person, in GB. Only where plans are enforced.
         plan_premium_storage_gb: i64,   true,   def,    5;
         /// Families plan people |> PassBundle: how many people a Families plan covers. Only where plans are enforced.
@@ -1545,6 +1549,12 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     if !(0..=366).contains(&cfg.plan_grace_days) {
         err!("`PLAN_GRACE_DAYS` must be between 0 and 366")
     }
+    if !(1..=366).contains(&cfg.plan_trial_days) {
+        err!("`PLAN_TRIAL_DAYS` must be between 1 and 366")
+    }
+    if !cfg.plan_reminders_schedule.is_empty() && cfg.plan_reminders_schedule.parse::<Schedule>().is_err() {
+        err!("`PLAN_REMINDERS_SCHEDULE` is not a valid cron expression")
+    }
     if cfg.plan_families_people < 1 {
         err!("`PLAN_FAMILIES_PEOPLE` must be at least 1")
     }
@@ -2231,6 +2241,7 @@ where
     reg!("email/keykeeper_msp_invite", ".html");
     reg!("email/keykeeper_member_joined", ".html");
     reg!("email/keykeeper_event_stream_paused", ".html");
+    reg!("email/keykeeper_plan_reminder", ".html");
     reg!("email/keykeeper_sso_linked", ".html");
     reg!("email/keykeeper_new_device_code", ".html");
     reg!("email/keykeeper_new_device_denied", ".html");

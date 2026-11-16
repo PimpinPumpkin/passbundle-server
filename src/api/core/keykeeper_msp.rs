@@ -392,6 +392,9 @@ async fn create_msp(headers: Headers, data: Json<CreateMspData>, conn: DbConn) -
     let msp = Msp::new(clean_name(&data.name)?);
     msp.insert(&conn).await?;
     MspStaff::new(msp.uuid.clone(), headers.user.uuid.clone(), MspRole::Admin).insert(&conn).await?;
+    // Keykeeper: its pool's trial starts now, where plans are enforced
+    // (DESIGN.md, "The trial clock").
+    crate::db::models::start_trial_now(&crate::db::models::PlanOwner::Msp(msp.uuid.clone()), &conn).await?;
     end_recovery_enrollments(&headers.user.uuid, &conn).await?;
     keykeeper_msp_policies::seed_defaults(&msp.uuid, &conn).await?;
     Audit::by("msp_created", &headers).detail(msp.name.clone()).record(&msp.uuid, &conn).await?;
@@ -571,6 +574,9 @@ struct CreateClientData {
 #[post("/keykeeper/msp/<msp_id>/clients", data = "<data>")]
 async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientData>, conn: DbConn) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
+    // Keykeeper: an MSP whose pool has ended takes on no new clients
+    // (DESIGN.md, "What happens when payment stops").
+    super::keykeeper_plan_limits::refuse_if_pool_ended(&msp_id, &conn).await?;
     // Upstream's own checks for creating an organization.
     if !CONFIG.is_org_creation_allowed(&headers.user.email) {
         err!("User not allowed to create organizations")
@@ -849,6 +855,10 @@ fn invite_url(token: &str) -> String {
 #[post("/keykeeper/msp/<msp_id>/staff", data = "<data>")]
 async fn add_staff(msp_id: MspId, headers: Headers, data: Json<AddStaffData>, conn: DbConn) -> JsonResult {
     require_admin(&msp_id, &headers.user.uuid, &conn).await?;
+    // Keykeeper: a new member of the staff joins every client they reach, so
+    // an MSP whose pool has ended invites nobody (DESIGN.md, "What happens
+    // when payment stops"). Removing staff and changing their access go on.
+    super::keykeeper_plan_limits::refuse_if_pool_ended(&msp_id, &conn).await?;
     let data = data.into_inner();
     let Some(role) = MspRole::from_str(&data.role) else {
         err!("Role must be admin or technician")
@@ -970,6 +980,9 @@ async fn accept_invite(data: Json<InviteTokenData>, headers: Headers, conn: DbCo
     };
     let msp_id = invite.msp_uuid.clone();
     if MspStaff::find(&msp_id, &headers.user.uuid, &conn).await.is_none() {
+        // Keykeeper: nor does anyone join it, for the same reason. The
+        // invitation stays, for when the pool is paid for.
+        super::keykeeper_plan_limits::refuse_if_pool_ended(&msp_id, &conn).await?;
         // Clients removed since the invitation drop out of its access, and
         // so do roles in them (or in clients it no longer reaches).
         let mut access = invite.access();
@@ -1338,6 +1351,9 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
             .await?;
     }
     client.delete(&conn).await?;
+    // Keykeeper: it has 30 days (PLAN_TRIAL_DAYS) from now to make its own
+    // arrangement, where plans are enforced (DESIGN.md, "The trial clock").
+    crate::db::models::after_leaving_msp(&org_id, &conn).await?;
     // A staff change that ran at the same moment may have added one back.
     let ours: HashSet<MembershipId> =
         MspMembership::try_find_by_msp(&msp_id, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();

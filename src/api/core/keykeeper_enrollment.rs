@@ -528,6 +528,11 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
         |status: i32| Json(json!({ "organizationId": org.uuid, "organizationName": org.name, "status": status }));
 
     let existing = Membership::find_by_user_and_org(&headers.user.uuid, &org.uuid, &conn).await;
+    // Keykeeper: nobody joins an organization whose plan has ended (DESIGN.md,
+    // "What happens when payment stops"). Someone already in stays in.
+    if existing.as_ref().is_none_or(|member| member.status == MembershipStatus::Invited as i32) {
+        super::keykeeper_plan_limits::refuse_if_ended(&org.uuid, &conn).await?;
+    }
     let member = match existing {
         // Already in: nothing to do.
         Some(member) if member.status >= MembershipStatus::Accepted as i32 => return Ok(joined(member.status)),
