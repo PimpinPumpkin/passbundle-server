@@ -6,6 +6,7 @@ mod emergency_access;
 mod events;
 mod folders;
 // Keykeeper
+mod keykeeper_billing;
 pub mod keykeeper_browser_autofill;
 mod keykeeper_cipher_history;
 pub mod keykeeper_device_approval;
@@ -96,6 +97,8 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_password_change::routes());
     routes.append(&mut keykeeper_plans::routes());
     routes.append(&mut keykeeper_browser_autofill::routes());
+    // Keykeeper: only where plans are enforced and a payment provider is set.
+    routes.append(&mut keykeeper_billing::routes());
     routes.append(&mut keykeeper_provisioning::routes());
     routes.append(&mut keykeeper_reload_keys::routes());
     routes.append(&mut keykeeper_seals::routes());

@@ -688,3 +688,23 @@ table! {
         updated_at -> Timestamp,
     }
 }
+
+table! {
+    billing_events (provider, event_id) {
+        provider -> Text,
+        event_id -> Text,
+        pending_customer -> Nullable<Text>,
+        received_at -> Timestamp,
+    }
+}
+
+table! {
+    billing_customers (provider, customer) {
+        provider -> Text,
+        customer -> Text,
+        user_uuid -> Nullable<Text>,
+        org_uuid -> Nullable<Text>,
+        msp_uuid -> Nullable<Text>,
+        created_at -> Timestamp,
+    }
+}

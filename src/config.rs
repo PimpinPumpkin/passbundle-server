@@ -591,6 +591,8 @@ make_config! {
         purge_incomplete_sso_auth: String, false,  def,   "0 20 0 * * *".to_owned();
         /// MSP clients' seats schedule |> PassBundle: cron schedule of the job that records how many seats each MSP client has, once a day, for the MSP console's Seats section. The reading counts for the UTC day it's taken on, so the default takes it near the day's end (23:55 UTC). Set blank to disable this job.
         msp_seats_schedule:     String, false,  def,    "0 55 23 * * *".to_owned();
+        /// Billing look schedule |> PassBundle: cron schedule of the job that asks the payment provider again about the plans it set: each one whose last answer is a day old, each whose paid-through date has passed since, and each a webhook asked about whose look got no answer. It also clears webhooks' ids after 35 days. Runs only where PLANS_ENFORCED and BILLING_PROVIDER are both set. Defaults to hourly. Set blank to disable this job.
+        billing_look_schedule:  String, false,  def,    "0 25 * * * *".to_owned();
     },
 
     /// General settings
@@ -668,6 +670,10 @@ make_config! {
         msp_signups_allowed:    bool,   true,   def,    false;
         /// Enforce plans |> PassBundle: whether what an account or an organization gets depends on its plan. Off, the default, everyone gets everything, as on any self-hosted server, and no plan is looked up. Set only in the environment.
         plans_enforced:         bool,   false,  def,    false;
+        /// Payment provider |> PassBundle: the provider the server learns from who has paid (DESIGN.md, "Learning who has paid"). Empty, the default: no provider, so there's no webhook route, no page to pay, and no billing job, and plans are set by hand on the admin page. `standin` is the test stand-in, which only talks to a loopback BILLING_API_BASE. Does nothing unless PLANS_ENFORCED is on. Set only in the environment. Its secrets, BILLING_API_KEY, BILLING_WEBHOOK_SECRET, and BILLING_WEBHOOK_SECRET_OLD, are read from the environment only and never shown here.
+        billing_provider:       String, false,  def,    String::new();
+        /// Payment provider's API address |> PassBundle: for tests only, the address the provider's adapter calls instead of the provider's own. The stand-in needs one, and it has to be a loopback address. Set only in the environment.
+        billing_api_base:       String, false,  def,    String::new();
         /// Plan grace (days) |> PassBundle: how many days a plan that was set to renew stays in effect past the date it was good through, while a failed payment is retried. Only where plans are enforced.
         plan_grace_days:        i64,    true,   def,    14;
         /// Premium storage (GB) |> PassBundle: the attachments a Premium plan gives a person, in GB. Only where plans are enforced.
@@ -1539,6 +1545,11 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     // Keykeeper: the daily reading of MSP clients' seats.
     if !cfg.msp_seats_schedule.is_empty() && cfg.msp_seats_schedule.parse::<Schedule>().is_err() {
         err!("`MSP_SEATS_SCHEDULE` is not a valid cron expression")
+    }
+    // Keykeeper: looking again at what the payment provider says. The provider's
+    // own settings are checked where they're read (`keykeeper_billing::init`).
+    if !cfg.billing_look_schedule.is_empty() && cfg.billing_look_schedule.parse::<Schedule>().is_err() {
+        err!("`BILLING_LOOK_SCHEDULE` is not a valid cron expression")
     }
 
     // Keykeeper: what plans give (DESIGN.md, "Plans and billing").

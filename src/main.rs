@@ -56,6 +56,7 @@ mod crypto;
 #[macro_use]
 mod db;
 mod http_client;
+mod keykeeper_billing;
 mod keykeeper_location;
 mod keykeeper_origins;
 mod keykeeper_streaming;
@@ -94,6 +95,9 @@ async fn main() -> Result<(), Error> {
     create_dir(&CONFIG.tmp_folder(), "tmp folder");
 
     let pool = create_db_pool().await;
+    // Keykeeper: the payment provider's settings and secrets, read once from
+    // the environment, before any route is mounted or job scheduled.
+    keykeeper_billing::init();
     schedule_jobs(pool.clone());
     // Keykeeper: sends queued events to organizations' security tools.
     keykeeper_streaming::start(pool.clone());
@@ -790,6 +794,14 @@ fn schedule_jobs(pool: db::DbPool) {
             if !CONFIG.msp_seats_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.msp_seats_schedule().parse().unwrap(), || {
                     runtime.spawn(api::record_client_seats_job(pool.clone()));
+                }));
+            }
+
+            // Keykeeper: ask the payment provider again about the plans it set (default
+            // hourly), only where plans are enforced and a provider is set.
+            if keykeeper_billing::billing().is_some() && !CONFIG.billing_look_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.billing_look_schedule().parse().unwrap(), || {
+                    runtime.spawn(keykeeper_billing::look_again_job(pool.clone()));
                 }));
             }
 

@@ -10,6 +10,7 @@ mod favorite;
 mod folder;
 mod group;
 // Keykeeper
+mod keykeeper_billing;
 mod keykeeper_browser_autofill;
 mod keykeeper_cipher_versions;
 mod keykeeper_event_streaming;
@@ -54,6 +55,9 @@ pub use self::event::{Event, EventType};
 pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
+pub use self::keykeeper_billing::{
+    BillingCustomer, BillingEvent, ProviderAnswer, plans_a_provider_set, write_provider_answer,
+};
 pub use self::keykeeper_browser_autofill::{BrowserAutofillMode, OrgBrowserAutofill};
 pub use self::keykeeper_cipher_versions::{
     CipherVersion, History, ItemSave, MAX_ITEM_BYTES, MAX_PASSWORD_HISTORY, encrypted_size,
@@ -82,7 +86,7 @@ pub use self::keykeeper_offboarding::RemovedMember;
 pub use self::keykeeper_orgs::OrgSetup;
 pub use self::keykeeper_password_change::OrgPasswordChange;
 pub use self::keykeeper_plans::{
-    Billed, FreeWhy, Plan, PlanName, PlanOwner, PlanState, PlanWrite, SetBy, Standing, Terms, may_manage_plan,
+    Billed, FreeWhy, Plan, PlanName, PlanNow, PlanOwner, PlanState, PlanWrite, SetBy, Standing, Terms, may_manage_plan,
     not_enforced_json, people_a_plan_reaches, plan_at, put_in_profile,
 };
 // Keykeeper: what the plan limits ask (`src/api/core/keykeeper_plan_limits.rs`).

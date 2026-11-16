@@ -326,6 +326,9 @@ pub struct Terms {
     pub org_storage_gb_per_person: i64,
     /// PLAN_ORG_STORAGE_MIN_GB
     pub org_storage_min_gb: i64,
+    /// Whether people can be sent to a payment provider's pages: plans are
+    /// enforced and BILLING_PROVIDER is set (`keykeeper_billing::payments_on`).
+    pub payments: bool,
 }
 
 impl Terms {
@@ -336,6 +339,7 @@ impl Terms {
             families_people: CONFIG.plan_families_people(),
             org_storage_gb_per_person: CONFIG.plan_org_storage_gb_per_person(),
             org_storage_min_gb: CONFIG.plan_org_storage_min_gb(),
+            payments: crate::keykeeper_billing::payments_on(),
         }
     }
 
@@ -412,6 +416,15 @@ impl PlanNow {
         self.state.is_some_and(PlanState::in_effect)
     }
 
+    /// Whether the person asking may be sent to the payment provider's pages
+    /// for this plan, to pay or to manage it: payments are on (`Terms`), they
+    /// manage the plan, and no MSP's pool covers it, since a client's plan is
+    /// paid for through its MSP. The sync's `canPay` and every payment route
+    /// ask here, and nowhere else decides it.
+    pub fn can_pay(&self, terms: &Terms) -> bool {
+        terms.payments && self.may_manage && self.covered_by.is_none()
+    }
+
     /// An organization on Families: six people, and no company features.
     pub fn is_family(&self) -> bool {
         self.row.as_ref().and_then(Plan::name) == Some(PlanName::Families)
@@ -455,7 +468,7 @@ const STAFF_ROLES: [i32; 2] = [MspRole::Admin as i32, MspRole::Technician as i32
 /// revoked ones keep a negative status.
 const JOINED: [i32; 2] = [MembershipStatus::Accepted as i32, MembershipStatus::Confirmed as i32];
 
-fn find_row(conn: &mut DbConnInner, whose: &PlanOwner) -> Query<Option<Plan>> {
+pub(super) fn find_row(conn: &mut DbConnInner, whose: &PlanOwner) -> Query<Option<Plan>> {
     match whose {
         PlanOwner::User(id) => plans::table.filter(plans::user_uuid.eq(id)).first::<Plan>(conn).optional(),
         PlanOwner::Organization(id) => plans::table.filter(plans::org_uuid.eq(id)).first::<Plan>(conn).optional(),
@@ -692,6 +705,7 @@ impl PlanNow {
             "people": self.gives.and_then(|gives| gives.people),
             "coveredBy": self.covered_by.as_ref().map(|(id, name)| json!({ "id": id, "name": name })),
             "canManage": self.may_manage,
+            "canPay": self.can_pay(terms),
         })
     }
 }
@@ -1129,6 +1143,7 @@ mod tests {
             families_people: 6,
             org_storage_gb_per_person: 1,
             org_storage_min_gb: 5,
+            payments: false,
         }
     }
 
@@ -1847,6 +1862,7 @@ mod tests {
                 "people": null,
                 "coveredBy": null,
                 "canManage": true,
+                "canPay": false,
             })
         );
         assert_eq!(not_enforced_json(), json!({ "enforced": false }));
@@ -1882,6 +1898,7 @@ mod tests {
                 "people": null,
                 "coveredBy": null,
                 "canManage": true,
+                "canPay": false,
             })
         );
 
@@ -1901,6 +1918,7 @@ mod tests {
                 "people": null,
                 "coveredBy": null,
                 "canManage": false,
+                "canPay": false,
             })
         );
         // Ended is ended for everyone.
