@@ -119,13 +119,33 @@ impl BillingEvent {
         Ok(first.into_iter().collect())
     }
 
-    /// The provider has answered about `customer`: no look is owed for them.
-    pub async fn answered(provider: &str, customer: &str, conn: &DbConn) -> ApiResult<()> {
+    /// Whether webhook `event_id` is still owed a look: no look about its
+    /// customer has asked the provider since it came.
+    pub async fn owed(provider: &str, event_id: &str, conn: &DbConn) -> ApiResult<bool> {
+        conn.run(move |conn| {
+            diesel::select(diesel::dsl::exists(
+                billing_events::table
+                    .filter(billing_events::provider.eq(provider))
+                    .filter(billing_events::event_id.eq(event_id))
+                    .filter(billing_events::pending_customer.is_not_null()),
+            ))
+            .get_result(conn)
+            .map_res("Error reading whether a billing event is owed a look")
+        })
+        .await
+    }
+
+    /// The provider was asked about `customer` at `asked_at` and answered: no
+    /// look is owed for the webhooks about them that came by then. One that
+    /// came later is still owed one, since the answer may be from before
+    /// what it says changed.
+    pub async fn answered(provider: &str, customer: &str, asked_at: NaiveDateTime, conn: &DbConn) -> ApiResult<()> {
         conn.run(move |conn| {
             diesel::update(
                 billing_events::table
                     .filter(billing_events::provider.eq(provider))
-                    .filter(billing_events::pending_customer.eq(customer)),
+                    .filter(billing_events::pending_customer.eq(customer))
+                    .filter(billing_events::received_at.le(asked_at)),
             )
             .set(billing_events::pending_customer.eq(None::<String>))
             .execute(conn)
@@ -554,7 +574,24 @@ mod tests {
         let mut pending = BillingEvent::pending("standin", &conn).await.unwrap();
         pending.sort();
         assert_eq!(pending, vec![("cus_1".to_owned(), at), ("cus_2".to_owned(), at + TimeDelta::hours(2))]);
-        BillingEvent::answered("standin", "cus_1", &conn).await.unwrap();
+        assert!(BillingEvent::owed("standin", "evt_1", &conn).await.unwrap());
+        assert!(!BillingEvent::owed("standin", "evt_4", &conn).await.unwrap());
+        assert!(!BillingEvent::owed("standin", "evt_nobody", &conn).await.unwrap());
+        // A look that asked between evt_1 and evt_2 answers evt_1 only: evt_2
+        // came while it waited, and may say something its answer doesn't.
+        BillingEvent::answered("standin", "cus_1", at + TimeDelta::minutes(30), &conn).await.unwrap();
+        assert!(!BillingEvent::owed("standin", "evt_1", &conn).await.unwrap());
+        assert!(BillingEvent::owed("standin", "evt_2", &conn).await.unwrap());
+        let mut pending = BillingEvent::pending("standin", &conn).await.unwrap();
+        pending.sort();
+        assert_eq!(
+            pending,
+            vec![("cus_1".to_owned(), at + TimeDelta::hours(1)), ("cus_2".to_owned(), at + TimeDelta::hours(2))]
+        );
+        // One that asked as evt_2 came answers it too, and nobody else's.
+        BillingEvent::answered("standin", "cus_1", at + TimeDelta::hours(1), &conn).await.unwrap();
+        assert!(!BillingEvent::owed("standin", "evt_2", &conn).await.unwrap());
+        assert!(BillingEvent::owed("standin", "evt_3", &conn).await.unwrap());
         assert_eq!(
             BillingEvent::pending("standin", &conn).await.unwrap(),
             vec![("cus_2".to_owned(), at + TimeDelta::hours(2))]
