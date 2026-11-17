@@ -21,15 +21,21 @@
 //
 // All of it is a second switch, BILLING_PROVIDER, which does nothing unless
 // PLANS_ENFORCED is on. Without both, `billing()` is None: no route here
-// exists, no job runs, and nothing is asked of anyone.
+// exists, no job runs, and nothing is asked of anyone. Billing by the day
+// after each month, for an MSP's pool and a Business organization with no
+// MSP (`invoices.rs`), is on where BILLING_INVOICE_SCHEDULE isn't blank too,
+// with a seat's prices from the environment (`by_the_day()`).
 //
 // The provider's secrets come from the environment only (`init`). They're
 // never in CONFIG, so the admin page, its diagnostics, and the config file
 // never see them, and `Secret` can't be printed, so no log or error can carry one.
 
+mod invoices;
 mod signature;
 mod standin;
 mod stripe;
+
+pub use invoices::{ByTheDay, invoice_month_job};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -77,8 +83,7 @@ pub struct PayPage {
     pub customer: String,
 }
 
-/// One line of a month's invoice (call 3).
-#[expect(dead_code, reason = "the month's invoice job, piece 10 of the plans design's build order, makes the first")]
+/// One line of a month's invoice (call 3), in `invoices::CURRENCY`.
 pub struct InvoiceLine {
     pub description: String,
     pub amount_cents: i64,
@@ -123,11 +128,9 @@ pub trait Provider {
 
     /// Call 3: invoice `customer` for `lines`, once for `month` ("2027-01"),
     /// whatever happens: `key` is the same every time it's asked for that
-    /// plan and month. Answers the provider's id for the invoice.
-    #[expect(
-        dead_code,
-        reason = "the month's invoice job, piece 10 of the plans design's build order, is the first to ask"
-    )]
+    /// plan and month, and asking again with it finds what the first asking
+    /// made. The invoice collects from the card on file by itself. Answers the
+    /// provider's id for the invoice.
     async fn invoice(
         &self,
         customer: &str,
@@ -141,9 +144,10 @@ pub trait Provider {
     /// customer. Nothing in the body is read until the signature checks out.
     fn event(&self, signature: Option<&str>, body: &[u8], now: i64) -> Result<Event, &'static str>;
 
-    /// Call 5: `customer`'s standing now. None when the provider has nothing for
-    /// them: never paid, or nothing started.
-    async fn standing(&self, customer: &str) -> Result<Option<ProviderAnswer>, Unreachable>;
+    /// Call 5: `customer`'s standing now, as the customer that pays for
+    /// `whose` plan (the server's own record says whose). None when the
+    /// provider has nothing for them: never paid, or nothing started.
+    async fn standing(&self, customer: &str, whose: &PlanOwner) -> Result<Option<ProviderAnswer>, Unreachable>;
 
     /// When the account or organization `customer` pays for is deleted: cancel
     /// at once everything the provider bills them for. Answers how many things
@@ -222,10 +226,10 @@ impl Provider for Adapter {
         }
     }
 
-    async fn standing(&self, customer: &str) -> Result<Option<ProviderAnswer>, Unreachable> {
+    async fn standing(&self, customer: &str, whose: &PlanOwner) -> Result<Option<ProviderAnswer>, Unreachable> {
         match self {
-            Self::Standin(p) => p.standing(customer).await,
-            Self::Stripe(p) => p.standing(customer).await,
+            Self::Standin(p) => p.standing(customer, whose).await,
+            Self::Stripe(p) => p.standing(customer, whose).await,
         }
     }
 
@@ -244,6 +248,10 @@ pub struct Billing {
     /// the plans it sets.
     pub name: &'static str,
     adapter: Adapter,
+    /// Billing by the day: a seat's prices, where BILLING_INVOICE_SCHEDULE
+    /// isn't blank. None: no month is invoiced, and Stripe doesn't take a
+    /// card for Business or a pool.
+    by_the_day: Option<ByTheDay>,
 }
 
 impl Billing {
@@ -259,6 +267,12 @@ static BILLING: OnceLock<Option<Billing>> = OnceLock::new();
 /// None everywhere else.
 pub fn billing() -> Option<&'static Billing> {
     BILLING.get().and_then(Option::as_ref)
+}
+
+/// Billing by the day after each month, and its prices: where PLANS_ENFORCED
+/// and BILLING_PROVIDER are both set and BILLING_INVOICE_SCHEDULE isn't blank.
+pub fn by_the_day() -> Option<(&'static Billing, &'static ByTheDay)> {
+    billing().and_then(|billing| billing.by_the_day.as_ref().map(|prices| (billing, prices)))
 }
 
 /// Whether people can be sent to a provider's pages: plans are enforced and
@@ -291,16 +305,23 @@ pub(super) fn loopback_url(api_base: &str) -> Option<url::Url> {
 
 /// Works out the provider from the settings and the environment. Pure, so
 /// each way a server can be set up is tested. The problems name settings
-/// and never hold a value.
+/// and never hold a value. `invoicing` is whether BILLING_INVOICE_SCHEDULE
+/// isn't blank: then a seat's prices are needed, whichever the provider.
 fn from_settings(
     enforced: bool,
     provider: &str,
     api_base: &str,
+    invoicing: bool,
     env: &dyn Fn(&'static str) -> Option<String>,
-) -> Result<Option<Billing>, &'static str> {
+) -> Result<Option<Billing>, String> {
     if provider.is_empty() || !enforced {
         return Ok(None);
     }
+    let by_the_day = if invoicing {
+        Some(ByTheDay::from_env(env)?)
+    } else {
+        None
+    };
     let secret = |name| env(name).filter(|value| !value.is_empty()).map(Secret::new);
     let api_key = secret(API_KEY).ok_or("`BILLING_PROVIDER` needs `BILLING_API_KEY` in the environment")?;
     let mut webhook_secrets =
@@ -313,17 +334,19 @@ fn from_settings(
                 premium: env(PRICE_PREMIUM).unwrap_or_default(),
                 families: env(PRICE_FAMILIES).unwrap_or_default(),
             };
-            ("stripe", Adapter::Stripe(stripe::Stripe::new(api_base, api_key, webhook_secrets, prices)?))
+            let stripe = stripe::Stripe::new(api_base, api_key, webhook_secrets, prices, by_the_day.is_some())?;
+            ("stripe", Adapter::Stripe(stripe))
         }
         _ => {
             return Err(
-                "`BILLING_PROVIDER` names a provider this server doesn't have: leave it empty, set `stripe`, or set `standin` for tests",
+                "`BILLING_PROVIDER` names a provider this server doesn't have: leave it empty, set `stripe`, or set `standin` for tests".to_owned(),
             );
         }
     };
     Ok(Some(Billing {
         name,
         adapter,
+        by_the_day,
     }))
 }
 
@@ -331,10 +354,20 @@ fn from_settings(
 /// mounted or job scheduled. A server set up wrong doesn't start.
 pub fn init() {
     let provider = CONFIG.billing_provider();
-    match from_settings(CONFIG.plans_enforced(), &provider, &CONFIG.billing_api_base(), &crate::util::get_env_str_value)
-    {
+    let invoicing = !CONFIG.billing_invoice_schedule().is_empty();
+    match from_settings(
+        CONFIG.plans_enforced(),
+        &provider,
+        &CONFIG.billing_api_base(),
+        invoicing,
+        &crate::util::get_env_str_value,
+    ) {
         Ok(found) => {
             match &found {
+                Some(billing) if billing.by_the_day.is_some() => info!(
+                    "Plans are paid for through the payment provider `{}`, and Business and MSPs' pools by the day after each month.",
+                    billing.name
+                ),
                 Some(billing) => info!("Plans are paid for through the payment provider `{}`.", billing.name),
                 None if !provider.is_empty() => warn!("BILLING_PROVIDER does nothing while PLANS_ENFORCED is off."),
                 None => {}
@@ -409,7 +442,7 @@ fn answered_since(checked_at: Option<NaiveDateTime>, since: NaiveDateTime) -> bo
 /// `look`, with `ONE_AT_A_TIME` held.
 async fn look_held(billing: &Billing, whose: &PlanOwner, customer: &str, conn: &DbConn) -> Looked {
     let asked_at = Utc::now().naive_utc();
-    let Ok(answer) = billing.provider().standing(customer).await else {
+    let Ok(answer) = billing.provider().standing(customer, whose).await else {
         warn!(
             "The payment provider couldn't be asked about the plan of {whose}. Its last answer stands, and it'll be asked again."
         );
@@ -590,8 +623,8 @@ pub fn may_look_now(whose: &PlanOwner) -> bool {
 pub const PROVIDER_UNREACHABLE: &str = "The payment provider can't be reached right now. Try again in a few minutes.";
 
 /// What a person reads when they ask to pay for a plan the provider can't
-/// take yet: a pool's card on file and Business are piece 10 of the plans
-/// design's build order.
+/// take: with Stripe, a pool's card on file and Business, while billing by
+/// the day is off (BILLING_INVOICE_SCHEDULE blank).
 pub fn not_yet(plan: PlanName) -> &'static str {
     match plan {
         PlanName::Msp => "An MSP's plan can't be paid for online yet.",
@@ -779,8 +812,9 @@ mod tests {
 
     #[test]
     fn stripe_starts_only_with_a_restricted_key_its_signing_secret_and_both_prices() {
-        let started =
-            |base: &str, values: &[(&'static str, &'static str)]| from_settings(true, "stripe", base, &env(values));
+        let started = |base: &str, values: &[(&'static str, &'static str)]| {
+            from_settings(true, "stripe", base, false, &env(values))
+        };
         // Stripe's own address, with BILLING_API_BASE empty, in either mode.
         let test = started("", &STRIPE).unwrap().unwrap();
         assert_eq!(test.name, "stripe");
@@ -791,10 +825,10 @@ mod tests {
         // The stand-in on this machine, with a test key.
         assert!(started("http://127.0.0.1:8128", &STRIPE).unwrap().is_some());
         // Nothing without PLANS_ENFORCED, and nothing is checked.
-        assert!(from_settings(false, "stripe", "https://api.example.com", &env(&[])).unwrap().is_none());
+        assert!(from_settings(false, "stripe", "https://api.example.com", false, &env(&[])).unwrap().is_none());
 
         let refused = |base: &str, values: Vec<(&'static str, &'static str)>| {
-            started(base, &values).err().unwrap_or("it was taken")
+            started(base, &values).err().unwrap_or_else(|| "it was taken".to_owned())
         };
         // A live key is only ever sent to Stripe: never beside BILLING_API_BASE.
         assert!(
@@ -833,11 +867,50 @@ mod tests {
         }
     }
 
+    /// Billing by the day: on where BILLING_INVOICE_SCHEDULE isn't blank, and
+    /// then a seat's prices are needed and checked at start, with Stripe or
+    /// the stand-in. Off, nothing about them is read.
+    #[test]
+    fn billing_by_the_day_needs_a_seats_prices_and_then_stripe_takes_a_card() {
+        let with_prices = |msp: Option<&'static str>, business: Option<&'static str>| {
+            let mut values = STRIPE.to_vec();
+            values.extend(msp.map(|value| ("BILLING_SEAT_PRICES_MSP", value)));
+            values.extend(business.map(|value| ("BILLING_SEAT_PRICES_BUSINESS", value)));
+            values
+        };
+        let prices = with_prices(Some("1:1.50,500:1.25,2500:1.00"), Some("1:2.00,250:1.75"));
+        let on = from_settings(true, "stripe", "", true, &env(&prices)).unwrap().unwrap();
+        let by_the_day = on.by_the_day.as_ref().unwrap();
+        assert_eq!(by_the_day.msp.price_for(50_000), 125);
+        assert_eq!(by_the_day.business.price_for(24_900), 200);
+        assert!(on.provider().takes(PlanName::Business) && on.provider().takes(PlanName::Msp));
+        // Off: no prices needed, none read, and Business and a pool aren't taken.
+        let off = from_settings(true, "stripe", "", false, &env(&prices)).unwrap().unwrap();
+        assert!(off.by_the_day.is_none());
+        assert!(!off.provider().takes(PlanName::Business) && !off.provider().takes(PlanName::Msp));
+        assert!(from_settings(true, "stripe", "", false, &env(&STRIPE)).unwrap().unwrap().by_the_day.is_none());
+        // On without both prices, or with one that doesn't read: no start.
+        for (values, missing) in [
+            (with_prices(None, Some("1:2.00")), "BILLING_SEAT_PRICES_MSP"),
+            (with_prices(Some("1:1.50"), None), "BILLING_SEAT_PRICES_BUSINESS"),
+            (with_prices(Some("1:1.50"), Some("2:2.00")), "BILLING_SEAT_PRICES_BUSINESS"),
+            (with_prices(Some("1.50"), Some("1:2.00")), "BILLING_SEAT_PRICES_MSP"),
+        ] {
+            let problem = from_settings(true, "stripe", "", true, &env(&values)).err().unwrap();
+            assert!(problem.contains(missing), "{problem}");
+        }
+        // The stand-in needs them too.
+        assert!(from_settings(true, "standin", "http://127.0.0.1:1", true, &env(&SECRETS)).is_err());
+        // Nothing without PLANS_ENFORCED or a provider.
+        assert!(from_settings(false, "stripe", "", true, &env(&[])).unwrap().is_none());
+        assert!(from_settings(true, "", "", true, &env(&[])).unwrap().is_none());
+    }
+
     #[test]
     fn both_signing_secrets_while_stripes_is_rolled() {
         let mut two = STRIPE.to_vec();
         two.push(("BILLING_WEBHOOK_SECRET_OLD", "whsec_old_made_up"));
-        let billing = from_settings(true, "stripe", "", &env(&two)).unwrap().unwrap();
+        let billing = from_settings(true, "stripe", "", false, &env(&two)).unwrap().unwrap();
         let Adapter::Stripe(stripe) = billing.provider() else {
             panic!("Stripe")
         };
@@ -905,14 +978,14 @@ mod tests {
     fn what_stripe_doesnt_take_yet_says_so() {
         assert_eq!(not_yet(PlanName::Business), "Business can't be paid for online yet.");
         assert_eq!(not_yet(PlanName::Msp), "An MSP's plan can't be paid for online yet.");
-        let billing = from_settings(true, "stripe", "", &env(&STRIPE)).unwrap().unwrap();
+        let billing = from_settings(true, "stripe", "", false, &env(&STRIPE)).unwrap().unwrap();
         for (plan, takes) in
             [(PlanName::Premium, true), (PlanName::Families, true), (PlanName::Business, false), (PlanName::Msp, false)]
         {
             assert_eq!(billing.provider().takes(plan), takes, "{plan:?}");
         }
         // The stand-in takes every plan.
-        let standin = from_settings(true, "standin", "http://127.0.0.1:1", &env(&SECRETS)).unwrap().unwrap();
+        let standin = from_settings(true, "standin", "http://127.0.0.1:1", false, &env(&SECRETS)).unwrap().unwrap();
         assert!(
             [PlanName::Premium, PlanName::Families, PlanName::Business, PlanName::Msp]
                 .into_iter()
@@ -943,13 +1016,13 @@ mod tests {
         let secrets = env(&SECRETS);
         let loopback = "http://127.0.0.1:8124";
         // No provider: nothing, whatever else is set.
-        assert!(from_settings(true, "", loopback, &secrets).unwrap().is_none());
-        assert!(from_settings(false, "", loopback, &secrets).unwrap().is_none());
+        assert!(from_settings(true, "", loopback, false, &secrets).unwrap().is_none());
+        assert!(from_settings(false, "", loopback, false, &secrets).unwrap().is_none());
         // A provider does nothing without PLANS_ENFORCED, and nothing is checked.
-        assert!(from_settings(false, "standin", loopback, &secrets).unwrap().is_none());
-        assert!(from_settings(false, "standin", "https://api.example.com", &env(&[])).unwrap().is_none());
+        assert!(from_settings(false, "standin", loopback, false, &secrets).unwrap().is_none());
+        assert!(from_settings(false, "standin", "https://api.example.com", false, &env(&[])).unwrap().is_none());
         // With both, there's a provider.
-        let billing = from_settings(true, "standin", loopback, &secrets).unwrap().unwrap();
+        let billing = from_settings(true, "standin", loopback, false, &secrets).unwrap().unwrap();
         assert_eq!(billing.name, "standin");
         assert!(!billing.provider().live());
     }
@@ -958,7 +1031,7 @@ mod tests {
     fn a_server_set_up_wrong_doesnt_start() {
         let loopback = "http://127.0.0.1:8124";
         let refused = |provider, base, values: &[(&'static str, &'static str)]| {
-            from_settings(true, provider, base, &env(values)).err().unwrap_or("it was taken")
+            from_settings(true, provider, base, false, &env(values)).err().unwrap_or_else(|| "it was taken".to_owned())
         };
         // A provider this server doesn't have.
         assert!(refused("nonesuch", loopback, &SECRETS).contains("doesn't have"));
@@ -983,7 +1056,7 @@ mod tests {
             assert!(refused("standin", base, &SECRETS).contains("BILLING_API_BASE"), "{base}");
         }
         for base in ["http://127.0.0.1:8124", "https://127.0.0.1", "http://127.8.9.10:1", "http://[::1]:8124/v1/"] {
-            assert!(from_settings(true, "standin", base, &env(&SECRETS)).is_ok(), "{base}");
+            assert!(from_settings(true, "standin", base, false, &env(&SECRETS)).is_ok(), "{base}");
         }
         // A key that looks like a live one is never sent to the stand-in.
         let live = [("BILLING_API_KEY", "rk_live_123"), SECRETS[1]];
@@ -997,20 +1070,20 @@ mod tests {
 
     #[test]
     fn both_webhook_secrets_while_one_is_replaced() {
-        let one = from_settings(true, "standin", "http://127.0.0.1:1", &env(&SECRETS)).unwrap().unwrap();
+        let one = from_settings(true, "standin", "http://127.0.0.1:1", false, &env(&SECRETS)).unwrap().unwrap();
         let Adapter::Standin(standin) = one.provider() else {
             panic!("the stand-in")
         };
         assert_eq!(standin.webhook_secrets(), 1);
         let two = [SECRETS[0], SECRETS[1], ("BILLING_WEBHOOK_SECRET_OLD", "whsec_old")];
-        let two = from_settings(true, "standin", "http://127.0.0.1:1", &env(&two)).unwrap().unwrap();
+        let two = from_settings(true, "standin", "http://127.0.0.1:1", false, &env(&two)).unwrap().unwrap();
         let Adapter::Standin(standin) = two.provider() else {
             panic!("the stand-in")
         };
         assert_eq!(standin.webhook_secrets(), 2);
         // An empty old one is none.
         let empty = [SECRETS[0], SECRETS[1], ("BILLING_WEBHOOK_SECRET_OLD", "")];
-        let empty = from_settings(true, "standin", "http://127.0.0.1:1", &env(&empty)).unwrap().unwrap();
+        let empty = from_settings(true, "standin", "http://127.0.0.1:1", false, &env(&empty)).unwrap().unwrap();
         let Adapter::Standin(standin) = empty.provider() else {
             panic!("the stand-in")
         };
@@ -1090,7 +1163,7 @@ mod tests {
     /// `keykeeperPlan` as the sync and `GET /api/keykeeper/plan` carry it, on
     /// a server set up each way, for someone who manages the plan or not.
     fn keykeeper_plan(enforced: bool, provider: &str, may_manage: bool, covered: bool) -> serde_json::Value {
-        let billing = from_settings(enforced, provider, "http://127.0.0.1:1", &env(&SECRETS)).unwrap();
+        let billing = from_settings(enforced, provider, "http://127.0.0.1:1", false, &env(&SECRETS)).unwrap();
         if !enforced {
             return not_enforced_json();
         }
