@@ -8,7 +8,10 @@
 //   2. a page to manage it: the card, past invoices, canceling;
 //   3. invoice a customer for some lines, once, for a month;
 //   4. whether a webhook is really the provider's, and which customer it's about;
-//   5. a customer's standing now: which plan, good through when, renewing or not.
+//   5. a customer's standing now: which plan, good through when, renewing or not;
+//
+// and one more, for when an account or an organization is deleted: cancel at
+// once whatever the provider bills that customer for (`cancel_at_provider`).
 //
 // A webhook only ever causes a look: the server never writes a plan from what a
 // webhook's body says. It asks the provider (call 5) and writes that answer
@@ -26,6 +29,7 @@
 
 mod signature;
 mod standin;
+mod stripe;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -41,8 +45,8 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            BillingCustomer, BillingEvent, PlanName, PlanOwner, ProviderAnswer, plans_a_provider_set,
-            write_provider_answer,
+            BillingCustomer, BillingEvent, Plan, PlanName, PlanOwner, PlanState, ProviderAnswer, SetBy, Standing,
+            plans_a_provider_set, write_provider_answer,
         },
     },
 };
@@ -100,6 +104,9 @@ pub trait Provider {
     /// The request header a webhook's signature comes in.
     fn signature_header(&self) -> &'static str;
 
+    /// Whether people can pay for `plan` on the provider's pages yet.
+    fn takes(&self, plan: PlanName) -> bool;
+
     /// Call 1: a page on the provider's site to pay for `plan`, or for a pool to
     /// put a card on file, for `whose` plan, as `customer` when the provider
     /// already has one for it. `back` is where the provider sends them after.
@@ -137,6 +144,11 @@ pub trait Provider {
     /// Call 5: `customer`'s standing now. None when the provider has nothing for
     /// them: never paid, or nothing started.
     async fn standing(&self, customer: &str) -> Result<Option<ProviderAnswer>, Unreachable>;
+
+    /// When the account or organization `customer` pays for is deleted: cancel
+    /// at once everything the provider bills them for. Answers how many things
+    /// it canceled.
+    async fn cancel(&self, customer: &str) -> Result<usize, Unreachable>;
 }
 
 /// The provider BILLING_PROVIDER names.
@@ -144,18 +156,29 @@ pub enum Adapter {
     /// `standin`: the test stand-in in the meta repo's e2e/, which only talks
     /// to a loopback address.
     Standin(standin::Standin),
+    /// `stripe`: Stripe, for Premium and Families.
+    Stripe(stripe::Stripe),
 }
 
 impl Provider for Adapter {
     fn live(&self) -> bool {
         match self {
             Self::Standin(p) => p.live(),
+            Self::Stripe(p) => p.live(),
         }
     }
 
     fn signature_header(&self) -> &'static str {
         match self {
             Self::Standin(p) => p.signature_header(),
+            Self::Stripe(p) => p.signature_header(),
+        }
+    }
+
+    fn takes(&self, plan: PlanName) -> bool {
+        match self {
+            Self::Standin(p) => p.takes(plan),
+            Self::Stripe(p) => p.takes(plan),
         }
     }
 
@@ -168,12 +191,14 @@ impl Provider for Adapter {
     ) -> Result<PayPage, Unreachable> {
         match self {
             Self::Standin(p) => p.pay_page(whose, plan, customer, back).await,
+            Self::Stripe(p) => p.pay_page(whose, plan, customer, back).await,
         }
     }
 
     async fn manage_page(&self, customer: &str, back: &str) -> Result<String, Unreachable> {
         match self {
             Self::Standin(p) => p.manage_page(customer, back).await,
+            Self::Stripe(p) => p.manage_page(customer, back).await,
         }
     }
 
@@ -186,18 +211,28 @@ impl Provider for Adapter {
     ) -> Result<String, Unreachable> {
         match self {
             Self::Standin(p) => p.invoice(customer, month, lines, key).await,
+            Self::Stripe(p) => p.invoice(customer, month, lines, key).await,
         }
     }
 
     fn event(&self, signature: Option<&str>, body: &[u8], now: i64) -> Result<Event, &'static str> {
         match self {
             Self::Standin(p) => p.event(signature, body, now),
+            Self::Stripe(p) => p.event(signature, body, now),
         }
     }
 
     async fn standing(&self, customer: &str) -> Result<Option<ProviderAnswer>, Unreachable> {
         match self {
             Self::Standin(p) => p.standing(customer).await,
+            Self::Stripe(p) => p.standing(customer).await,
+        }
+    }
+
+    async fn cancel(&self, customer: &str) -> Result<usize, Unreachable> {
+        match self {
+            Self::Standin(p) => p.cancel(customer).await,
+            Self::Stripe(p) => p.cancel(customer).await,
         }
     }
 }
@@ -237,6 +272,22 @@ pub fn payments_on() -> bool {
 const API_KEY: &str = "BILLING_API_KEY";
 const WEBHOOK_SECRET: &str = "BILLING_WEBHOOK_SECRET";
 const WEBHOOK_SECRET_OLD: &str = "BILLING_WEBHOOK_SECRET_OLD";
+/// Stripe's prices for Premium and Families. They aren't secrets, and are
+/// read from the environment beside them.
+const PRICE_PREMIUM: &str = "BILLING_PRICE_PREMIUM";
+const PRICE_FAMILIES: &str = "BILLING_PRICE_FAMILIES";
+
+/// An http or https address on this machine, written as one: a name could be
+/// made to point anywhere. The only address BILLING_API_BASE may be.
+pub(super) fn loopback_url(api_base: &str) -> Option<url::Url> {
+    let url = url::Url::parse(api_base).ok()?;
+    let ip = match url.host()? {
+        url::Host::Ipv4(ip) => std::net::IpAddr::V4(ip),
+        url::Host::Ipv6(ip) => std::net::IpAddr::V6(ip),
+        url::Host::Domain(_) => return None,
+    };
+    (ip.is_loopback() && matches!(url.scheme(), "http" | "https")).then_some(url)
+}
 
 /// Works out the provider from the settings and the environment. Pure, so
 /// each way a server can be set up is tested. The problems name settings
@@ -257,9 +308,16 @@ fn from_settings(
     webhook_secrets.extend(secret(WEBHOOK_SECRET_OLD));
     let (name, adapter) = match provider {
         "standin" => ("standin", Adapter::Standin(standin::Standin::new(api_base, api_key, webhook_secrets)?)),
+        "stripe" => {
+            let prices = stripe::Prices {
+                premium: env(PRICE_PREMIUM).unwrap_or_default(),
+                families: env(PRICE_FAMILIES).unwrap_or_default(),
+            };
+            ("stripe", Adapter::Stripe(stripe::Stripe::new(api_base, api_key, webhook_secrets, prices)?))
+        }
         _ => {
             return Err(
-                "`BILLING_PROVIDER` names a provider this server doesn't have: leave it empty, or set `standin` for tests",
+                "`BILLING_PROVIDER` names a provider this server doesn't have: leave it empty, set `stripe`, or set `standin` for tests",
             );
         }
     };
@@ -475,9 +533,55 @@ pub fn may_look_now(whose: &PlanOwner) -> bool {
 /// What a person reads when the provider can't be reached for a page.
 pub const PROVIDER_UNREACHABLE: &str = "The payment provider can't be reached right now. Try again in a few minutes.";
 
+/// What a person reads when they ask to pay for a plan the provider can't
+/// take yet: a pool's card on file and Business are piece 10 of the plans
+/// design's build order.
+pub fn not_yet(plan: PlanName) -> &'static str {
+    match plan {
+        PlanName::Msp => "An MSP's plan can't be paid for online yet.",
+        PlanName::Business => "Business can't be paid for online yet.",
+        PlanName::Premium | PlanName::Families => "This plan can't be paid for online yet.",
+    }
+}
+
+/// Whether `row` is a plan `provider` set that's paid for and still in effect
+/// at `at`: in good standing, or in grace while a payment is retried. Someone
+/// with such a plan already pays for it, so asking to pay again gets the page
+/// to manage it, never a second subscription.
+fn paid_through_provider(row: &Plan, provider: &str, at: NaiveDateTime, grace_days: i64) -> bool {
+    row.set_by == SetBy::Provider.as_str()
+        && row.provider.as_deref() == Some(provider)
+        && row.standing() != Standing::None
+        && matches!(row.state_at(at, grace_days), PlanState::Active | PlanState::PaymentDue)
+}
+
+/// The page to manage `whose` plan, when a provider already bills them for
+/// one that's in effect. The provider is asked first, so a payment whose
+/// webhook hasn't come yet counts too; when it can't be asked, its last
+/// answer is what counts.
+async fn already_paid(billing: &Billing, whose: &PlanOwner, back: &str, conn: &DbConn) -> ApiResult<Option<String>> {
+    let Some(customer) = BillingCustomer::of(billing.name, whose, conn).await? else {
+        return Ok(None);
+    };
+    look(billing, whose, &customer, conn).await;
+    let grace_days = CONFIG.plan_grace_days();
+    let now = Utc::now().naive_utc();
+    let paid =
+        Plan::find(whose, conn).await?.is_some_and(|row| paid_through_provider(&row, billing.name, now, grace_days));
+    if !paid {
+        return Ok(None);
+    }
+    info!("The plan of {whose} is paid for already, so asking to pay again gets the page to manage it.");
+    manage_page(billing, whose, back, conn).await
+}
+
 /// A page to pay for `plan` (call 1), for `whose` plan. The provider's
 /// customer for it is recorded the first time, and the same one is used
 /// after, so a payment's webhooks are about someone the server knows.
+///
+/// Someone the provider already bills for a plan that's in effect gets the
+/// page to manage it instead, whatever the button they pressed said: the
+/// server checks, so nobody pays twice.
 pub async fn pay_page(
     billing: &Billing,
     whose: &PlanOwner,
@@ -485,6 +589,12 @@ pub async fn pay_page(
     back: &str,
     conn: &DbConn,
 ) -> ApiResult<String> {
+    if let Some(url) = already_paid(billing, whose, back, conn).await? {
+        return Ok(url);
+    }
+    if !billing.provider().takes(plan) {
+        err!(not_yet(plan))
+    }
     let _one = ONE_AT_A_TIME.lock().await;
     let known = BillingCustomer::of(billing.name, whose, conn).await?;
     let Ok(page) = billing.provider().pay_page(whose, plan, known.as_deref(), back).await else {
@@ -526,6 +636,45 @@ pub async fn manage_page(billing: &Billing, whose: &PlanOwner, back: &str, conn:
     }
 }
 
+/// Before an account or an organization is deleted: asks the provider to
+/// cancel at once whatever it bills `whose` customer for, so nobody is
+/// charged for something that's gone. Whoever has a customer at the provider
+/// is asked about, whatever their plan says now, since the server's record of
+/// who is a customer is what says who could be billed.
+///
+/// It never stops the deletion: when the provider can't be reached, or the
+/// customer can't be looked up, the operator is told in the log, with the
+/// provider's id for the customer so it can be canceled in the provider's
+/// dashboard, and the deletion goes ahead. Where PLANS_ENFORCED or
+/// BILLING_PROVIDER is off, it does nothing and reads nothing.
+pub async fn cancel_at_provider(whose: &PlanOwner, conn: &DbConn) {
+    let Some(billing) = billing() else {
+        return;
+    };
+    let customer = match BillingCustomer::of(billing.name, whose, conn).await {
+        Ok(Some(customer)) => customer,
+        Ok(None) => return,
+        Err(e) => {
+            error!(
+                "{whose} is being deleted, and whether the payment provider `{}` bills it for anything couldn't be read: {e:#?}. The deletion goes ahead: look for it in the provider's dashboard.",
+                billing.name
+            );
+            return;
+        }
+    };
+    match billing.provider().cancel(&customer).await {
+        Ok(0) => {}
+        Ok(canceled) => info!(
+            "{whose} is being deleted, so the payment provider `{}` canceled {canceled} subscription(s) of its customer {customer}.",
+            billing.name
+        ),
+        Err(Unreachable) => error!(
+            "{whose} is being deleted, and the payment provider `{}` couldn't be asked to cancel what its customer {customer} pays for. The deletion goes ahead: cancel it in the provider's dashboard.",
+            billing.name
+        ),
+    }
+}
+
 /// A page a person's browser can open.
 fn web_page(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "https" | "http") && url.host().is_some())
@@ -555,6 +704,184 @@ mod tests {
     const SECRETS: [(&str, &str); 2] =
         [("BILLING_API_KEY", "sk_test_standin"), ("BILLING_WEBHOOK_SECRET", "whsec_standin")];
 
+    /// Stripe's settings, every value made up.
+    const STRIPE: [(&str, &str); 4] = [
+        ("BILLING_API_KEY", "rk_test_made_up"),
+        ("BILLING_WEBHOOK_SECRET", "whsec_made_up"),
+        ("BILLING_PRICE_PREMIUM", "price_premium_made_up"),
+        ("BILLING_PRICE_FAMILIES", "price_families_made_up"),
+    ];
+
+    /// Stripe's settings with one changed, or without it when `value` is None.
+    fn stripe_with(name: &'static str, value: Option<&'static str>) -> Vec<(&'static str, &'static str)> {
+        let mut values: Vec<_> = STRIPE.iter().copied().filter(|(n, _)| *n != name).collect();
+        if let Some(value) = value {
+            values.push((name, value));
+        }
+        values
+    }
+
+    #[test]
+    fn stripe_starts_only_with_a_restricted_key_its_signing_secret_and_both_prices() {
+        let started =
+            |base: &str, values: &[(&'static str, &'static str)]| from_settings(true, "stripe", base, &env(values));
+        // Stripe's own address, with BILLING_API_BASE empty, in either mode.
+        let test = started("", &STRIPE).unwrap().unwrap();
+        assert_eq!(test.name, "stripe");
+        assert!(!test.provider().live());
+        assert_eq!(test.provider().signature_header(), "Stripe-Signature");
+        let live = started("", &stripe_with("BILLING_API_KEY", Some("rk_live_made_up"))).unwrap().unwrap();
+        assert!(live.provider().live());
+        // The stand-in on this machine, with a test key.
+        assert!(started("http://127.0.0.1:8128", &STRIPE).unwrap().is_some());
+        // Nothing without PLANS_ENFORCED, and nothing is checked.
+        assert!(from_settings(false, "stripe", "https://api.example.com", &env(&[])).unwrap().is_none());
+
+        let refused = |base: &str, values: Vec<(&'static str, &'static str)>| {
+            started(base, &values).err().unwrap_or("it was taken")
+        };
+        // A live key is only ever sent to Stripe: never beside BILLING_API_BASE.
+        assert!(
+            refused("http://127.0.0.1:8128", stripe_with("BILLING_API_KEY", Some("rk_live_made_up"))).contains("live")
+        );
+        // BILLING_API_BASE is only an address on this machine.
+        for base in ["https://api.example.com", "http://localhost:8128", "http://192.0.2.10:8128"] {
+            assert!(refused(base, STRIPE.to_vec()).contains("BILLING_API_BASE"), "{base}");
+        }
+        // The account's full secret key, in either mode, for a restricted one.
+        for key in ["sk_live_made_up", "sk_test_made_up"] {
+            assert!(refused("", stripe_with("BILLING_API_KEY", Some(key))).contains("restricted key"), "{key}");
+        }
+        assert!(refused("", stripe_with("BILLING_API_KEY", Some("pk_live_made_up"))).contains("restricted key"));
+        // Each setting is needed.
+        assert!(refused("", stripe_with("BILLING_API_KEY", None)).contains("BILLING_API_KEY"));
+        assert!(refused("", stripe_with("BILLING_WEBHOOK_SECRET", None)).contains("BILLING_WEBHOOK_SECRET"));
+        for price in ["BILLING_PRICE_PREMIUM", "BILLING_PRICE_FAMILIES"] {
+            assert!(refused("", stripe_with(price, None)).contains(price), "{price}");
+            assert!(refused("", stripe_with(price, Some(""))).contains(price), "{price}");
+            assert!(refused("", stripe_with(price, Some("prod_made_up"))).contains(price), "{price}");
+        }
+        // A signing secret that isn't one.
+        assert!(refused("", stripe_with("BILLING_WEBHOOK_SECRET", Some("rk_test_made_up"))).contains("whsec_"));
+        let mut old = STRIPE.to_vec();
+        old.push(("BILLING_WEBHOOK_SECRET_OLD", "not_a_secret"));
+        assert!(refused("", old).contains("BILLING_WEBHOOK_SECRET_OLD"));
+        // No problem holds a value.
+        for values in [
+            stripe_with("BILLING_API_KEY", Some("sk_live_made_up")),
+            stripe_with("BILLING_API_KEY", Some("rk_live_made_up")),
+            stripe_with("BILLING_PRICE_PREMIUM", Some("prod_made_up")),
+        ] {
+            let problem = refused("http://127.0.0.1:8128", values);
+            assert!(!problem.contains("made_up"), "{problem}");
+        }
+    }
+
+    #[test]
+    fn both_signing_secrets_while_stripes_is_rolled() {
+        let mut two = STRIPE.to_vec();
+        two.push(("BILLING_WEBHOOK_SECRET_OLD", "whsec_old_made_up"));
+        let billing = from_settings(true, "stripe", "", &env(&two)).unwrap().unwrap();
+        let Adapter::Stripe(stripe) = billing.provider() else {
+            panic!("Stripe")
+        };
+        assert_eq!(stripe.webhook_secrets(), 2);
+    }
+
+    fn row(
+        set_by: SetBy,
+        provider: Option<&str>,
+        standing: Standing,
+        until: Option<NaiveDateTime>,
+        renews: bool,
+    ) -> Plan {
+        Plan {
+            uuid: "row".to_owned(),
+            user_uuid: Some("ana".to_owned().into()),
+            org_uuid: None,
+            msp_uuid: None,
+            plan: "premium".to_owned(),
+            free_until: None,
+            free_why: None,
+            standing: standing.as_str().to_owned(),
+            until,
+            renews,
+            billed: "prepaid".to_owned(),
+            set_by: set_by.as_str().to_owned(),
+            provider: provider.map(str::to_owned),
+            provider_customer: provider.map(|_| "cus_1".to_owned()),
+            provider_subscription: None,
+            checked_at: None,
+            updated_at: at(1, 0),
+        }
+    }
+
+    /// Who gets the page to manage their plan instead of a second checkout.
+    #[test]
+    fn no_second_subscription() {
+        let now = at(10, 12);
+        let year = Some(now + TimeDelta::days(365));
+        let grace = 14;
+        let paid = |row: Plan| paid_through_provider(&row, "stripe", now, grace);
+        // Paid through the provider and in good standing, renewing or canceled.
+        assert!(paid(row(SetBy::Provider, Some("stripe"), Standing::Until, year, true)));
+        assert!(paid(row(SetBy::Provider, Some("stripe"), Standing::Until, year, false)));
+        assert!(paid(row(SetBy::Provider, Some("stripe"), Standing::Open, None, true)));
+        // In grace while a payment is retried: they manage the card, not pay twice.
+        let lapsed = Some(now - TimeDelta::days(3));
+        assert!(paid(row(SetBy::Provider, Some("stripe"), Standing::Until, lapsed, true)));
+        // Past grace, or canceled and past its date: a new checkout.
+        assert!(!paid(row(SetBy::Provider, Some("stripe"), Standing::Until, Some(now - TimeDelta::days(15)), true)));
+        assert!(!paid(row(SetBy::Provider, Some("stripe"), Standing::Until, lapsed, false)));
+        // Over at the provider, even during a free period the server gave.
+        let mut over = row(SetBy::Provider, Some("stripe"), Standing::None, None, false);
+        assert!(!paid(over.clone()));
+        over.free_until = Some(now + TimeDelta::days(10));
+        assert!(!paid(over));
+        // A plan the operator or the server set, or another provider's: the provider bills nothing for it.
+        assert!(!paid(row(SetBy::Operator, Some("stripe"), Standing::Until, year, true)));
+        assert!(!paid(row(SetBy::Operator, None, Standing::Until, year, true)));
+        assert!(!paid(row(SetBy::Server, None, Standing::None, None, false)));
+        assert!(!paid(row(SetBy::Provider, Some("standin"), Standing::Until, year, true)));
+    }
+
+    #[test]
+    fn what_stripe_doesnt_take_yet_says_so() {
+        assert_eq!(not_yet(PlanName::Business), "Business can't be paid for online yet.");
+        assert_eq!(not_yet(PlanName::Msp), "An MSP's plan can't be paid for online yet.");
+        let billing = from_settings(true, "stripe", "", &env(&STRIPE)).unwrap().unwrap();
+        for (plan, takes) in
+            [(PlanName::Premium, true), (PlanName::Families, true), (PlanName::Business, false), (PlanName::Msp, false)]
+        {
+            assert_eq!(billing.provider().takes(plan), takes, "{plan:?}");
+        }
+        // The stand-in takes every plan.
+        let standin = from_settings(true, "standin", "http://127.0.0.1:1", &env(&SECRETS)).unwrap().unwrap();
+        assert!(
+            [PlanName::Premium, PlanName::Families, PlanName::Business, PlanName::Msp]
+                .into_iter()
+                .all(|plan| standin.provider().takes(plan))
+        );
+    }
+
+    #[test]
+    fn the_same_loopback_rule_for_every_provider() {
+        for base in ["http://127.0.0.1:8128", "https://127.0.0.1", "http://127.8.9.10:1", "http://[::1]:8128/v1/"] {
+            assert!(loopback_url(base).is_some(), "{base}");
+        }
+        for base in [
+            "",
+            "http://localhost:8128",
+            "http://127.0.0.1.example.com",
+            "http://[::ffff:127.0.0.1]:8128",
+            "http://10.0.0.5",
+            "ftp://127.0.0.1",
+            "https://api.stripe.com",
+        ] {
+            assert!(loopback_url(base).is_none(), "{base}");
+        }
+    }
+
     #[test]
     fn the_provider_is_a_second_switch() {
         let secrets = env(&SECRETS);
@@ -578,8 +905,9 @@ mod tests {
             from_settings(true, provider, base, &env(values)).err().unwrap_or("it was taken")
         };
         // A provider this server doesn't have.
-        assert!(refused("stripe", loopback, &SECRETS).contains("doesn't have"));
+        assert!(refused("nonesuch", loopback, &SECRETS).contains("doesn't have"));
         assert!(refused("Standin", loopback, &SECRETS).contains("doesn't have"));
+        assert!(refused("Stripe", loopback, &STRIPE).contains("doesn't have"));
         // Each secret is needed, and an empty one is none.
         assert!(refused("standin", loopback, &[SECRETS[1]]).contains("BILLING_API_KEY"));
         assert!(refused("standin", loopback, &[SECRETS[0]]).contains("BILLING_WEBHOOK_SECRET"));
@@ -614,16 +942,22 @@ mod tests {
     #[test]
     fn both_webhook_secrets_while_one_is_replaced() {
         let one = from_settings(true, "standin", "http://127.0.0.1:1", &env(&SECRETS)).unwrap().unwrap();
-        let Adapter::Standin(standin) = one.provider();
+        let Adapter::Standin(standin) = one.provider() else {
+            panic!("the stand-in")
+        };
         assert_eq!(standin.webhook_secrets(), 1);
         let two = [SECRETS[0], SECRETS[1], ("BILLING_WEBHOOK_SECRET_OLD", "whsec_old")];
         let two = from_settings(true, "standin", "http://127.0.0.1:1", &env(&two)).unwrap().unwrap();
-        let Adapter::Standin(standin) = two.provider();
+        let Adapter::Standin(standin) = two.provider() else {
+            panic!("the stand-in")
+        };
         assert_eq!(standin.webhook_secrets(), 2);
         // An empty old one is none.
         let empty = [SECRETS[0], SECRETS[1], ("BILLING_WEBHOOK_SECRET_OLD", "")];
         let empty = from_settings(true, "standin", "http://127.0.0.1:1", &env(&empty)).unwrap().unwrap();
-        let Adapter::Standin(standin) = empty.provider();
+        let Adapter::Standin(standin) = empty.provider() else {
+            panic!("the stand-in")
+        };
         assert_eq!(standin.webhook_secrets(), 1);
     }
 

@@ -373,6 +373,12 @@ impl Organization {
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
+        // Keykeeper: what a payment provider bills this organization for is
+        // canceled there first, so nobody is charged for an organization that's
+        // gone. A provider that can't be reached is logged for the operator and
+        // never stops the deletion (keykeeper_billing::cancel_at_provider).
+        crate::keykeeper_billing::cancel_at_provider(&super::PlanOwner::Organization(self.uuid.clone()), conn).await;
+
         Cipher::delete_all_by_organization(&self.uuid, conn).await?;
         Collection::delete_all_by_organization(&self.uuid, conn).await?;
         Membership::delete_all_by_organization(&self.uuid, conn).await?;
