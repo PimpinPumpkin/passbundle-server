@@ -595,6 +595,8 @@ make_config! {
         plan_reminders_schedule: String, false, def,    "0 20 * * * *".to_owned();
         /// Billing look schedule |> PassBundle: cron schedule of the job that asks the payment provider again about the plans it set: each one whose last answer is a day old, each whose paid-through date has passed since, and each a webhook asked about whose look got no answer. It also clears webhooks' ids after 35 days. Runs only where PLANS_ENFORCED and BILLING_PROVIDER are both set. Defaults to hourly. Set blank to disable this job.
         billing_look_schedule:  String, false,  def,    "0 25 * * * *".to_owned();
+        /// Billing invoice schedule |> PassBundle: cron schedule of the job that bills MSPs' pools and Business organizations with no MSP by the day, after each month: for the month just ended, each one's seat-days, prorated over the month's days, at the price for its tier, invoiced once through the payment provider to the card on file. Runs only where PLANS_ENFORCED and BILLING_PROVIDER are both set, and needs a seat's prices in the environment (BILLING_SEAT_PRICES_MSP and BILLING_SEAT_PRICES_BUSINESS). Defaults to hourly; each month is invoiced once, on the first run after it ends, and a run the provider couldn't answer is tried again on the next. Set blank to turn billing by the day off: then Business and MSPs' pools can't put a card on file with Stripe.
+        billing_invoice_schedule: String, false, def,  "0 35 * * * *".to_owned();
     },
 
     /// General settings
@@ -672,7 +674,7 @@ make_config! {
         msp_signups_allowed:    bool,   true,   def,    false;
         /// Enforce plans |> PassBundle: whether what an account or an organization gets depends on its plan. Off, the default, everyone gets everything, as on any self-hosted server, and no plan is looked up. Set only in the environment.
         plans_enforced:         bool,   false,  def,    false;
-        /// Payment provider |> PassBundle: the provider the server learns from who has paid (DESIGN.md, "Learning who has paid"). Empty, the default: no provider, so there's no webhook route, no page to pay, and no billing job, and plans are set by hand on the admin page. `stripe` is Stripe, for Premium and Families, which also needs the prices BILLING_PRICE_PREMIUM and BILLING_PRICE_FAMILIES in the environment. `standin` is the test stand-in, which only talks to a loopback BILLING_API_BASE. Does nothing unless PLANS_ENFORCED is on. Set only in the environment. Its secrets, BILLING_API_KEY, BILLING_WEBHOOK_SECRET, and BILLING_WEBHOOK_SECRET_OLD, are read from the environment only and never shown here.
+        /// Payment provider |> PassBundle: the provider the server learns from who has paid (DESIGN.md, "Learning who has paid"). Empty, the default: no provider, so there's no webhook route, no page to pay, and no billing job, and plans are set by hand on the admin page. `stripe` is Stripe, for Premium and Families, which also needs the prices BILLING_PRICE_PREMIUM and BILLING_PRICE_FAMILIES in the environment, and, while BILLING_INVOICE_SCHEDULE isn't blank, for Business and MSPs' pools billed by the day, with a seat's prices in BILLING_SEAT_PRICES_MSP and BILLING_SEAT_PRICES_BUSINESS. `standin` is the test stand-in, which only talks to a loopback BILLING_API_BASE. Does nothing unless PLANS_ENFORCED is on. Set only in the environment. Its secrets, BILLING_API_KEY, BILLING_WEBHOOK_SECRET, and BILLING_WEBHOOK_SECRET_OLD, are read from the environment only and never shown here.
         billing_provider:       String, false,  def,    String::new();
         /// Payment provider's API address |> PassBundle: for tests only, the address the provider's adapter calls instead of the provider's own. The stand-in needs one, and it has to be a loopback address. With Stripe it's empty, for Stripe's own address, and the server won't start with it set beside a live key. Set only in the environment.
         billing_api_base:       String, false,  def,    String::new();
@@ -1554,6 +1556,9 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     // own settings are checked where they're read (`keykeeper_billing::init`).
     if !cfg.billing_look_schedule.is_empty() && cfg.billing_look_schedule.parse::<Schedule>().is_err() {
         err!("`BILLING_LOOK_SCHEDULE` is not a valid cron expression")
+    }
+    if !cfg.billing_invoice_schedule.is_empty() && cfg.billing_invoice_schedule.parse::<Schedule>().is_err() {
+        err!("`BILLING_INVOICE_SCHEDULE` is not a valid cron expression")
     }
 
     // Keykeeper: what plans give (DESIGN.md, "Plans and billing").

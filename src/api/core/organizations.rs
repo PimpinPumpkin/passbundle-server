@@ -320,7 +320,10 @@ async fn get_organization(org_id: OrganizationId, headers: OwnerHeaders, conn: D
         err!("Organization not found", "Organization id's do not match");
     }
     if let Some(organization) = Organization::find_by_uuid(&org_id, &conn).await {
-        Ok(Json(organization.to_json()))
+        // Keykeeper: its plan's true values, where plans are enforced.
+        let mut json = organization.to_json();
+        crate::db::models::put_on_organization(&mut json, &org_id, &headers.user.uuid, &conn).await;
+        Ok(Json(json))
     } else {
         err!("Can't find organization details")
     }
@@ -359,7 +362,10 @@ async fn put_organization(
     )
     .await;
 
-    Ok(Json(org.to_json()))
+    // Keykeeper: its plan's true values, where plans are enforced.
+    let mut json = org.to_json();
+    crate::db::models::put_on_organization(&mut json, &org_id, &headers.user.uuid, &conn).await;
+    Ok(Json(json))
 }
 
 // GET /api/collections?writeOnly=false
@@ -1090,6 +1096,10 @@ async fn send_invite(
     super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
     let data: InviteData = data.into_inner();
     data.validate(&org_id, &conn).await?;
+    // Keykeeper: a family has room for so many people, counting everyone
+    // invited (DESIGN.md, "What the server refuses").
+    let inviting = i64::try_from(data.emails.len()).unwrap_or(i64::MAX);
+    super::keykeeper_plan_limits::refuse_if_family_full(&org_id, inviting, &conn).await?;
 
     // HACK: We need the raw user-type to be sure custom role is selected to determine the access_all permission
     // The from_str() will convert the custom role type into a manager role type
@@ -1102,6 +1112,10 @@ async fn send_invite(
     };
     // Keykeeper: a Custom role with our permissions is a regular member plus those permissions.
     let custom_role = crate::db::models::keykeeper_roles::CustomPermissions::from_request(raw_type, &data.permissions)?;
+    // Keykeeper: custom roles are a company feature, which a family doesn't have.
+    if raw_type == "4" {
+        super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
+    }
     let new_type = if custom_role.is_some() {
         MembershipType::User as i32
     } else {
@@ -1192,7 +1206,14 @@ async fn send_invite(
         new_member.access_all = access_all;
         new_member.atype = new_type;
         new_member.status = member_status;
-        new_member.save(&conn).await?;
+        // Keykeeper: a family's people are counted as each one is added, so
+        // invitations at once can't take one place twice.
+        if let Err(e) = super::keykeeper_plan_limits::save_counted(&new_member, &conn).await {
+            if user_created {
+                user.delete(&conn).await?;
+            }
+            return Err(e);
+        }
         // Keykeeper: joined at once without email, so not by them.
         if member_status == MembershipStatus::Accepted as i32 {
             super::keykeeper_two_step::accepted_without_them(vec![new_member.uuid.clone()], &conn).await?;
@@ -1362,6 +1383,9 @@ async fn reinvite_member_impl(
     // Keykeeper: nothing new is added to an organization whose plan has
     // ended (DESIGN.md, "What happens when payment stops").
     super::keykeeper_plan_limits::refuse_if_ended(org_id, conn).await?;
+    // Keykeeper: someone invited already counts in a family, so sending it
+    // again is refused only while it has more people than its plan covers.
+    super::keykeeper_plan_limits::refuse_if_family_full(org_id, 0, conn).await?;
     let Some(member) = Membership::find_by_uuid_and_org(member_id, org_id, conn).await else {
         err!("The user hasn't been invited to the organization.")
     };
@@ -1462,6 +1486,8 @@ async fn accept_invite(
         // Keykeeper: nothing new is added to an organization whose plan has
         // ended (DESIGN.md, "What happens when payment stops").
         super::keykeeper_plan_limits::refuse_if_ended(&membership.org_uuid, &conn).await?;
+        // Keykeeper: and not into a family with more people than its plan covers.
+        super::keykeeper_plan_limits::refuse_if_family_full(&membership.org_uuid, 0, &conn).await?;
         accept_org_invite(&headers.user, membership, reset_password_key, true, &conn).await?;
     } else if CONFIG.mail_enabled() {
         // User was invited from /admin, so they are automatically confirmed
@@ -1561,6 +1587,8 @@ async fn confirm_invite_impl(
     // Keykeeper: nothing new is added to an organization whose plan has
     // ended (DESIGN.md, "What happens when payment stops").
     super::keykeeper_plan_limits::refuse_if_ended(org_id, conn).await?;
+    // Keykeeper: and not into a family with more people than its plan covers.
+    super::keykeeper_plan_limits::refuse_if_family_full(org_id, 0, conn).await?;
     if key.is_empty() || member_id.is_empty() {
         err!("Key or UserId is not set, unable to process request");
     }
@@ -1746,6 +1774,10 @@ async fn edit_member(
     };
     // Keykeeper: a Custom role with our permissions is a regular member plus those permissions.
     let custom_role = crate::db::models::keykeeper_roles::CustomPermissions::from_request(raw_type, &data.permissions)?;
+    // Keykeeper: custom roles are a company feature, which a family doesn't have.
+    if raw_type == "4" {
+        super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
+    }
     let new_type = if custom_role.is_some() {
         MembershipType::User
     } else {
@@ -2430,6 +2462,11 @@ async fn put_policy(
     // changes only in the MSP's console, whoever asks here (DESIGN.md,
     // "Required for every client"). A 400, which doesn't sign anyone out.
     super::keykeeper_msp_policies::refuse_if_required(&org_id, pol_type, data.enabled, &conn).await?;
+    // Keykeeper: policies are a company feature, which a family doesn't have.
+    // Turning one off goes on.
+    if data.enabled {
+        super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
+    }
 
     // Keykeeper: the rest is set_policy, shared with MSP default policies so a
     // default reaches each client with the same checks and side effects.
@@ -2646,13 +2683,22 @@ fn get_billing_warnings(_org_id: OrganizationId, _headers: OrgMemberHeaders) -> 
     }))
 }
 
-#[get("/organizations/<_org_id>/billing/vnext/self-host/metadata")]
-fn get_self_host_billing_metadata(_org_id: OrganizationId, _headers: OrgMemberHeaders) -> Json<Value> {
+#[get("/organizations/<org_id>/billing/vnext/self-host/metadata")]
+async fn get_self_host_billing_metadata(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
+    // Keykeeper: a family's seats taken, counted as the server counts them,
+    // so upstream's invite form stops at the seats left (DESIGN.md, "How a
+    // plan reaches the clients"). Everyone else, and every organization where
+    // plans aren't enforced, gets 0 as before.
+    let taken = if org_id == headers.membership.org_uuid {
+        super::keykeeper_plan_limits::family_seats_taken(&org_id, &conn).await?
+    } else {
+        None
+    };
     // Prevent a 404 error, which also causes Javascript errors.
-    Json(json!({
+    Ok(Json(json!({
         "isOnSecretsManagerStandalone": false, // Secrets Manager is not supported by Vaultwarden
-        "organizationOccupiedSeats": 0 // Vaultwarden does not count seats
-    }))
+        "organizationOccupiedSeats": taken.unwrap_or(0) // Vaultwarden does not count seats
+    })))
 }
 
 #[derive(Deserialize, Debug)]
@@ -2885,6 +2931,10 @@ async fn restore_member_impl(
             // they revoked (keykeeper_offboarding.rs).
             let by = super::keykeeper_offboarding::By::Member(&headers.user);
             super::keykeeper_offboarding::check_restore(&member, by, conn).await?;
+            // Keykeeper: a family has room for so many people. Someone whose
+            // restore already waits for them holds their place.
+            let held = crate::db::models::RevokedUntilAccepted::is(&member.uuid, conn).await;
+            super::keykeeper_plan_limits::refuse_if_family_full(org_id, i64::from(!held), conn).await?;
             // Keykeeper: a role its person never accepted, where it requires
             // two-step login, comes back only when they accept it.
             super::keykeeper_two_step::require_accepted_to_restore(&member, conn).await?;
@@ -2895,7 +2945,8 @@ async fn restore_member_impl(
             // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
             // This check need to be done after restoring to work with the correct status
             OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
-            member.save(conn).await?;
+            // Keykeeper: counted again as they're written, for a family.
+            super::keykeeper_plan_limits::save_counted(&member, conn).await?;
             crate::db::models::RevokedUntilAccepted::end(&member.uuid, conn).await?;
             super::keykeeper_offboarding::after_restore(&member, by, conn).await?;
             watch.settle(conn).await?;
@@ -2951,7 +3002,11 @@ async fn get_groups_data(
         err_code!("Resource not found.", "User does not have access", Status::NotFound.code);
     }
 
-    let groups: Vec<Value> = if CONFIG.org_groups_enabled() {
+    // Keykeeper: a family has no groups (company features), so it's answered
+    // as a server without them answers.
+    let groups_on =
+        CONFIG.org_groups_enabled() && super::keykeeper_plan_limits::company_features_on(&org_id, &conn).await?;
+    let groups: Vec<Value> = if groups_on {
         let groups = Group::find_by_organization(&org_id, &conn).await;
         let mut groups_json = Vec::with_capacity(groups.len());
 
@@ -3102,6 +3157,8 @@ async fn post_groups(
     if !CONFIG.org_groups_enabled() {
         err!("Group support is disabled");
     }
+    // Keykeeper: groups are a company feature, which a family doesn't have.
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     // Keykeeper: nothing new is added to an organization whose plan has
     // ended (DESIGN.md, "What happens when payment stops").
     super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
@@ -3140,6 +3197,9 @@ async fn put_group(
     if !CONFIG.org_groups_enabled() {
         err!("Group support is disabled");
     }
+    // Keykeeper: groups are a company feature, which a family doesn't have.
+    // Deleting one goes on.
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
 
     let Some(group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {
         err!("Group not found", "Group uuid is invalid or does not belong to the organization")
@@ -3552,6 +3612,8 @@ async fn check_reset_password_applicable_and_permissions(
     headers: &AdminHeaders,
     conn: &DbConn,
 ) -> EmptyResult {
+    // Keykeeper: account recovery is a company feature, which a family doesn't have.
+    super::keykeeper_plan_limits::refuse_company_feature(org_id, conn).await?;
     check_reset_password_applicable(org_id, conn).await?;
 
     let Some(target_user) = Membership::find_by_uuid_and_org(member_id, org_id, conn).await else {
@@ -3616,6 +3678,11 @@ async fn put_reset_password_enrollment(
 
     let mut membership = headers.membership;
 
+    // Keykeeper: account recovery is a company feature, which a family
+    // doesn't have. Withdrawing from it goes on.
+    if data.reset_password_key.as_deref().is_some_and(|key| !key.is_empty()) {
+        super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
+    }
     check_reset_password_applicable(&org_id, &conn).await?;
 
     let reset_request = data.into_inner();
@@ -3725,6 +3792,9 @@ async fn api_key(
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
+    // Keykeeper: the organization's API key (its directory import) is a
+    // company feature, which a family doesn't have.
+    super::keykeeper_plan_limits::refuse_company_feature(org_id, &conn).await?;
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 

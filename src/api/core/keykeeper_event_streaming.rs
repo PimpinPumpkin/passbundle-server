@@ -905,6 +905,9 @@ async fn create_org(org_id: OrganizationId, data: Json<DestinationData>, headers
     // Keykeeper: no new destination for an organization whose plan has ended
     // (DESIGN.md, "What happens when payment stops"). Those it has keep sending.
     super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
+    // Keykeeper: events to security tools are a company feature, which a
+    // family doesn't have.
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     create(scope, data.into_inner(), &headers, &conn).await
 }
 
@@ -917,6 +920,8 @@ async fn update_org(
     conn: DbConn,
 ) -> JsonResult {
     let scope = require_org_manager(&org_id, &headers, &conn).await?;
+    // Keykeeper: not for a family (company features). Deleting one goes on.
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     update(scope, &checked_id(id)?, data.into_inner(), &headers, &conn).await
 }
 
@@ -929,6 +934,8 @@ async fn delete_org(org_id: OrganizationId, id: &str, headers: Headers, conn: Db
 #[post("/keykeeper/organizations/<org_id>/event-streaming/<id>/test")]
 async fn test_org(org_id: OrganizationId, id: &str, headers: Headers, conn: DbConn) -> JsonResult {
     let scope = require_org_manager(&org_id, &headers, &conn).await?;
+    // Keykeeper: not for a family (company features).
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     test(scope, &checked_id(id)?, &headers, conn).await
 }
 
@@ -941,6 +948,8 @@ async fn new_secret_org(
     conn: DbConn,
 ) -> JsonResult {
     let scope = require_org_manager(&org_id, &headers, &conn).await?;
+    // Keykeeper: not for a family (company features).
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     new_secret(scope, &checked_id(id)?, &data.map(Json::into_inner).unwrap_or_default(), &headers, &conn).await
 }
 

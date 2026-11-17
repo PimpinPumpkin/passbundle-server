@@ -1242,7 +1242,9 @@ fn string_field(resource: &Value, name: &str) -> Result<Option<String>, ScimErro
 /// Keykeeper: nothing new is added to an organization whose plan has ended:
 /// no new people, nobody turned back on, and no new groups (DESIGN.md, "What
 /// happens when payment stops"). The directory still turns people off,
-/// removes them, and changes who's in a group.
+/// removes them, and changes who's in a group. Nor to a family, whose plan
+/// has no provisioning (company features), for a token made before it was
+/// one.
 async fn refuse_if_ended(org: &OrganizationId, conn: &DbConn) -> Result<(), ScimError> {
     if crate::api::core::keykeeper_plan_limits::organization_has_ended(org, conn).await? {
         return Err(ScimError::new(
@@ -1250,6 +1252,9 @@ async fn refuse_if_ended(org: &OrganizationId, conn: &DbConn) -> Result<(), Scim
             None,
             crate::api::core::keykeeper_plan_limits::ORGANIZATION_ENDED,
         ));
+    }
+    if !crate::api::core::keykeeper_plan_limits::company_features_on(org, conn).await? {
+        return Err(ScimError::new(Status::BadRequest, None, crate::api::core::keykeeper_plan_limits::BUSINESS_PLAN));
     }
     Ok(())
 }

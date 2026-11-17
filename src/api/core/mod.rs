@@ -17,7 +17,7 @@ mod keykeeper_joining;
 mod keykeeper_member_health;
 mod keykeeper_msp;
 mod keykeeper_msp_policies;
-mod keykeeper_msp_seats;
+pub mod keykeeper_msp_seats;
 mod keykeeper_msp_templates;
 pub mod keykeeper_new_device;
 mod keykeeper_offboarding;
