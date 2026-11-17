@@ -29,11 +29,11 @@ use crate::{
     db::{
         DbConn,
         models::{
-            CollectionId, CollectionUser, EnrollmentDomains, JoiningSeal, JoiningSealSource, Membership,
-            MembershipStatus, MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole,
-            OrgJoining, OrgMemberHealth, OrgPolicy, OrgSetup, Organization, OrganizationId, RemovedMember, ScimUser,
-            User, effective_joining, email_in_domains, joining_seal_source, parse_enrollment_domains,
-            valid_encrypted_secret, valid_expiring_seal, valid_seal,
+            CollectionUser, EnrollmentDomains, JoiningSeal, JoiningSealSource, Membership, MembershipStatus,
+            MembershipType, Msp, MspClient, MspEnrollmentJoin, MspId, MspMembership, MspRole, OrgJoining,
+            OrgMemberHealth, OrgPolicy, OrgSetup, Organization, OrganizationId, RemovedMember, ScimUser, User,
+            effective_joining, email_in_domains, joining_seal_source, parse_enrollment_domains, valid_encrypted_secret,
+            valid_expiring_seal, valid_seal,
         },
     },
     mail,
@@ -424,7 +424,6 @@ async fn set_org_enrollment_domains(
 /// organization.
 struct Target {
     org_uuid: OrganizationId,
-    everyone_collection: Option<CollectionId>,
     msp_uuid: Option<MspId>,
 }
 
@@ -432,13 +431,11 @@ async fn target_by_token(token: &str, conn: &DbConn) -> Option<Target> {
     if let Some(client) = MspClient::find_by_enrollment_token(token, conn).await {
         return Some(Target {
             org_uuid: client.org_uuid,
-            everyone_collection: client.everyone_collection,
             msp_uuid: Some(client.msp_uuid),
         });
     }
     OrgSetup::find_by_enrollment_token(token, conn).await.map(|setup| Target {
         org_uuid: setup.org_uuid,
-        everyone_collection: setup.everyone_collection,
         msp_uuid: None,
     })
 }
@@ -601,15 +598,17 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
     let invited_by = member.invited_by_email.clone();
     super::accept_org_invite(&headers.user, member, reset_password_key, false, &conn).await?;
 
-    if let Some(collection) = &target.everyone_collection
+    // Keykeeper: only while the organization still has its Everyone: one it
+    // deleted is skipped, rather than failing the join after it's accepted.
+    if let Some(collection) = super::keykeeper_everyone::everyone_collection(&org.uuid, &conn).await
         // An invitation's own grant there stays as the admin set it: Can
         // edit would widen a narrower one.
-        && CollectionUser::find_by_collection_and_user(collection, &headers.user.uuid, &conn).await.is_none()
+        && CollectionUser::find_by_collection_and_user(&collection.uuid, &headers.user.uuid, &conn).await.is_none()
     {
         // Can edit, as a preset grant (keykeeper_folder_permissions.rs).
         crate::db::models::keykeeper_folder_permissions::save_user(
             &headers.user.uuid,
-            collection,
+            &collection.uuid,
             &crate::db::models::keykeeper_folder_permissions::Grid::preset(false, false, false),
             &conn,
         )
