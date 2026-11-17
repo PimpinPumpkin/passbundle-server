@@ -8,14 +8,14 @@
 // (the server won't start otherwise), never with a key that looks live, and
 // it's never the provider's live mode, so a live event is dropped.
 
-use std::{net::IpAddr, sync::LazyLock};
+use std::sync::LazyLock;
 
 use reqwest::{Client, Method, StatusCode, header};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use url::{Host, Url};
+use url::Url;
 
-use super::{Event, InvoiceLine, PayPage, Provider, Secret, Unreachable, plain_id, signature};
+use super::{Event, InvoiceLine, PayPage, Provider, Secret, Unreachable, loopback_url, plain_id, signature};
 use crate::{
     db::models::{Billed, PlanName, PlanOwner, ProviderAnswer, Standing},
     http_client::get_reqwest_client_builder,
@@ -39,17 +39,9 @@ static CLIENT: LazyLock<Client> = LazyLock::new(|| {
 /// Only an address on this machine, written as one: a name could be made to
 /// point anywhere.
 fn loopback(api_base: &str) -> Result<Url, &'static str> {
-    const NOT_LOOPBACK: &str = "The stand-in payment provider is for tests: `BILLING_API_BASE` must be an http or https address on this machine, written as one, such as http://127.0.0.1:8124";
-    let url = Url::parse(api_base).map_err(|_| NOT_LOOPBACK)?;
-    let ip = match url.host() {
-        Some(Host::Ipv4(ip)) => IpAddr::V4(ip),
-        Some(Host::Ipv6(ip)) => IpAddr::V6(ip),
-        _ => return Err(NOT_LOOPBACK),
-    };
-    if !ip.is_loopback() || !matches!(url.scheme(), "http" | "https") {
-        return Err(NOT_LOOPBACK);
-    }
-    Ok(url)
+    loopback_url(api_base).ok_or(
+        "The stand-in payment provider is for tests: `BILLING_API_BASE` must be an http or https address on this machine, written as one, such as http://127.0.0.1:8124",
+    )
 }
 
 impl Standin {
@@ -179,6 +171,11 @@ impl Provider for Standin {
         "Standin-Signature"
     }
 
+    /// Every plan, so the server's whole path is tested for each.
+    fn takes(&self, _plan: PlanName) -> bool {
+        true
+    }
+
     async fn pay_page(
         &self,
         whose: &PlanOwner,
@@ -239,6 +236,14 @@ impl Provider for Standin {
             warn!("The stand-in payment provider's standing couldn't be read.");
         }
         read
+    }
+
+    async fn cancel(&self, customer: &str) -> Result<usize, Unreachable> {
+        let body = json!({ "customer": customer });
+        let Some(answer) = self.call(Method::POST, &["cancel"], Some(body)).await? else {
+            return Ok(0);
+        };
+        answer["canceled"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or(Unreachable)
     }
 }
 

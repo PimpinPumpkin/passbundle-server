@@ -382,6 +382,12 @@ impl User {
             }
         }
 
+        // Keykeeper: what a payment provider bills this account for is canceled
+        // there first, so nobody is charged for an account that's gone. A
+        // provider that can't be reached is logged for the operator and never
+        // stops the deletion (keykeeper_billing::cancel_at_provider).
+        crate::keykeeper_billing::cancel_at_provider(&super::PlanOwner::User(self.uuid.clone()), conn).await;
+
         super::Send::delete_all_by_user(&self.uuid, conn).await?;
         EmergencyAccess::delete_all_by_user(&self.uuid, conn).await?;
         EmergencyAccess::delete_all_by_grantee_email(&self.email, conn).await?;
