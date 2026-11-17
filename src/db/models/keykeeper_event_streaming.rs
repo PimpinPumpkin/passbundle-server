@@ -39,8 +39,8 @@ pub const MAX_DESTINATIONS: i64 = 5;
 /// take up the worker with hundreds of them. An MSP's feed covers every
 /// client in one.
 pub const MAX_SCOPES_PER_PERSON: usize = 20;
-/// Events waiting per destination. When it's full, the oldest go, and the
-/// destination counts them as dropped.
+/// Events waiting per destination. When it's full, the least important go
+/// first (EventDelivery::enqueue), and the destination counts them as dropped.
 pub const MAX_QUEUED: i64 = 10_000;
 
 /// Wakes the delivery worker when there's something new to send.
@@ -824,9 +824,6 @@ fn sooner(now: Option<NaiveDateTime>, before: Option<NaiveDateTime>) -> bool {
 /// Standard Webhooks suggests.
 pub const GIVE_UP_AFTER: TimeDelta = TimeDelta::days(3);
 
-/// A full queue can grow past MAX_QUEUED with kept events only, up to this.
-const MAX_WITH_KEPT: i64 = 2 * MAX_QUEUED;
-
 /// What an event adds to a destination's queue.
 pub struct Queued<'a> {
     pub event_uuid: &'a str,
@@ -872,6 +869,13 @@ impl EventDelivery {
     /// its own statement, not one transaction, so SQLite's busy wait covers
     /// each.
     pub async fn enqueue(destination: &EventDestination, event: Queued<'_>, conn: &DbConn) -> EmptyResult {
+        Self::enqueue_within(destination, event, MAX_QUEUED, conn).await
+    }
+
+    /// Queues an event as enqueue does, in a queue of at most `max` events
+    /// (twice that with kept events only): MAX_QUEUED, or a few in the tests
+    /// of what a full queue drops, since filling one of 10,000 is too slow.
+    async fn enqueue_within(destination: &EventDestination, event: Queued<'_>, max: i64, conn: &DbConn) -> EmptyResult {
         let now = Utc::now().naive_utc();
         let next_attempt_at = if destination.enabled {
             now
@@ -960,7 +964,7 @@ impl EventDelivery {
                     .execute(conn)?;
                 }
                 let counted: i32 = dest.select(event_destinations::queued).first(conn)?;
-                if i64::from(counted) <= MAX_QUEUED {
+                if i64::from(counted) <= max {
                     return Ok(0);
                 }
                 // Looks full: count for real, drop the least important (from
@@ -972,7 +976,7 @@ impl EventDelivery {
                     .filter(event_deliveries::priority.lt(KEPT))
                     .count()
                     .get_result(conn)?;
-                let over = queued - MAX_QUEUED;
+                let over = queued - max;
                 let mut gone = 0;
                 if over > 0 && droppable > 0 {
                     let mut least = event_deliveries::table
@@ -1005,13 +1009,13 @@ impl EventDelivery {
                         event_deliveries::table.filter(mine).filter(event_deliveries::event_uuid.eq_any(ids)),
                     )
                     .execute(conn)?;
-                } else if queued > MAX_WITH_KEPT {
+                } else if queued > 2 * max {
                     // Only kept events, and too many even for those: the oldest go.
                     let ids: Vec<String> = event_deliveries::table
                         .filter(mine.clone())
                         .order((event_deliveries::created_at.asc(), event_deliveries::event_uuid.asc()))
                         .select(event_deliveries::event_uuid)
-                        .limit(queued - MAX_WITH_KEPT)
+                        .limit(queued - 2 * max)
                         .load(conn)?;
                     gone = diesel::delete(
                         event_deliveries::table.filter(mine).filter(event_deliveries::event_uuid.eq_any(ids)),
@@ -1903,5 +1907,230 @@ mod tests {
         assert_eq!(unknown["type"], 9199);
         assert_eq!(unknown["action"], "something_new");
         assert_eq!(unknown["actor"], json!({ "type": "system" }));
+    }
+}
+
+/// The queue and the lease on real rows, in a SQLite database of the test's
+/// own: what a full queue drops (with a cap of a few events, through the
+/// same code a cap of 10,000 runs), and that one worker at a time holds a
+/// destination, however many servers share the database.
+#[cfg(all(test, sqlite))]
+mod queue_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::db::DbPool;
+
+    /// The queue's cap in these tests.
+    const CAP: i64 = 4;
+    const LOW: i32 = 0;
+    const MEDIUM: i32 = 1;
+    const HIGH: i32 = 2;
+
+    async fn owner(conn: &DbConn) -> User {
+        let mut user = User::new(&format!("{}@example.test", crate::util::get_uuid()), None);
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    /// A destination of an organization's own.
+    async fn of_organization(conn: &DbConn) -> EventDestination {
+        let org = Organization::new("Contoso".to_owned(), "billing@example.test", None, None);
+        org.save(conn).await.unwrap();
+        let d = EventDestination::new(Some(org.uuid), None, "SIEM".into(), Kind::Webhook, owner(conn).await.uuid);
+        assert_eq!(d.insert_capped(MAX_DESTINATIONS, conn).await.unwrap(), Added::Yes);
+        d
+    }
+
+    /// An MSP's feed, which gets every client's events.
+    async fn of_msp(conn: &DbConn) -> EventDestination {
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(conn).await.unwrap();
+        let d = EventDestination::new(None, Some(msp.uuid), "SOC".into(), Kind::Syslog, owner(conn).await.uuid);
+        assert_eq!(d.insert_capped(MAX_DESTINATIONS, conn).await.unwrap(), Added::Yes);
+        d
+    }
+
+    /// Queues event `id` with a priority, from a client, in a queue of CAP.
+    /// The ids sort in the order they're queued.
+    async fn queue(d: &EventDestination, id: &str, priority: i32, client: &str, conn: &DbConn) {
+        let event = Queued {
+            event_uuid: id,
+            payload: json!({ "id": id }).to_string(),
+            priority,
+            merge_key: None,
+            source: Some(client.to_owned()),
+        };
+        EventDelivery::enqueue_within(d, event, CAP, conn).await.unwrap();
+    }
+
+    /// What waits, in the order it was queued, and the destination's running
+    /// count of it, which must be the real count.
+    async fn waiting(d: &EventDestination, conn: &DbConn) -> Vec<String> {
+        let uuid = d.uuid.clone();
+        let ids: Vec<String> = conn
+            .run(move |conn| {
+                event_deliveries::table
+                    .filter(event_deliveries::destination_uuid.eq(uuid))
+                    .select(event_deliveries::event_uuid)
+                    .order(event_deliveries::event_uuid.asc())
+                    .load(conn)
+                    .unwrap()
+            })
+            .await;
+        let now = EventDestination::find(&d.uuid, conn).await.unwrap();
+        assert_eq!(i64::from(now.queued), EventDelivery::count(&d.uuid, conn).await, "the running count");
+        assert_eq!(usize::try_from(now.queued).unwrap(), ids.len());
+        ids
+    }
+
+    async fn dropped(d: &EventDestination, conn: &DbConn) -> i32 {
+        EventDestination::find(&d.uuid, conn).await.unwrap().dropped
+    }
+
+    /// DESIGN.md, "A bounded queue": past the cap, low severity goes first,
+    /// then medium, then high, oldest first, and each is counted. Kept events
+    /// (changes to who can do what) are never dropped for that: they can fill
+    /// the queue to twice the cap, and only past that do the oldest go.
+    #[rocket::async_test]
+    async fn a_full_queue_drops_the_least_important_oldest_first_and_kept_events_last() {
+        let conn = DbPool::for_test().await;
+        let d = of_organization(&conn).await;
+        let org = d.org_uuid.clone().unwrap().to_string();
+
+        queue(&d, "e01", LOW, &org, &conn).await;
+        queue(&d, "e02", MEDIUM, &org, &conn).await;
+        queue(&d, "e03", HIGH, &org, &conn).await;
+        queue(&d, "e04", KEPT, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e02", "e03", "e04"]);
+        assert_eq!(dropped(&d, &conn).await, 0);
+
+        // One past the cap: the oldest low goes.
+        queue(&d, "e05", LOW, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e02", "e03", "e04", "e05"]);
+        // Low before medium, even a newer low.
+        queue(&d, "e06", MEDIUM, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e02", "e03", "e04", "e06"]);
+        // Medium before high, the oldest first.
+        queue(&d, "e07", HIGH, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e03", "e04", "e06", "e07"]);
+        // A new event that's the least important goes itself.
+        queue(&d, "e08", LOW, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e03", "e04", "e06", "e07"]);
+        assert_eq!(dropped(&d, &conn).await, 4);
+
+        // Kept events push out the rest: medium, then high, oldest first.
+        queue(&d, "e09", KEPT, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e03", "e04", "e07", "e09"]);
+        queue(&d, "e10", KEPT, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e04", "e07", "e09", "e10"]);
+        queue(&d, "e11", KEPT, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e04", "e09", "e10", "e11"]);
+        assert_eq!(dropped(&d, &conn).await, 7);
+
+        // With only kept events waiting, the queue grows to twice the cap...
+        for id in ["e12", "e13", "e14", "e15"] {
+            queue(&d, id, KEPT, &org, &conn).await;
+        }
+        assert_eq!(waiting(&d, &conn).await, ["e04", "e09", "e10", "e11", "e12", "e13", "e14", "e15"]);
+        assert_eq!(dropped(&d, &conn).await, 7);
+        // ...and past that, the oldest kept event goes.
+        queue(&d, "e16", KEPT, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e09", "e10", "e11", "e12", "e13", "e14", "e15", "e16"]);
+        assert_eq!(dropped(&d, &conn).await, 8);
+        // Anything else that comes now goes at once.
+        queue(&d, "e17", HIGH, &org, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e09", "e10", "e11", "e12", "e13", "e14", "e15", "e16"]);
+        assert_eq!(dropped(&d, &conn).await, 9);
+    }
+
+    /// In an MSP's feed, the client with the most events that could go loses
+    /// first, its least important and oldest, even when another client's
+    /// event is older or less important: one client's member can't crowd out
+    /// the others. A busy client's kept events stay.
+    #[rocket::async_test]
+    async fn in_an_msps_feed_the_client_with_the_most_waiting_loses_first() {
+        let conn = DbPool::for_test().await;
+        let d = of_msp(&conn).await;
+
+        queue(&d, "e01", LOW, "client-b", &conn).await;
+        queue(&d, "e02", KEPT, "client-a", &conn).await;
+        queue(&d, "e03", MEDIUM, "client-a", &conn).await;
+        queue(&d, "e04", MEDIUM, "client-a", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e02", "e03", "e04"]);
+
+        // Client A has three that could go and B one: A's oldest medium goes,
+        // not B's older low.
+        queue(&d, "e05", HIGH, "client-a", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e02", "e04", "e05"]);
+        // Still A: its new low goes.
+        queue(&d, "e06", LOW, "client-a", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e02", "e04", "e05"]);
+        // A has two, B and C one each: A's medium goes.
+        queue(&d, "e07", MEDIUM, "client-c", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e02", "e05", "e07"]);
+        // Now B has the most: its low goes, and A's high and kept stay.
+        queue(&d, "e08", HIGH, "client-b", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e02", "e05", "e07", "e08"]);
+        assert_eq!(dropped(&d, &conn).await, 4);
+    }
+
+    /// Two servers on one database each run a worker. When several reach for
+    /// one destination at once, each on its own connection, exactly one gets
+    /// it. Nobody else gets it until that one lets go or its lease runs out
+    /// (as when its server stopped mid-turn), and only the holder can let go.
+    #[rocket::async_test]
+    async fn one_worker_at_a_time_holds_a_destination() {
+        const AT_ONCE: u32 = 8;
+        let lease = TimeDelta::seconds(120);
+        let pool = Arc::new(DbPool::for_test_pool_of(AT_ONCE));
+        let conn = pool.get().await.unwrap();
+        let d = of_organization(&conn).await;
+        drop(conn);
+
+        let start = Arc::new(tokio::sync::Barrier::new(AT_ONCE as usize));
+        let mut tasks = Vec::new();
+        for _ in 0..AT_ONCE {
+            let (pool, start, id) = (Arc::clone(&pool), Arc::clone(&start), d.uuid.clone());
+            tasks.push(tokio::spawn(async move {
+                let conn = pool.get().await.unwrap();
+                start.wait().await;
+                EventDestination::claim(&id, lease, &conn).await
+            }));
+        }
+        let mut held = Vec::new();
+        for task in tasks {
+            held.extend(task.await.unwrap());
+        }
+        assert_eq!(held.len(), 1, "{held:?}");
+        let first = held[0];
+
+        let conn = pool.get().await.unwrap();
+        assert!(EventDestination::claim(&d.uuid, lease, &conn).await.is_none());
+        // Someone else's lease doesn't let it go.
+        EventDestination::release(&d.uuid, first - TimeDelta::seconds(1), &conn).await;
+        assert!(EventDestination::claim(&d.uuid, lease, &conn).await.is_none());
+        // Its holder does.
+        EventDestination::release(&d.uuid, first, &conn).await;
+        let second = EventDestination::claim(&d.uuid, lease, &conn).await.expect("free once let go");
+        EventDestination::release(&d.uuid, second, &conn).await;
+
+        // A holder that never let go (its server stopped mid-turn), whose
+        // lease ran out a second ago: another takes it, and the old holder
+        // letting go late doesn't free it.
+        let ran_out = chrono::DateTime::from_timestamp(Utc::now().timestamp() - 1, 0).expect("a time").naive_utc();
+        let id = d.uuid.clone();
+        conn.run(move |conn| {
+            diesel::update(event_destinations::table.filter(event_destinations::uuid.eq(id)))
+                .set(event_destinations::lease_until.eq(Some(ran_out)))
+                .execute(conn)
+                .unwrap()
+        })
+        .await;
+        let third = EventDestination::claim(&d.uuid, lease, &conn).await.expect("free once the lease ran out");
+        EventDestination::release(&d.uuid, ran_out, &conn).await;
+        assert!(EventDestination::claim(&d.uuid, lease, &conn).await.is_none());
+        EventDestination::release(&d.uuid, third, &conn).await;
+        assert!(EventDestination::claim(&d.uuid, lease, &conn).await.is_some());
     }
 }
