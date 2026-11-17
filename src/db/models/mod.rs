@@ -26,6 +26,7 @@ mod keykeeper_offboarding;
 mod keykeeper_orgs;
 mod keykeeper_password_change;
 mod keykeeper_plan_clock;
+mod keykeeper_plan_invoices;
 mod keykeeper_plans;
 pub mod keykeeper_roles;
 mod keykeeper_scim;
@@ -97,6 +98,8 @@ pub use self::keykeeper_plans::{
 pub use self::keykeeper_plan_clock::{
     DueReminder, PlanNotice, Reminder, after_leaving_msp, run_clock, start_trial_now,
 };
+// Keykeeper: invoices by the day (`src/keykeeper_billing/invoices.rs`).
+pub use self::keykeeper_plan_invoices::{OrgSeats, PlanInvoice, business_orgs_of_their_own, plans_billed_by_the_day};
 // Keykeeper: what the plan limits ask (`src/api/core/keykeeper_plan_limits.rs`).
 pub use self::keykeeper_plans::{PersonGets, what_a_person_gets};
 pub use self::keykeeper_scim::{

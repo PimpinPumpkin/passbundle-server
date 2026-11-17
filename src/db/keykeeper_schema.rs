@@ -717,3 +717,33 @@ table! {
         created_at -> Timestamp,
     }
 }
+
+table! {
+    org_seats (org_uuid, day) {
+        org_uuid -> Text,
+        day -> Text,
+        seats -> Integer,
+    }
+}
+
+table! {
+    plan_invoices (uuid) {
+        uuid -> Text,
+        org_uuid -> Nullable<Text>,
+        msp_uuid -> Nullable<Text>,
+        month -> Text,
+        plan -> Text,
+        seat_days -> BigInt,
+        free_days -> Integer,
+        days_in_month -> Integer,
+        prorated -> BigInt,
+        price_cents -> BigInt,
+        amount_cents -> BigInt,
+        currency -> Text,
+        provider -> Text,
+        provider_customer -> Text,
+        provider_invoice -> Nullable<Text>,
+        created_at -> Timestamp,
+        sent_at -> Nullable<Timestamp>,
+    }
+}

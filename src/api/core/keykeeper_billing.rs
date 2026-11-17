@@ -11,6 +11,8 @@
 //   may pay for and manage the plan (`PlanNow::can_pay`), and 404 for anyone
 //   else, never 403, which would sign the web vault out. None writes a plan:
 //   only the provider's answer, which the server fetches itself, does.
+// - `GET /api/keykeeper/plan/invoices`: the months a plan billed by the day
+//   was invoiced for, as the server worked them out, for the same people.
 
 use chrono::Utc;
 use rocket::{
@@ -29,7 +31,8 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            BillingCustomer, BillingEvent, PlanName, PlanNow, PlanOwner, Terms, UserId, may_manage_plan, plan_at,
+            BillingCustomer, BillingEvent, PlanInvoice, PlanName, PlanNow, PlanOwner, Terms, UserId, may_manage_plan,
+            plan_at,
         },
     },
     keykeeper_billing::{
@@ -43,7 +46,7 @@ pub fn routes() -> Vec<Route> {
     if billing().is_none() {
         return Vec::new();
     }
-    routes![billing_event, pay, manage, look_now]
+    routes![billing_event, pay, manage, look_now, invoices]
 }
 
 /// The most a webhook's body may be: 1 MiB.
@@ -257,6 +260,19 @@ async fn look_now(data: Json<WhoseData>, headers: Headers, conn: DbConn) -> Json
     }
     let plan = plan_at(&whose, Some(asker), Utc::now().naive_utc(), &conn).await?;
     Ok(Json(plan.to_json(&Terms::from_config())))
+}
+
+/// The months the plan was invoiced for by the day, newest first, each with
+/// what its invoice comes from: `{"invoices": [...]}` (`PlanInvoice::to_json`).
+/// Empty for a plan that isn't billed by the day.
+#[get("/keykeeper/plan/invoices?<organization>&<msp>")]
+async fn invoices(organization: Option<String>, msp: Option<String>, headers: Headers, conn: DbConn) -> JsonResult {
+    let asker = &headers.user.uuid;
+    let whose = whose_plan(asker, organization, msp)?;
+    payable(asker, &whose, &conn).await?;
+    let invoices: Vec<serde_json::Value> =
+        PlanInvoice::of(&whose, &conn).await?.iter().map(PlanInvoice::to_json).collect();
+    Ok(Json(json!({ "invoices": invoices })))
 }
 
 #[cfg(test)]
