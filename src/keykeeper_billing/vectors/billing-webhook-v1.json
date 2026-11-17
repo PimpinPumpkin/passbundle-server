@@ -1,0 +1,267 @@
+{
+  "description": "Stripe's published webhook signature scheme, as the server checks it (DESIGN.md, \"Checking a webhook\"). Each case is taken (valid) or refused, at `now`, with the named secrets in use, for `body` unless the case gives its own. Made with make-billing-webhook-v1.mjs and Node's crypto alone. The secrets are made up for these vectors.",
+  "tolerance": 300,
+  "secrets": {
+    "current": "whsec_vectors_only_current_7c1e5a",
+    "old": "whsec_vectors_only_old_2b9d40",
+    "other": "whsec_vectors_only_someone_else_8e3f11"
+  },
+  "body": "{\"id\":\"evt_vector_1\",\"object\":\"event\",\"livemode\":false,\"customer\":\"cus_vector_1\"}",
+  "cases": [
+    {
+      "name": "one signature with the secret in use",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": true
+    },
+    {
+      "name": "the timestamp five minutes behind the clock",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000300,
+      "secrets": [
+        "current"
+      ],
+      "valid": true
+    },
+    {
+      "name": "the timestamp five minutes ahead of the clock",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1799999700,
+      "secrets": [
+        "current"
+      ],
+      "valid": true
+    },
+    {
+      "name": "the old secret while it's being replaced",
+      "header": "t=1800000000,v1=3b15aac5ca6d934fbee06784f96957823bf5c9f701b71a853972016ebbf5d9f1",
+      "now": 1800000000,
+      "secrets": [
+        "current",
+        "old"
+      ],
+      "valid": true
+    },
+    {
+      "name": "one signature for each secret, with only the new one in use",
+      "header": "t=1800000000,v1=3b15aac5ca6d934fbee06784f96957823bf5c9f701b71a853972016ebbf5d9f1,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": true
+    },
+    {
+      "name": "one signature for each secret, with only the old one in use",
+      "header": "t=1800000000,v1=3b15aac5ca6d934fbee06784f96957823bf5c9f701b71a853972016ebbf5d9f1,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "old"
+      ],
+      "valid": true
+    },
+    {
+      "name": "entries in another order",
+      "header": "v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838,t=1800000000",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": true
+    },
+    {
+      "name": "a test signature and debugging entries beside it, which are ignored",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838,v0=c3ccb5b815fe678c92b48b9ccdaf913bdfa33004786da32f506e46683d921798,secret=whsec_****7c1e5a,destination=we_vector,payload=ab12cd34",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": true
+    },
+    {
+      "name": "a timestamp a second more than five minutes behind",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000301,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a timestamp a second more than five minutes ahead",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1799999699,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a secret not in use",
+      "header": "t=1800000000,v1=c3ccb5b815fe678c92b48b9ccdaf913bdfa33004786da32f506e46683d921798",
+      "now": 1800000000,
+      "secrets": [
+        "current",
+        "old"
+      ],
+      "valid": false
+    },
+    {
+      "name": "the old secret once it's no longer in use",
+      "header": "t=1800000000,v1=3b15aac5ca6d934fbee06784f96957823bf5c9f701b71a853972016ebbf5d9f1",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "the body changed by one byte",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "body": "{\"id\":\"evt_vector_1\",\"object\":\"event\",\"livemode\":false,\"customer\":\"cus_vector_2\"}",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a signature changed in its last digit",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b830",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a signature changed in its first digit",
+      "header": "t=1800000000,v1=0ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a signature cut short by a byte",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b8",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a signature a byte too long",
+      "header": "t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b83800",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a signature that isn't hex",
+      "header": "t=1800000000,v1=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a good signature under another scheme only",
+      "header": "t=1800000000,v0=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838,v2=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a signature for another timestamp",
+      "header": "t=1800000060,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000060,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "the timestamp written another way",
+      "header": "t=01800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "no timestamp",
+      "header": "v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "two timestamps",
+      "header": "t=1800000000,t=1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a timestamp that isn't a number",
+      "header": "t=soon,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "a negative timestamp",
+      "header": "t=-1800000000,v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "no signature",
+      "header": "t=1800000000",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "an empty header",
+      "header": "",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    },
+    {
+      "name": "spaces around the entries",
+      "header": "t=1800000000, v1=5ef265bd56a0c7657ed995f284a7264f2d41d4b41040be8653ff3616fa40b838",
+      "now": 1800000000,
+      "secrets": [
+        "current"
+      ],
+      "valid": false
+    }
+  ]
+}

@@ -396,6 +396,9 @@ pub struct Terms {
     pub org_storage_gb_per_person: i64,
     /// PLAN_ORG_STORAGE_MIN_GB
     pub org_storage_min_gb: i64,
+    /// Whether people can be sent to a payment provider's pages: plans are
+    /// enforced and BILLING_PROVIDER is set (`keykeeper_billing::payments_on`).
+    pub payments: bool,
 }
 
 impl Terms {
@@ -408,6 +411,7 @@ impl Terms {
             families_people: CONFIG.plan_families_people(),
             org_storage_gb_per_person: CONFIG.plan_org_storage_gb_per_person(),
             org_storage_min_gb: CONFIG.plan_org_storage_min_gb(),
+            payments: crate::keykeeper_billing::payments_on(),
         }
     }
 
@@ -482,6 +486,15 @@ impl PlanNow {
     /// Whether the plan gives what it gives at the time asked.
     pub fn in_effect(&self) -> bool {
         self.state.is_some_and(PlanState::in_effect)
+    }
+
+    /// Whether the person asking may be sent to the payment provider's pages
+    /// for this plan, to pay or to manage it: payments are on (`Terms`), they
+    /// manage the plan, and no MSP's pool covers it, since a client's plan is
+    /// paid for through its MSP. The sync's `canPay` and every payment route
+    /// ask here, and nowhere else decides it.
+    pub fn can_pay(&self, terms: &Terms) -> bool {
+        terms.payments && self.may_manage && self.covered_by.is_none()
     }
 
     /// An organization on Families: six people, and no company features.
@@ -788,6 +801,7 @@ impl PlanNow {
             "people": self.gives.and_then(|gives| gives.people),
             "coveredBy": self.covered_by.as_ref().map(|(id, name)| json!({ "id": id, "name": name })),
             "canManage": self.may_manage,
+            "canPay": self.can_pay(terms),
         })
     }
 }
@@ -1342,6 +1356,7 @@ mod tests {
             families_people: 6,
             org_storage_gb_per_person: 1,
             org_storage_min_gb: 5,
+            payments: false,
         }
     }
 
@@ -2168,6 +2183,7 @@ mod tests {
                 "people": null,
                 "coveredBy": null,
                 "canManage": true,
+                "canPay": false,
             })
         );
         assert_eq!(not_enforced_json(), json!({ "enforced": false }));
@@ -2204,6 +2220,7 @@ mod tests {
                 "people": null,
                 "coveredBy": null,
                 "canManage": true,
+                "canPay": false,
             })
         );
 
@@ -2224,6 +2241,7 @@ mod tests {
                 "people": null,
                 "coveredBy": null,
                 "canManage": false,
+                "canPay": false,
             })
         );
         // Ended is ended for everyone.

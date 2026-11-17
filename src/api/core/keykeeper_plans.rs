@@ -8,11 +8,11 @@ use rocket::{Route, http::Status, serde::json::Json};
 
 use crate::{
     CONFIG,
-    api::{JsonResult, Notify, UpdateType},
+    api::{ApiResult, JsonResult, Notify, UpdateType},
     auth::Headers,
     db::{
         DbConn,
-        models::{PlanOwner, Terms, User, may_manage_plan, not_enforced_json, people_a_plan_reaches, plan_at},
+        models::{PlanOwner, Terms, User, UserId, may_manage_plan, not_enforced_json, people_a_plan_reaches, plan_at},
     },
 };
 
@@ -35,12 +35,7 @@ pub fn routes() -> Vec<Route> {
 #[get("/keykeeper/plan?<organization>&<msp>")]
 async fn get_plan(organization: Option<String>, msp: Option<String>, headers: Headers, conn: DbConn) -> JsonResult {
     let asker = &headers.user.uuid;
-    let whose = match (organization, msp) {
-        (None, None) => PlanOwner::User(asker.clone()),
-        (Some(id), None) => PlanOwner::Organization(id.into()),
-        (None, Some(id)) => PlanOwner::Msp(id.into()),
-        (Some(_), Some(_)) => err!("Ask about an organization or an MSP, not both"),
-    };
+    let whose = whose_plan(asker, organization, msp)?;
     if !may_manage_plan(asker, &whose, &conn).await? {
         err_code!("Plan not found", Status::NotFound.code)
     }
@@ -49,6 +44,18 @@ async fn get_plan(organization: Option<String>, msp: Option<String>, headers: He
     }
     let plan = plan_at(&whose, Some(asker), Utc::now().naive_utc(), &conn).await?;
     Ok(Json(plan.to_json(&Terms::from_config())))
+}
+
+/// Whose plan a request asks about: with no query, the caller's own; with
+/// `organization` or `msp`, that organization's or that MSP's pool. Every
+/// route about a plan reads it this way.
+pub fn whose_plan(asker: &UserId, organization: Option<String>, msp: Option<String>) -> ApiResult<PlanOwner> {
+    Ok(match (organization, msp) {
+        (None, None) => PlanOwner::User(asker.clone()),
+        (Some(id), None) => PlanOwner::Organization(id.into()),
+        (None, Some(id)) => PlanOwner::Msp(id.into()),
+        (Some(_), Some(_)) => err!("Ask about an organization or an MSP, not both"),
+    })
 }
 
 /// When a plan changes, the people it reaches are sent the sync notice
