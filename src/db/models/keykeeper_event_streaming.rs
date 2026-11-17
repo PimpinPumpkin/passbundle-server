@@ -12,7 +12,7 @@
 
 use std::sync::LazyLock;
 
-use chrono::{NaiveDateTime, TimeDelta, Utc};
+use chrono::{NaiveDateTime, SubsecRound, TimeDelta, Utc};
 use diesel::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -865,7 +865,8 @@ impl EventDelivery {
     /// has it paused. An event that merges joins one of its kind, person, and
     /// minute that's still waiting. A full queue loses its least important,
     /// oldest events (in an MSP's feed, from the client with the most
-    /// waiting), never kept ones, counted on the destination. Each step is
+    /// waiting, or those tied for the most), never kept ones, counted on the
+    /// destination, the same events on SQLite and PostgreSQL. Each step is
     /// its own statement, not one transaction, so SQLite's busy wait covers
     /// each.
     pub async fn enqueue(destination: &EventDestination, event: Queued<'_>, conn: &DbConn) -> EmptyResult {
@@ -876,7 +877,10 @@ impl EventDelivery {
     /// (twice that with kept events only): MAX_QUEUED, or a few in the tests
     /// of what a full queue drops, since filling one of 10,000 is too slow.
     async fn enqueue_within(destination: &EventDestination, event: Queued<'_>, max: i64, conn: &DbConn) -> EmptyResult {
-        let now = Utc::now().naive_utc();
+        // In whole microseconds, as PostgreSQL keeps a time (SQLite would keep
+        // a Linux clock's nanoseconds), so events order the same, oldest
+        // first, on either database.
+        let now = Utc::now().naive_utc().trunc_subsecs(6);
         let next_attempt_at = if destination.enabled {
             now
         } else {
@@ -984,18 +988,38 @@ impl EventDelivery {
                         .filter(event_deliveries::priority.lt(KEPT))
                         .into_boxed();
                     if is_feed {
-                        let busiest: Option<Option<String>> = event_deliveries::table
+                        // The client with the most that could go (the MSP's
+                        // own entries count as one more). Clients tied for
+                        // the most lose together: the order below picks from
+                        // all of their events, never one client by whatever
+                        // order the database groups them in.
+                        let counts: Vec<(Option<String>, i64)> = event_deliveries::table
                             .filter(mine.clone())
                             .filter(event_deliveries::priority.lt(KEPT))
                             .group_by(event_deliveries::source)
-                            .select(event_deliveries::source)
-                            .order(diesel::dsl::count_star().desc())
-                            .first(conn)
-                            .optional()?;
-                        if let Some(Some(source)) = busiest {
-                            least = least.filter(event_deliveries::source.eq(source));
+                            .select((event_deliveries::source, diesel::dsl::count_star()))
+                            .load(conn)?;
+                        let most = counts.iter().map(|(_, n)| *n).max().unwrap_or(0);
+                        let mut msps_own = false;
+                        let mut clients = Vec::new();
+                        for (source, n) in counts {
+                            if n == most {
+                                match source {
+                                    Some(client) => clients.push(client),
+                                    None => msps_own = true,
+                                }
+                            }
                         }
+                        least = if msps_own {
+                            least
+                                .filter(event_deliveries::source.eq_any(clients).or(event_deliveries::source.is_null()))
+                        } else {
+                            least.filter(event_deliveries::source.eq_any(clients))
+                        };
                     }
+                    // Least important, then oldest, then by id (UUIDs,
+                    // which sort the same under any collation), so the same
+                    // events go on every database.
                     let ids: Vec<String> = least
                         .order((
                             event_deliveries::priority.asc(),
@@ -1954,12 +1978,17 @@ mod queue_tests {
     /// Queues event `id` with a priority, from a client, in a queue of CAP.
     /// The ids sort in the order they're queued.
     async fn queue(d: &EventDestination, id: &str, priority: i32, client: &str, conn: &DbConn) {
+        queue_from(d, id, priority, Some(client), conn).await;
+    }
+
+    /// The same, from a client or (None) the MSP's own activity log.
+    async fn queue_from(d: &EventDestination, id: &str, priority: i32, source: Option<&str>, conn: &DbConn) {
         let event = Queued {
             event_uuid: id,
             payload: json!({ "id": id }).to_string(),
             priority,
             merge_key: None,
-            source: Some(client.to_owned()),
+            source: source.map(str::to_owned),
         };
         EventDelivery::enqueue_within(d, event, CAP, conn).await.unwrap();
     }
@@ -2073,6 +2102,90 @@ mod queue_tests {
         queue(&d, "e08", HIGH, "client-b", &conn).await;
         assert_eq!(waiting(&d, &conn).await, ["e02", "e05", "e07", "e08"]);
         assert_eq!(dropped(&d, &conn).await, 4);
+    }
+
+    /// Clients tied for the most waiting lose together: of all their events,
+    /// the least important goes, then the oldest, then by id. Never one
+    /// client by the order the database happens to group them in, which
+    /// differs between SQLite and PostgreSQL, so the same events go on both.
+    /// The client that loses is B at one step (not the first by name) and A
+    /// at another (not the last), so no fixed order of clients passes.
+    #[rocket::async_test]
+    async fn in_an_msps_feed_clients_tied_for_the_most_lose_their_least_important_oldest_first() {
+        let conn = DbPool::for_test().await;
+        let d = of_msp(&conn).await;
+
+        queue(&d, "e01", HIGH, "client-a", &conn).await;
+        queue(&d, "e02", LOW, "client-b", &conn).await;
+        queue(&d, "e03", MEDIUM, "client-a", &conn).await;
+        queue(&d, "e04", MEDIUM, "client-b", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e02", "e03", "e04"]);
+
+        // A and B have two each, C one: B's low is the least important of
+        // theirs, so it goes.
+        queue(&d, "e05", HIGH, "client-c", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e03", "e04", "e05"]);
+        // A and B tied again: B's new low goes itself.
+        queue(&d, "e06", LOW, "client-b", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e03", "e04", "e05"]);
+        // A and C tied: of their mediums, A's is older, so it goes.
+        queue(&d, "e07", MEDIUM, "client-c", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e04", "e05", "e07"]);
+        // A and C tied: C's medium goes before anyone's high.
+        queue(&d, "e08", HIGH, "client-a", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e04", "e05", "e08"]);
+        assert_eq!(dropped(&d, &conn).await, 4);
+    }
+
+    /// In an MSP's feed, the MSP's own activity log counts as one more
+    /// client: when it has the most waiting, its own least important go,
+    /// not another client's, even an older or less important one.
+    #[rocket::async_test]
+    async fn in_an_msps_feed_its_own_entries_count_as_one_more_client() {
+        let conn = DbPool::for_test().await;
+        let d = of_msp(&conn).await;
+
+        queue(&d, "e01", LOW, "client-a", &conn).await;
+        queue_from(&d, "e02", MEDIUM, None, &conn).await;
+        queue_from(&d, "e03", MEDIUM, None, &conn).await;
+        queue(&d, "e04", HIGH, "client-a", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e02", "e03", "e04"]);
+
+        // The MSP's own have three, A two: the MSP's oldest medium goes, not
+        // A's older low.
+        queue_from(&d, "e05", HIGH, None, &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e01", "e03", "e04", "e05"]);
+        // Tied, two each: A's low goes before the MSP's medium.
+        queue(&d, "e06", HIGH, "client-b", &conn).await;
+        assert_eq!(waiting(&d, &conn).await, ["e03", "e04", "e05", "e06"]);
+        assert_eq!(dropped(&d, &conn).await, 2);
+    }
+
+    /// Queued times are whole microseconds, as PostgreSQL keeps them, so
+    /// "oldest first" orders events the same on SQLite (which would keep a
+    /// Linux clock's nanoseconds) and PostgreSQL.
+    #[rocket::async_test]
+    async fn queued_times_are_whole_microseconds() {
+        let conn = DbPool::for_test().await;
+        let d = of_organization(&conn).await;
+        let org = d.org_uuid.clone().unwrap().to_string();
+        for id in ["e01", "e02", "e03"] {
+            queue(&d, id, LOW, &org, &conn).await;
+        }
+        let uuid = d.uuid.clone();
+        let times: Vec<NaiveDateTime> = conn
+            .run(move |conn| {
+                event_deliveries::table
+                    .filter(event_deliveries::destination_uuid.eq(uuid))
+                    .select(event_deliveries::created_at)
+                    .load(conn)
+                    .unwrap()
+            })
+            .await;
+        assert_eq!(times.len(), 3);
+        for t in times {
+            assert_eq!(t.and_utc().timestamp_subsec_nanos() % 1_000, 0, "{t}");
+        }
     }
 
     /// Two servers on one database each run a worker. When several reach for
