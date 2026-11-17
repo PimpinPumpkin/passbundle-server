@@ -15,13 +15,20 @@
 // for reference. This month counts through today, as it is now. MSP admins
 // only; everyone else gets "not found", never 403, which would sign the web
 // vault out. See DESIGN.md, "Seats by client".
+//
+// The same arithmetic, on the same readings, is what a month's invoice is
+// worked out from (`month_to_invoice`, for the month job in
+// `src/keykeeper_billing/invoices.rs`), so an MSP's invoice and the report it
+// bills its own clients from can't disagree. Where plans are enforced and a
+// payment provider is set, the daily job also reads each organization with a
+// Business plan of its own (`org_seats`), by the same rule for what a seat is.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt::Write as _,
 };
 
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
 use rocket::{
     Request, Route,
     http::{ContentType, Header, Status},
@@ -36,7 +43,8 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            ClientSeats, MembershipId, MspId, MspMembership, MspRole, OrganizationId,
+            ClientSeats, MembershipId, MspId, MspMembership, MspRole, OrgSeats, OrganizationId,
+            business_orgs_of_their_own,
             keykeeper_msp_seats::{all_msps, clients_now, joined_members, staff_users},
         },
     },
@@ -77,20 +85,20 @@ async fn read_now(msp_id: &MspId, conn: &DbConn) -> ApiResult<Vec<Reading>> {
 }
 
 /// A day as the table keeps it.
-fn day_text(day: NaiveDate) -> String {
+pub(crate) fn day_text(day: NaiveDate) -> String {
     day.format("%Y-%m-%d").to_string()
 }
 
 /// A month as the API names it.
-fn month_text(first: NaiveDate) -> String {
+pub(crate) fn month_text(first: NaiveDate) -> String {
     first.format("%Y-%m").to_string()
 }
 
-fn first_of_month(day: NaiveDate) -> NaiveDate {
+pub(crate) fn first_of_month(day: NaiveDate) -> NaiveDate {
     day.with_day(1).unwrap_or(day)
 }
 
-fn next_month(first: NaiveDate) -> NaiveDate {
+pub(crate) fn next_month(first: NaiveDate) -> NaiveDate {
     let (year, month) = if first.month() == 12 {
         (first.year() + 1, 1)
     } else {
@@ -105,12 +113,12 @@ fn last_of_month(first: NaiveDate) -> NaiveDate {
 }
 
 /// 28 to 31: what a month's seat-days are divided by.
-fn days_in_month(first: NaiveDate) -> i64 {
+pub(crate) fn days_in_month(first: NaiveDate) -> i64 {
     (last_of_month(first) - first).num_days() + 1
 }
 
 /// `YYYY-MM`, and nothing else.
-fn parse_month(text: &str) -> Option<NaiveDate> {
+pub(crate) fn parse_month(text: &str) -> Option<NaiveDate> {
     let bytes = text.as_bytes();
     if bytes.len() != 7 || bytes[4] != b'-' || !bytes.iter().enumerate().all(|(i, b)| i == 4 || b.is_ascii_digit()) {
         return None;
@@ -134,7 +142,30 @@ async fn record_msp(msp_id: &MspId, day: &str, conn: &DbConn) -> EmptyResult {
     ClientSeats::record(rows, conn).await
 }
 
-/// The daily job: records each MSP client's seats for today (UTC).
+/// Records the seats of each organization with a Business plan of its own,
+/// for today: its members who joined and aren't revoked, the rule for what a
+/// seat is. While it's an MSP's client its seats are the MSP's, so its own
+/// reading is 0.
+async fn record_own_orgs(day: &str, conn: &DbConn) -> EmptyResult {
+    let mut rows = Vec::new();
+    for (org, client) in business_orgs_of_their_own(conn).await? {
+        let seats = if client {
+            0
+        } else {
+            joined_members(&org, conn).await?.len()
+        };
+        rows.push(OrgSeats {
+            org_uuid: org,
+            day: day.to_owned(),
+            seats: i32::try_from(seats).unwrap_or(i32::MAX),
+        });
+    }
+    OrgSeats::record(rows, conn).await
+}
+
+/// The daily job: records each MSP client's seats for today (UTC), and,
+/// where plans are enforced and a payment provider is set, each organization
+/// billed on its own.
 pub async fn record_client_seats_job(pool: DbPool) {
     debug!("Recording MSP clients' seats");
     let Ok(conn) = pool.get().await else {
@@ -154,6 +185,11 @@ pub async fn record_client_seats_job(pool: DbPool) {
             error!("Couldn't record the seats of MSP {msp_id}'s clients: {e:?}");
         }
     }
+    if crate::keykeeper_billing::billing().is_some()
+        && let Err(e) = record_own_orgs(&day, &conn).await
+    {
+        error!("Couldn't record the seats of the organizations billed on their own: {e:?}");
+    }
 }
 
 /// One client's line for a month.
@@ -169,6 +205,9 @@ struct Line {
     most: i64,
     /// This month only, and only for a client now.
     today: Option<i64>,
+    /// Its seats as each day of the month counts them, from the first
+    /// through the last day counted: what `seat_days` adds up.
+    by_day: Vec<i64>,
 }
 
 /// A month's seats, by client.
@@ -203,7 +242,7 @@ impl Summary {
 }
 
 /// `sum / days` in hundredths, rounded half up: to two decimals.
-fn hundredths(sum: i64, days: i64) -> i64 {
+pub(crate) fn hundredths(sum: i64, days: i64) -> i64 {
     if days <= 0 {
         0
     } else {
@@ -216,12 +255,45 @@ fn hundredths_text(hundredths: i64) -> String {
     format!("{}.{:02}", hundredths / 100, hundredths % 100)
 }
 
-fn hundredths_value(hundredths: i64) -> Value {
+pub(crate) fn hundredths_value(hundredths: i64) -> Value {
     // The nearest double to two decimals, which JSON writes as those two
     // decimals, for any count of seats a client has.
     #[expect(clippy::cast_precision_loss, reason = "hundredths of seat-days stay far below 2^53")]
     let value = hundredths as f64 / 100.0;
     json!(value)
+}
+
+/// One client's seats on one day, as the report counts them: a reading of
+/// the server's (`msp_client_seats`, or an organization's own, `org_seats`),
+/// with the client's name that day.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DayReading {
+    pub org: OrganizationId,
+    pub day: String,
+    pub seats: i64,
+    pub name: String,
+}
+
+impl From<&ClientSeats> for DayReading {
+    fn from(row: &ClientSeats) -> Self {
+        Self {
+            org: row.org_uuid.clone(),
+            day: row.day.clone(),
+            seats: i64::from(row.seats),
+            name: row.org_name.clone(),
+        }
+    }
+}
+
+impl From<&OrgSeats> for DayReading {
+    fn from(row: &OrgSeats) -> Self {
+        Self {
+            org: row.org_uuid.clone(),
+            day: row.day.clone(),
+            seats: i64::from(row.seats),
+            name: String::new(),
+        }
+    }
 }
 
 /// Where a day's seats come from.
@@ -240,7 +312,7 @@ enum Source {
 /// month: a client now then counts today as it is now, in place of a reading
 /// already taken today, while one that left since keeps that reading, and
 /// the month counts through today.
-fn summarize(first: NaiveDate, rows: &[ClientSeats], now: &[Reading], today: Option<NaiveDate>) -> Summary {
+fn summarize(first: NaiveDate, rows: &[DayReading], now: &[Reading], today: Option<NaiveDate>) -> Summary {
     struct Client {
         id: OrganizationId,
         name: String,
@@ -260,17 +332,17 @@ fn summarize(first: NaiveDate, rows: &[ClientSeats], now: &[Reading], today: Opt
     let mut read: BTreeSet<String> = BTreeSet::new();
     for row in rows.iter().filter(|r| r.day >= first_text && r.day <= through_text) {
         read.insert(row.day.clone());
-        let client = clients.entry(row.org_uuid.to_string()).or_insert_with(|| Client {
-            id: row.org_uuid.clone(),
-            name: row.org_name.clone(),
+        let client = clients.entry(row.org.to_string()).or_insert_with(|| Client {
+            id: row.org.clone(),
+            name: row.name.clone(),
             name_day: row.day.clone(),
             days: BTreeMap::new(),
         });
         if row.day >= client.name_day {
-            client.name.clone_from(&row.org_name);
+            client.name.clone_from(&row.name);
             client.name_day.clone_from(&row.day);
         }
-        client.days.insert(row.day.clone(), i64::from(row.seats));
+        client.days.insert(row.day.clone(), row.seats);
     }
     if let Some(today) = &today_text {
         read.insert(today.clone());
@@ -305,17 +377,18 @@ fn summarize(first: NaiveDate, rows: &[ClientSeats], now: &[Reading], today: Opt
         .into_values()
         .map(|client| {
             let on = |day: &String| client.days.get(day).copied().unwrap_or(0);
-            let seat_days = sources
+            let by_day: Vec<i64> = sources
                 .iter()
                 .map(|source| match source {
                     Source::Reading(day) => on(day),
                     Source::Between(before, after) => on(before).min(on(after)),
                     Source::Nothing => 0,
                 })
-                .sum();
+                .collect();
             let is_current = current.contains(&client.id);
             Line {
-                seat_days,
+                seat_days: by_day.iter().sum(),
+                by_day,
                 most: client.days.values().copied().max().unwrap_or(0),
                 today: today_text.as_ref().filter(|_| is_current).and_then(|t| client.days.get(t).copied()),
                 current: is_current,
@@ -330,6 +403,61 @@ fn summarize(first: NaiveDate, rows: &[ClientSeats], now: &[Reading], today: Opt
         through,
         lines,
     }
+}
+
+/// What a month's invoice is worked out from, for a plan billed by the day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InvoiceFigures {
+    /// 28 to 31: what the seat-days are divided by, whatever was free.
+    pub days_in_month: i64,
+    /// The seat-days of the days that are billed.
+    pub seat_days: i64,
+    /// The days that aren't: those that start before `free_until`.
+    pub free_days: i64,
+    /// Prorated seats in hundredths: `seat_days` over `days_in_month`,
+    /// rounded half up.
+    pub prorated: i64,
+}
+
+/// The first day of `first`'s month that's billed: the first that starts at
+/// or after `free_until`. Days that start before it are free, so a free
+/// period that ends partway through a day leaves that day free.
+fn first_billed_day(first: NaiveDate, free_until: Option<NaiveDateTime>) -> NaiveDate {
+    let Some(free_until) = free_until else {
+        return first;
+    };
+    let day = free_until.date();
+    let from = if free_until == day.and_hms_opt(0, 0, 0).unwrap_or(free_until) {
+        day
+    } else {
+        day.succ_opt().unwrap_or(day)
+    };
+    from.max(first)
+}
+
+/// A month that has ended, for an invoice: the same lines as the report for
+/// the same readings (`summarize`), added up over the days that are billed,
+/// and prorated over all of the month's days with the report's rounding. Days
+/// that start before `free_until` aren't billed, so a month that's partly
+/// free bills only its other days' seat-days, still divided by all of its
+/// days. None for a month that isn't `YYYY-MM`.
+pub(crate) fn month_to_invoice(
+    month: &str,
+    readings: &[DayReading],
+    free_until: Option<NaiveDateTime>,
+) -> Option<InvoiceFigures> {
+    let first = parse_month(month)?;
+    let summary = summarize(first, readings, &[], None);
+    let billed_from = first_billed_day(first, free_until);
+    let free_days = (billed_from - first).num_days().clamp(0, summary.days_in_month);
+    let skip = usize::try_from(free_days).unwrap_or(usize::MAX);
+    let seat_days = summary.lines.iter().map(|line| line.by_day.iter().skip(skip).sum::<i64>()).sum();
+    Some(InvoiceFigures {
+        days_in_month: summary.days_in_month,
+        seat_days,
+        free_days,
+        prorated: hundredths(seat_days, summary.days_in_month),
+    })
 }
 
 /// A CSV field: quoted when it must be, and never read as a formula by a
@@ -435,7 +563,12 @@ async fn seats(
     }
     let is_this_month = first == this_month;
 
-    let rows = ClientSeats::find_between(&msp_id, &day_text(first), &day_text(next_month(first)), &conn).await?;
+    let rows: Vec<DayReading> =
+        ClientSeats::find_between(&msp_id, &day_text(first), &day_text(next_month(first)), &conn)
+            .await?
+            .iter()
+            .map(DayReading::from)
+            .collect();
     let now = read_now(&msp_id, &conn).await?;
     let summary = summarize(first, &rows, &now, is_this_month.then_some(today));
     let month_name = month_text(first);
@@ -492,18 +625,18 @@ async fn seats(
 mod tests {
     use super::*;
 
-    fn row(org: &str, day: &str, seats: i32, name: &str) -> ClientSeats {
-        ClientSeats {
+    fn row(org: &str, day: &str, seats: i32, name: &str) -> DayReading {
+        DayReading::from(&ClientSeats {
             msp_uuid: MspId::from("msp".to_owned()),
             org_uuid: OrganizationId::from(org.to_owned()),
             day: day.to_owned(),
             seats,
             org_name: name.to_owned(),
-        }
+        })
     }
 
     /// A client's readings on days `from` to `to` of `month` (`YYYY-MM`).
-    fn readings(org: &str, month: &str, from: u32, to: u32, seats: i32, name: &str) -> Vec<ClientSeats> {
+    fn readings(org: &str, month: &str, from: u32, to: u32, seats: i32, name: &str) -> Vec<DayReading> {
         (from..=to).map(|d| row(org, &format!("{month}-{d:02}"), seats, name)).collect()
     }
 
@@ -647,6 +780,7 @@ mod tests {
                     seat_days: 12,
                     most: 5,
                     today: None,
+                    by_day: [vec![3, 5, 4], vec![0; 28]].concat(),
                 },
                 Line {
                     id: OrganizationId::from("b".to_owned()),
@@ -655,6 +789,7 @@ mod tests {
                     seat_days: 2,
                     most: 2,
                     today: None,
+                    by_day: [vec![2], vec![0; 30]].concat(),
                 },
             ]
         );
@@ -750,6 +885,85 @@ mod tests {
             first_of_month(NaiveDate::from_ymd_opt(2026, 11, 30).unwrap()),
             NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()
         );
+    }
+
+    /// A month's invoice is the report's own figures for the same readings:
+    /// months of 28, 29, 30, and 31 days, each with a seat added and one
+    /// removed mid-month, a client added mid-month, and days with no reading.
+    #[test]
+    fn a_months_invoice_is_the_reports_figures_for_the_same_readings() {
+        for text in ["2026-02", "2028-02", "2026-11", "2026-12"] {
+            let first = month(text);
+            let days = u32::try_from(days_in_month(first)).unwrap();
+            let mut rows = readings("a", text, 1, 9, 10, "Acme");
+            // No reading on the 10th or the 11th, and a seat more from the 12th.
+            rows.extend(readings("a", text, 12, days, 11, "Acme"));
+            // Bolt from the 15th, and a seat less for its last three days.
+            rows.extend(readings("b", text, 15, days - 3, 4, "Bolt"));
+            rows.extend(readings("b", text, days - 2, days, 3, "Bolt"));
+            let report = summarize(first, &rows, &[], None);
+            let invoice = month_to_invoice(text, &rows, None).unwrap();
+            assert_eq!(
+                invoice,
+                InvoiceFigures {
+                    days_in_month: report.days_in_month,
+                    seat_days: report.seat_days(),
+                    free_days: 0,
+                    prorated: report.prorated(report.seat_days()),
+                },
+                "{text}"
+            );
+            assert_eq!(invoice.days_in_month, i64::from(days), "{text}");
+            // The route reads the same month beside the clients now: the same figures.
+            let route = summarize(first, &rows, &[now("a", "Acme Dental", 99), now("c", "Cara", 7)], None);
+            assert_eq!((route.seat_days(), route.prorated(route.seat_days())), (invoice.seat_days, invoice.prorated));
+        }
+        // November 2026 by hand: 9 × 10, the 10th and 11th at the lower 10,
+        // 19 × 11, and Bolt's 13 × 4 and 3 × 3: 90 + 20 + 209 + 52 + 9.
+        let mut rows = readings("a", "2026-11", 1, 9, 10, "Acme");
+        rows.extend(readings("a", "2026-11", 12, 30, 11, "Acme"));
+        rows.extend(readings("b", "2026-11", 15, 27, 4, "Bolt"));
+        rows.extend(readings("b", "2026-11", 28, 30, 3, "Bolt"));
+        let invoice = month_to_invoice("2026-11", &rows, None).unwrap();
+        assert_eq!((invoice.seat_days, invoice.prorated), (380, 1267));
+        // Not a month.
+        assert_eq!(month_to_invoice("2026-13", &rows, None), None);
+    }
+
+    #[test]
+    fn days_before_free_until_arent_billed_and_the_rest_are_over_all_the_months_days() {
+        let at = |day: &str, time: &str| {
+            NaiveDateTime::parse_from_str(&format!("{day} {time}"), "%Y-%m-%d %H:%M:%S").unwrap()
+        };
+        // November 2026: ten seats every day, one more from the 20th.
+        let mut rows = readings("a", "2026-11", 1, 19, 10, "Acme");
+        rows.extend(readings("a", "2026-11", 20, 30, 11, "Acme"));
+        let whole = month_to_invoice("2026-11", &rows, None).unwrap();
+        assert_eq!((whole.seat_days, whole.free_days, whole.prorated), (311, 0, 1037));
+        // Free until the 15th at midnight: the 1st to the 14th aren't billed.
+        let from_15th = month_to_invoice("2026-11", &rows, Some(at("2026-11-15", "00:00:00"))).unwrap();
+        assert_eq!(
+            from_15th,
+            InvoiceFigures {
+                days_in_month: 30,
+                seat_days: 5 * 10 + 11 * 11,
+                free_days: 14,
+                // 171 over all 30 days: 5.70.
+                prorated: 570,
+            }
+        );
+        // A free period that ends partway through the 15th leaves the 15th free.
+        let after_15th = month_to_invoice("2026-11", &rows, Some(at("2026-11-15", "09:30:00"))).unwrap();
+        assert_eq!((after_15th.seat_days, after_15th.free_days), (4 * 10 + 11 * 11, 15));
+        // Free until before the month, or after it.
+        assert_eq!(month_to_invoice("2026-11", &rows, Some(at("2026-10-20", "12:00:00"))).unwrap(), whole);
+        let all_free = month_to_invoice("2026-11", &rows, Some(at("2026-12-01", "00:00:00"))).unwrap();
+        assert_eq!((all_free.seat_days, all_free.free_days, all_free.prorated), (0, 30, 0));
+        let later = month_to_invoice("2026-11", &rows, Some(at("2027-05-01", "00:00:00"))).unwrap();
+        assert_eq!((later.seat_days, later.free_days), (0, 30));
+        // Its first day free.
+        let first_day = month_to_invoice("2026-11", &rows, Some(at("2026-11-01", "00:00:01"))).unwrap();
+        assert_eq!((first_day.seat_days, first_day.free_days), (301, 1));
     }
 
     #[test]

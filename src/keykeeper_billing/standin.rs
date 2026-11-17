@@ -208,7 +208,15 @@ impl Provider for Standin {
             .iter()
             .map(|line| json!({ "description": line.description, "amountCents": line.amount_cents }))
             .collect();
-        let body = json!({ "customer": customer, "month": month, "lines": lines, "key": key });
+        let (start, end) = super::invoices::month_period(month).ok_or(Unreachable)?;
+        let body = json!({
+            "customer": customer,
+            "month": month,
+            "period": { "start": start, "end": end },
+            "currency": super::invoices::CURRENCY,
+            "lines": lines,
+            "key": key,
+        });
         let answer = self.call(Method::POST, &["invoices"], Some(body)).await?.ok_or(Unreachable)?;
         Self::id(&answer, "id")
     }
@@ -226,7 +234,8 @@ impl Provider for Standin {
         })
     }
 
-    async fn standing(&self, customer: &str) -> Result<Option<ProviderAnswer>, Unreachable> {
+    /// Whatever the stand-in says, which a test sets, for anyone's plan.
+    async fn standing(&self, customer: &str, _whose: &PlanOwner) -> Result<Option<ProviderAnswer>, Unreachable> {
         let Some(answer) = self.call(Method::GET, &["customers", customer], None).await? else {
             return Ok(None);
         };
