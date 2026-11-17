@@ -33,7 +33,7 @@ use crate::{
         },
     },
     keykeeper_billing::{
-        Billing, Looked, Provider, back_to_plan, billing, look, look_at_customer, manage_page, may_look_now, pay_page,
+        Billing, Looked, Provider, back_to_plan, billing, look, look_for_webhook, manage_page, may_look_now, pay_page,
     },
 };
 
@@ -160,11 +160,12 @@ async fn billing_event(
     }
     if let Some(customer) = owed {
         let pool = pool.inner().clone();
+        let event_id = event.id;
         tokio::spawn(async move {
             match pool.get().await {
                 Ok(conn) => {
                     // A look that fails is owed still, and the billing job tries it again.
-                    look_at_customer(billing, &customer, &conn).await;
+                    look_for_webhook(billing, &customer, &event_id, &conn).await;
                 }
                 Err(e) => warn!("The look a webhook asked for waits for the billing job: {e:#?}"),
             }
