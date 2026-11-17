@@ -325,7 +325,7 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
             let member_id: MembershipId = FAKE_ADMIN_UUID.to_owned().into();
             // Keykeeper: a server invitation, not an organization's: the server's lifetime.
             let hours = i64::from(CONFIG.invitation_expiration_hours());
-            mail::send_invite(user, org_id, member_id, &CONFIG.invitation_org_name(), None, hours).await
+            mail::send_invite(user, org_id, member_id, &CONFIG.invitation_org_name(), None, hours, false).await
         } else {
             let invitation = Invitation::new(&user.email);
             invitation.save(conn).await
@@ -713,7 +713,7 @@ async fn resend_user_invite(user_id: UserId, _token: AdminToken, conn: DbConn) -
             let member_id: MembershipId = FAKE_ADMIN_UUID.to_owned().into();
             // Keykeeper: a server invitation, not an organization's: the server's lifetime.
             let hours = i64::from(CONFIG.invitation_expiration_hours());
-            mail::send_invite(&user, org_id, member_id, &CONFIG.invitation_org_name(), None, hours).await
+            mail::send_invite(&user, org_id, member_id, &CONFIG.invitation_org_name(), None, hours, false).await
         } else {
             Ok(())
         }

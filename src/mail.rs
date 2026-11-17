@@ -280,7 +280,10 @@ pub async fn send_single_org_removed_from_org(address: &str, org_name: &str) -> 
 }
 
 // Keykeeper: expire_hours is the organization's invitation lifetime, which the
-// email states. See DESIGN.md, "Joining".
+// email states. See DESIGN.md, "Joining". With member_health (the
+// organization has "Members' own passwords" on), it also says its admins will
+// see how many of the person's own passwords are weak, reused, or exposed.
+// See DESIGN.md, "Members' own passwords".
 pub async fn send_invite(
     user: &User,
     org_id: OrganizationId,
@@ -288,6 +291,7 @@ pub async fn send_invite(
     org_name: &str,
     invited_by_email: Option<String>,
     expire_hours: i64,
+    member_health: bool,
 ) -> EmptyResult {
     let claims = generate_invite_claims(
         user.uuid.clone(),
@@ -329,18 +333,30 @@ pub async fn send_invite(
         err!("Failed to build invite URL query parameters")
     };
 
-    let (subject, body_html, body_text) = get_text(
+    // `url.Url` would place the anchor `#` after the query parameters
+    let url = format!("{}/#/accept-organization/?{query_string}", CONFIG.domain());
+    let (subject, body_html, body_text) = invite_text(&url, org_name, expire_hours, member_health)?;
+
+    send_email(&user.email, &subject, body_html, body_text).await
+}
+
+/// Keykeeper: an invitation's subject and its HTML and plain text.
+fn invite_text(
+    url: &str,
+    org_name: &str,
+    expire_hours: i64,
+    member_health: bool,
+) -> Result<(String, String, String), Error> {
+    get_text(
         "email/send_org_invite",
         json!({
-            // `url.Url` would place the anchor `#` after the query parameters
-            "url": format!("{}/#/accept-organization/?{query_string}", CONFIG.domain()),
+            "url": url,
             "img_src": CONFIG._smtp_img_src(),
             "org_name": org_name,
             "expires_in": lifetime_words(expire_hours),
+            "member_health": member_health,
         }),
-    )?;
-
-    send_email(&user.email, &subject, body_html, body_text).await
+    )
 }
 
 /// Keykeeper: an invitation's lifetime in words: "2 hours", "1 day", "5 days".
@@ -962,4 +978,33 @@ async fn send_email(address: &str, subject: &str, body_html: String, body_text: 
         .multipart(body)?;
 
     send_with_selected_transport(email).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEEN: &str = "Admins at Harbor Dental will see how many of your own passwords are weak, reused, or exposed. Never which ones.";
+
+    #[test]
+    fn an_invitation_says_when_admins_will_see_how_many_of_the_persons_passwords_are_weak() {
+        let url = "https://vault.example.test/#/accept-organization/?token=t";
+        let (subject, html, text) = invite_text(url, "Harbor Dental", 120, true).unwrap();
+        assert_eq!(subject, "Join Harbor Dental");
+        assert!(text.contains(SEEN), "{text}");
+        assert!(html.contains(SEEN), "{html}");
+        // Once each, and nothing about which passwords.
+        assert_eq!(text.matches("Never which ones").count(), 1, "{text}");
+        assert_eq!(html.matches("Never which ones").count(), 1, "{html}");
+        assert!(text.contains("This invitation works for 5 days."), "{text}");
+
+        // With the setting off, the invitation says nothing of it.
+        let (_, html, text) = invite_text(url, "Harbor Dental", 120, false).unwrap();
+        for body in [&html, &text] {
+            assert!(!body.contains("Admins at"), "{body}");
+            assert!(!body.contains("weak, reused, or exposed"), "{body}");
+        }
+        assert!(text.contains("You have been invited to join the *Harbor Dental* organization."), "{text}");
+        assert!(text.contains(&format!("Click here to join: {url}")), "{text}");
+    }
 }
