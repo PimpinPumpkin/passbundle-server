@@ -375,6 +375,37 @@ pub enum Looked {
 /// owed for is then answered.
 pub async fn look(billing: &Billing, whose: &PlanOwner, customer: &str, conn: &DbConn) -> Looked {
     let _one = ONE_AT_A_TIME.lock().await;
+    look_held(billing, whose, customer, conn).await
+}
+
+/// The billing job's look, decided on at `since`: none if the provider has
+/// answered about the plan since then, which a webhook's look or an earlier
+/// run of the job still going may have done while this one waited its turn.
+/// The schedule starts a run on each tick without waiting for the last.
+async fn look_unless_answered_since(
+    billing: &Billing,
+    whose: &PlanOwner,
+    customer: &str,
+    since: NaiveDateTime,
+    conn: &DbConn,
+) -> Looked {
+    let _one = ONE_AT_A_TIME.lock().await;
+    if let Ok(Some(row)) = Plan::find(whose, conn).await
+        && answered_since(row.checked_at, since)
+    {
+        return Looked::Answered;
+    }
+    look_held(billing, whose, customer, conn).await
+}
+
+/// Whether the provider's last answer, at `checked_at`, came at or after
+/// `since`.
+fn answered_since(checked_at: Option<NaiveDateTime>, since: NaiveDateTime) -> bool {
+    checked_at.is_some_and(|checked_at| checked_at >= since)
+}
+
+/// `look`, with `ONE_AT_A_TIME` held.
+async fn look_held(billing: &Billing, whose: &PlanOwner, customer: &str, conn: &DbConn) -> Looked {
     let Ok(answer) = billing.provider().standing(customer).await else {
         warn!(
             "The payment provider couldn't be asked about the plan of {whose}. Its last answer stands, and it'll be asked again."
@@ -499,7 +530,9 @@ pub async fn look_again_job(pool: DbPool) {
 
     let mut unanswered_for_a_day = 0_usize;
     for (customer, (whose, since)) in asking {
-        if look(billing, &whose, &customer, &conn).await == Looked::Failed && since <= now - TELL_THE_OPERATOR_AFTER {
+        if look_unless_answered_since(billing, &whose, &customer, now, &conn).await == Looked::Failed
+            && since <= now - TELL_THE_OPERATOR_AFTER
+        {
             unanswered_for_a_day += 1;
         }
     }
@@ -984,6 +1017,17 @@ mod tests {
         // Answered since it passed: the answer already says what came after.
         assert!(!due_a_look(Some(checked), Some(checked - second), now));
         assert!(!due_a_look(Some(checked), Some(now + TimeDelta::days(30)), now));
+    }
+
+    #[test]
+    fn the_job_leaves_a_plan_answered_after_it_began() {
+        let began = chrono::NaiveDate::from_ymd_opt(2026, 11, 16).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        // A webhook's look, or another run's, answered while this run waited.
+        assert!(answered_since(Some(began), began));
+        assert!(answered_since(Some(began + TimeDelta::seconds(3)), began));
+        // Answered before the run began, or never: the run asks.
+        assert!(!answered_since(Some(began - TimeDelta::seconds(1)), began));
+        assert!(!answered_since(None, began));
     }
 
     #[test]
