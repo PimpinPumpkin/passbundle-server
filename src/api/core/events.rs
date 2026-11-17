@@ -47,7 +47,10 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
 
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+    // Keykeeper: and for a family, which has no event log (company features).
+    let events_on =
+        CONFIG.org_events_enabled() && super::keykeeper_plan_limits::company_features_on(&org_id, &conn).await?;
+    let events_json: Vec<Value> = if events_on {
         let (start_date, end_date) = data.date_range()?;
 
         Event::find_by_organization_uuid(&org_id, &start_date, &end_date, &conn)
@@ -70,8 +73,11 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
 async fn get_cipher_events(cipher_id: CipherId, data: EventRange, headers: Headers, conn: DbConn) -> JsonResult {
     // Return an empty vec when org events are disabled.
     // This prevents client errors
+    // Keykeeper: and for a family's items, since a family has no event log
+    // (company features).
     let events_json: Vec<Value> = if CONFIG.org_events_enabled()
         && Membership::user_has_ge_admin_access_to_cipher(&headers.user.uuid, &cipher_id, &conn).await
+        && event_log_of_cipher(&cipher_id, &conn).await?
     {
         let (start_date, end_date) = data.date_range()?;
 
@@ -100,7 +106,10 @@ async fn get_user_events(
     }
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+    // Keykeeper: and for a family, which has no event log (company features).
+    let events_on =
+        CONFIG.org_events_enabled() && super::keykeeper_plan_limits::company_features_on(&org_id, &conn).await?;
+    let events_json: Vec<Value> = if events_on {
         let (start_date, end_date) = data.date_range()?;
 
         Event::find_by_org_and_member(&org_id, &member_id, &start_date, &end_date, &conn)
@@ -117,6 +126,16 @@ async fn get_user_events(
         "object": "list",
         "continuationToken": get_continuation_token(&events_json),
     })))
+}
+
+/// Keykeeper: whether the organization that owns an item has an event log: a
+/// family has none (company features). The check before it already leaves
+/// out an item no organization owns.
+async fn event_log_of_cipher(cipher_id: &CipherId, conn: &DbConn) -> ApiResult<bool> {
+    match Cipher::find_by_uuid(cipher_id, conn).await.and_then(|cipher| cipher.organization_uuid) {
+        Some(org) => super::keykeeper_plan_limits::company_features_on(&org, conn).await,
+        None => Ok(true),
+    }
 }
 
 fn get_continuation_token(events_json: &[Value]) -> Option<&str> {

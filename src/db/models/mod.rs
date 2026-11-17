@@ -14,6 +14,7 @@ mod keykeeper_billing;
 mod keykeeper_browser_autofill;
 mod keykeeper_cipher_versions;
 mod keykeeper_event_streaming;
+mod keykeeper_family_people;
 pub mod keykeeper_folder_permissions;
 mod keykeeper_install_tokens;
 mod keykeeper_joining;
@@ -69,6 +70,8 @@ pub use self::keykeeper_event_streaming::{
     MAX_SCOPES_PER_PERSON, Secrets as EventSecrets, Settings as EventSettings, WAKE, describe as describe_event,
     destination_target, save_with_extras,
 };
+// Keykeeper: a family's people limit, counted (`src/api/core/keykeeper_plan_limits.rs`).
+pub use self::keykeeper_family_people::Within as FamilyWithin;
 pub use self::keykeeper_install_tokens::{
     StoredToken, init_install_token_key, open_install_token, token_hash, upgrade_install_tokens,
 };
@@ -89,7 +92,7 @@ pub use self::keykeeper_orgs::OrgSetup;
 pub use self::keykeeper_password_change::OrgPasswordChange;
 pub use self::keykeeper_plans::{
     Billed, FreeWhy, Plan, PlanName, PlanNow, PlanOwner, PlanState, PlanWrite, SetBy, Standing, Terms, may_manage_plan,
-    not_enforced_json, people_a_plan_reaches, plan_at, put_in_profile,
+    not_enforced_json, people_a_plan_reaches, plan_at, put_in_profile, put_on_organization,
 };
 // Keykeeper: the trial clock and the reminders (`src/api/core/keykeeper_plan_clock.rs`).
 pub use self::keykeeper_plan_clock::{

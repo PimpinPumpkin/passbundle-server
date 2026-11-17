@@ -319,6 +319,11 @@ struct SsoSettings {
 async fn put_sso(org_id: OrganizationId, data: Json<SsoSettings>, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&org_id, &headers, &conn).await?;
     let data = data.into_inner();
+    // Keykeeper: single sign-on is a company feature, which a family doesn't
+    // have. Turning it off goes on.
+    if data.enabled {
+        crate::api::core::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
+    }
     data.verification.confirm_change(&headers.user, &conn).await?;
     let Some(identifier) = normalize_identifier(&data.identifier) else {
         err!("The SSO identifier is 3 to 40 lowercase letters, digits, and hyphens, such as acme-dental.")
@@ -456,6 +461,8 @@ struct DomainData {
 #[post("/keykeeper/organizations/<org_id>/sso/domains", data = "<data>")]
 async fn add_domain(org_id: OrganizationId, data: Json<DomainData>, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&org_id, &headers, &conn).await?;
+    // Keykeeper: not for a family (company features). Removing one goes on.
+    crate::api::core::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     let raw = data.into_inner().domain;
     let raw = raw.trim();
     let raw = raw.rsplit_once('@').map_or(raw, |(_, d)| d);
@@ -493,6 +500,8 @@ async fn add_domain(org_id: OrganizationId, data: Json<DomainData>, headers: Hea
 #[post("/keykeeper/organizations/<org_id>/sso/domains/<domain_id>/verify")]
 async fn verify_domain(org_id: OrganizationId, domain_id: &str, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&org_id, &headers, &conn).await?;
+    // Keykeeper: not for a family (company features).
+    crate::api::core::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     let Some(d) = SsoDomain::find(domain_id, &org_id, &conn).await else {
         err_code!("Domain not found", Status::NotFound.code)
     };

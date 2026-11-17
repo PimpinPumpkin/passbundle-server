@@ -502,6 +502,23 @@ impl PlanNow {
         self.row.as_ref().and_then(Plan::name) == Some(PlanName::Families)
     }
 
+    /// How many people the plan covers, whatever its state: a family's
+    /// PLAN_FAMILIES_PEOPLE. None for no limit, and for no plan.
+    pub fn people_limit(&self) -> Option<i64> {
+        self.gives.and_then(|gives| gives.people)
+    }
+
+    /// Whether the plan gives the company features (policies, groups, the
+    /// event log and event destinations, single sign-on, provisioning,
+    /// account recovery, custom roles, the install command, and the
+    /// organization's API key), whatever its state. Only a plan that says it
+    /// doesn't, which is a family's, turns them off: an organization with no
+    /// plan has them as it always had. The sync's fields and every route that
+    /// refuses a company feature ask here.
+    pub fn company_features(&self) -> bool {
+        self.gives.is_none_or(|gives| gives.company_features)
+    }
+
     /// Attachments, in whole GB: the plan's figure while it's in effect, and
     /// none after. A person covered by an organization or an MSP gets
     /// Premium's for their own vault. None for a pool, which has no storage of
@@ -826,13 +843,13 @@ fn put_in_organization(org: &mut Value, plan: &PlanNow, terms: &Terms) {
     org["maxStorageGb"] = plan.storage_gb(terms).unwrap_or(0).clamp(0, i64::from(i16::MAX)).into();
     if plan.is_family() {
         // Upstream's Families, where the invite form stops at the seats left.
-        org["seats"] = plan.gives.and_then(|gives| gives.people).into();
+        org["seats"] = plan.people_limit().into();
         org["productTierType"] = 1.into();
     } else {
         org["seats"] = Value::Null;
         org["productTierType"] = 3.into();
     }
-    if plan.gives.is_some_and(|gives| !gives.company_features) {
+    if !plan.company_features() {
         for field in COMPANY_FEATURE_FIELDS {
             org[field] = false.into();
         }
@@ -880,6 +897,22 @@ pub async fn put_in_profile(profile: &mut Value, user: &UserId, conn: &DbConn) {
                 put_in_organization(org, plan, &terms);
             }
         }
+    }
+}
+
+/// Puts an organization's plan on the organization itself, as `GET` and
+/// `PUT /organizations/<id>` answer it (`Organization::to_json`), with the same
+/// fields and values its entry in a profile gets (`put_in_organization`), for
+/// `asker`. With PLANS_ENFORCED off, nothing changes and no plan is looked up.
+pub async fn put_on_organization(org_json: &mut Value, org: &OrganizationId, asker: &UserId, conn: &DbConn) {
+    if !CONFIG.plans_enforced() {
+        return;
+    }
+    let whose = PlanOwner::Organization(org.clone());
+    match plan_at(&whose, Some(asker), Utc::now().naive_utc(), conn).await {
+        Ok(plan) => put_in_organization(org_json, &plan, &Terms::from_config()),
+        // A plan never ends on a guess, as in a profile.
+        Err(e) => error!("An organization's plan couldn't be read, so it was left as it is: {e:#?}"),
     }
 }
 
@@ -1372,6 +1405,38 @@ mod tests {
         assert_eq!((small.storage_gb, small.people, small.company_features), (5, None, true));
         assert_eq!(PlanName::Business.gives(40, &terms).storage_gb, 40);
         assert_eq!(PlanName::Msp.gives(40, &terms), PlanName::Business.gives(40, &terms));
+    }
+
+    /// The family's figure and its company features come from the one table,
+    /// in any state, and only a family's plan turns either on.
+    #[test]
+    fn a_familys_people_and_company_features() {
+        let acme = PlanOwner::Organization("acme".to_owned().into());
+        let good = |plan: PlanName| Plan {
+            org_uuid: Some("acme".to_owned().into()),
+            standing: "until".to_owned(),
+            until: Some(noon()),
+            ..row(plan)
+        };
+        for at in [noon(), noon() + second()] {
+            let family = as_it_stands(acme.clone(), Some(good(PlanName::Families)), at, 4, true);
+            assert_eq!((family.people_limit(), family.company_features()), (Some(6), false), "{at}");
+            let business = as_it_stands(acme.clone(), Some(good(PlanName::Business)), at, 4, true);
+            assert_eq!((business.people_limit(), business.company_features()), (None, true), "{at}");
+            // An MSP's client is covered by the pool, as Business.
+            let mut client = as_it_stands(acme.clone(), Some(good(PlanName::Msp)), at, 4, false);
+            client.covered_by = Some(("northwind".to_owned().into(), "Northwind IT".to_owned()));
+            assert_eq!((client.people_limit(), client.company_features()), (None, true), "{at}");
+        }
+        // No plan at all: no limit, and everything an organization always had.
+        let none = as_it_stands(acme, None, noon(), 4, true);
+        assert_eq!((none.people_limit(), none.company_features()), (None, true));
+        // The figure is the setting's.
+        let terms = Terms {
+            families_people: 4,
+            ..site_terms()
+        };
+        assert_eq!(PlanName::Families.gives(2, &terms).people, Some(4));
     }
 
     #[test]
