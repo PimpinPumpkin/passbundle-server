@@ -475,6 +475,31 @@ impl EventDestination {
         .await;
     }
 
+    /// Gives back each of these leases (a destination and when its lease
+    /// ends) that its holder still has: a server's own, as it stops normally.
+    /// A lease that ran out and another server took ends at another time, so
+    /// it stays that server's. Returns how many were given back.
+    pub async fn release_all(held: Vec<(String, NaiveDateTime)>, conn: &DbConn) -> usize {
+        if held.is_empty() {
+            return 0;
+        }
+        conn.run(move |conn| {
+            held.into_iter()
+                .map(|(uuid, lease)| {
+                    diesel::update(
+                        event_destinations::table
+                            .filter(event_destinations::uuid.eq(uuid))
+                            .filter(event_destinations::lease_until.eq(Some(lease))),
+                    )
+                    .set(event_destinations::lease_until.eq(None::<NaiveDateTime>))
+                    .execute(conn)
+                    .unwrap_or(0)
+                })
+                .sum()
+        })
+        .await
+    }
+
     /// Records a turn that delivered, quickly: no longer failing or slow.
     pub async fn succeeded(uuid: &str, conn: &DbConn) {
         let uuid = uuid.to_owned();
