@@ -182,6 +182,9 @@ async fn make_token(
 ) -> JsonResult {
     // Who may, first: anyone else gets "not found", with or without a body.
     require_admin(&org_id, &headers, &conn).await?;
+    // Keykeeper: provisioning is a company feature, which a family doesn't
+    // have. Revoking a token goes on.
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     data.map(Json::into_inner).unwrap_or_default().confirm_change(&headers.user, &conn).await?;
     let replaced = ScimToken::find(&org_id, &conn).await.is_some();
     let (token, mut row) = ScimToken::generate(org_id.clone(), &headers.user.email);
@@ -250,6 +253,8 @@ struct LetInData {
 #[put("/keykeeper/organizations/<org_id>/provisioning/seals", data = "<data>")]
 async fn let_in(org_id: OrganizationId, data: Json<LetInData>, headers: Headers, conn: DbConn) -> JsonResult {
     require_admin(&org_id, &headers, &conn).await?;
+    // Keykeeper: nobody comes in from a directory to a family (company features).
+    super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
     let data = data.into_inner();
     if data.seals.is_empty() || data.seals.len() > MAX_SEALS {
         err!(format!("Let in between 1 and {MAX_SEALS} people at a time"))

@@ -313,6 +313,9 @@ async fn own_org_admin(
             rocket::http::Status::Forbidden.code
         )
     }
+    // Keykeeper: the install command is a company feature, which a family
+    // doesn't have.
+    super::keykeeper_plan_limits::refuse_company_feature(org_id, conn).await?;
     Ok(match OrgSetup::find_by_org(org_id, conn).await {
         Some(setup) => OrgSetupOrNew::Saved(setup),
         None => OrgSetupOrNew::New(OrgSetup::new(org_id.clone(), None, None, false)?),
@@ -356,6 +359,12 @@ async fn get_org_enrollment(org_id: OrganizationId, headers: Headers, conn: DbCo
         )
         .await;
         return Ok(Json(json!({ "provider": provider, "removedSinceToken": removed })));
+    }
+    // Keykeeper: a family has no install command (company features), so its
+    // card on Joining and security stays hidden, as for anything the server
+    // says isn't there.
+    if !super::keykeeper_plan_limits::company_features_on(&org_id, &conn).await? {
+        err_code!("Organization not found", rocket::http::Status::NotFound.code)
     }
     let setup = OrgSetup::find_by_org(&org_id, &conn).await;
     let setup = setup.as_ref();
@@ -532,6 +541,9 @@ async fn join(data: Json<JoinData>, headers: Headers, conn: DbConn) -> JsonResul
     // "What happens when payment stops"). Someone already in stays in.
     if existing.as_ref().is_none_or(|member| member.status == MembershipStatus::Invited as i32) {
         super::keykeeper_plan_limits::refuse_if_ended(&org.uuid, &conn).await?;
+        // Keykeeper: nor a family, which has no install command (company
+        // features), with a command made before it was one.
+        super::keykeeper_plan_limits::refuse_company_feature(&org.uuid, &conn).await?;
     }
     let member = match existing {
         // Already in: nothing to do.

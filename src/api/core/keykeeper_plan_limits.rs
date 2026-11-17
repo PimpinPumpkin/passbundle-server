@@ -4,6 +4,9 @@
 // data breach report, and anything new in an organization whose plan has
 // ended, or added by an MSP whose pool has ("What happens when payment
 // stops"). The routes call `refuse_if_ended` and `refuse_if_pool_ended`.
+// And a family's two limits: its people, counted at every way in
+// (`refuse_if_family_full`, `save_counted`), and the company features it
+// doesn't have (`refuse_company_feature`).
 //
 // Only adding is checked. Downloading and deleting never look at a plan, so
 // nothing here is called from those routes: a file attached while a plan was
@@ -30,8 +33,8 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Attachment, Cipher, MspId, Organization, OrganizationId, PersonGets, PlanOwner, PlanState, Terms, UserId,
-            plan_at, what_a_person_gets,
+            Attachment, Cipher, FamilyWithin, Membership, MspId, Organization, OrganizationId, PersonGets, PlanOwner,
+            PlanState, Terms, UserId, plan_at, what_a_person_gets,
         },
     },
 };
@@ -44,6 +47,9 @@ const BREACH_REPORT_IS_PREMIUM: &str = "The data breach report is part of Premiu
 pub(super) const ORGANIZATION_ENDED: &str = "This organization's plan has ended, so nothing new can be added. Everything in it can still be opened, changed, exported, and deleted.";
 /// The same, in an MSP's console, for what it would add to its clients.
 const POOL_ENDED: &str = "This MSP's plan has ended, so nothing new can be added to its clients. Everything in them can still be opened, changed, exported, and deleted.";
+/// The design's sentence for a company feature in a family ("What the server
+/// refuses").
+pub(super) const BUSINESS_PLAN: &str = "That's part of the Business plan.";
 /// The server's own sentence where its operator turned attachments off for
 /// everyone (a cap of 0), whatever anyone's plan.
 const ATTACHMENTS_OFF: &str = "Attachments are disabled";
@@ -267,6 +273,99 @@ pub async fn refuse_if_pool_ended(msp: &MspId, conn: &DbConn) -> EmptyResult {
     Ok(())
 }
 
+/// The design's sentence for a family with no room: "A Families plan covers 6
+/// people, and this one has 6. Remove someone first.", with the plan's figure
+/// and the people it has now.
+fn family_full(limit: i64, has: i64) -> String {
+    let people = if limit == 1 {
+        "1 person".to_owned()
+    } else {
+        format!("{limit} people")
+    };
+    format!("A Families plan covers {people}, and this one has {has}. Remove someone first.")
+}
+
+/// How many people the organization's plan covers: a family's figure, and
+/// None for no limit. Where plans aren't enforced, None, with nothing looked
+/// up.
+async fn people_limit(org: &OrganizationId, conn: &DbConn) -> ApiResult<Option<i64>> {
+    if !CONFIG.plans_enforced() {
+        return Ok(None);
+    }
+    let plan = plan_at(&PlanOwner::Organization(org.clone()), None, Utc::now().naive_utc(), conn).await?;
+    Ok(plan.people_limit())
+}
+
+/// Refuses `adding` more people to a family that has no room for them, before
+/// anything is written: everyone invited or joined who isn't revoked counts,
+/// the owner included (`Membership::people_counted`). `adding` is 0 for
+/// someone already counted (an invitation sent again, accepting, confirming),
+/// who is refused only while the family has more people than its plan covers.
+/// The write that adds or restores someone counts again under a lock
+/// (`save_counted`). Where plans aren't enforced, nothing is looked up.
+pub async fn refuse_if_family_full(org: &OrganizationId, adding: i64, conn: &DbConn) -> EmptyResult {
+    let Some(limit) = people_limit(org, conn).await? else {
+        return Ok(());
+    };
+    let has = Membership::people_counted(org, conn).await?;
+    if has.saturating_add(adding) > limit {
+        err!(family_full(limit, has))
+    }
+    Ok(())
+}
+
+/// Saves a membership on a way into an organization: invited, or restored.
+/// For a family, the count and the write are one locked transaction
+/// (`Membership::save_within`), so invitations at once can't both take the
+/// last place. For anyone else, and wherever plans aren't enforced, it's
+/// `save`, as it always was.
+pub async fn save_counted(member: &Membership, conn: &DbConn) -> EmptyResult {
+    let Some(limit) = people_limit(&member.org_uuid, conn).await? else {
+        return member.save(conn).await;
+    };
+    match member.save_within(limit, conn).await? {
+        FamilyWithin::Saved => Ok(()),
+        FamilyWithin::Full {
+            has,
+        } => err!(family_full(limit, has)),
+    }
+}
+
+/// The seats a family has taken, for the web vault's invite form, which stops
+/// at the seats left (upstream's `organizationOccupiedSeats`). None for every
+/// other organization, and wherever plans aren't enforced, with nothing
+/// looked up: the server answers 0 for them, as it always has.
+pub async fn family_seats_taken(org: &OrganizationId, conn: &DbConn) -> ApiResult<Option<i64>> {
+    if people_limit(org, conn).await?.is_none() {
+        return Ok(None);
+    }
+    Membership::people_counted(org, conn).await.map(Some)
+}
+
+/// Whether the organization's plan gives the company features: a family's
+/// doesn't (`PlanNow::company_features`). Where plans aren't enforced, always,
+/// with nothing looked up.
+pub async fn company_features_on(org: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
+    if !CONFIG.plans_enforced() {
+        return Ok(true);
+    }
+    let plan = plan_at(&PlanOwner::Organization(org.clone()), None, Utc::now().naive_utc(), conn).await?;
+    Ok(plan.company_features())
+}
+
+/// Refuses a company feature to an organization whose plan doesn't give them,
+/// a family, with the design's sentence. The routes call it where a feature
+/// would be added or turned on: policies, groups, event destinations, single
+/// sign-on, provisioning, account recovery, custom roles, the install
+/// command, and the organization's API key. Turning one off, removing what's
+/// there, and reading go on.
+pub async fn refuse_company_feature(org: &OrganizationId, conn: &DbConn) -> EmptyResult {
+    if !company_features_on(org, conn).await? {
+        err!(BUSINESS_PLAN)
+    }
+    Ok(())
+}
+
 /// Refuses with `sentence` unless the person has Premium's features at `at`.
 async fn needs_premium_at(user: &UserId, sentence: &'static str, at: NaiveDateTime, conn: &DbConn) -> EmptyResult {
     if !has_premium(&what_a_person_gets(user, at, conn).await?) {
@@ -438,6 +537,17 @@ mod tests {
 
         assert_eq!(SENDING_FILES_IS_PREMIUM, "Sending files is part of Premium. Sending text is free.");
         assert_eq!(BREACH_REPORT_IS_PREMIUM, "The data breach report is part of Premium.");
+    }
+
+    #[test]
+    fn a_familys_sentences() {
+        assert_eq!(family_full(6, 6), "A Families plan covers 6 people, and this one has 6. Remove someone first.");
+        // Over its figure (it had more people before it was a family): the real count.
+        assert_eq!(family_full(6, 8), "A Families plan covers 6 people, and this one has 8. Remove someone first.");
+        // The figure is the setting's.
+        assert_eq!(family_full(4, 4), "A Families plan covers 4 people, and this one has 4. Remove someone first.");
+        assert_eq!(family_full(1, 1), "A Families plan covers 1 person, and this one has 1. Remove someone first.");
+        assert_eq!(BUSINESS_PLAN, "That's part of the Business plan.");
     }
 }
 
