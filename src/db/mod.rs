@@ -244,12 +244,19 @@ impl DbPool {
     /// route its connection and then checks the rows with another.
     #[cfg(all(test, sqlite))]
     pub fn for_test_pool() -> DbPool {
+        Self::for_test_pool_of(1)
+    }
+
+    /// Keykeeper: the same, with `size` connections, for a test of requests
+    /// that arrive at once.
+    #[cfg(all(test, sqlite))]
+    pub fn for_test_pool_of(size: u32) -> DbPool {
         let path = std::env::temp_dir().join(format!("keykeeper-test-{}.sqlite3", crate::util::get_uuid()));
         let url = path.to_string_lossy().into_owned();
         sqlite_migrations::run_migrations(&url).expect("the migrations run");
         drop(ACTIVE_DB_TYPE.set(DbConnType::Sqlite));
         let pool = Pool::builder()
-            .max_size(1)
+            .max_size(size)
             .connection_customizer(Box::new(DbConnOptions {
                 init_stmts: DbConnType::Sqlite.default_init_stmts(),
             }))
@@ -257,7 +264,7 @@ impl DbPool {
             .expect("a pool for the test's database");
         DbPool {
             pool: Some(pool),
-            semaphore: Arc::new(Semaphore::new(1)),
+            semaphore: Arc::new(Semaphore::new(usize::try_from(size).expect("a pool size fits"))),
         }
     }
 

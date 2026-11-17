@@ -65,6 +65,10 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
     // directory removes or turns off still goes, and the import then says
     // what it couldn't add (DESIGN.md, "What happens when payment stops").
     let ended = crate::api::core::keykeeper_plan_limits::organization_has_ended(&org_id, &conn).await?;
+    // Keykeeper: nor does a family, whose plan has no directory import
+    // (company features), for an API key made before it was one.
+    let family = !ended && !crate::api::core::keykeeper_plan_limits::company_features_on(&org_id, &conn).await?;
+    let ended = ended || family;
     let mut refused = false;
 
     // Like upstream, the import never removes Owners, so it doesn't revoke or restore them either.
@@ -223,6 +227,9 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
         }
     }
 
+    if refused && family {
+        err!(crate::api::core::keykeeper_plan_limits::BUSINESS_PLAN)
+    }
     if refused {
         err!(crate::api::core::keykeeper_plan_limits::ORGANIZATION_ENDED)
     }
