@@ -21,7 +21,7 @@ use crate::{
     api::notifications::WebSocketUsers,
     db::{
         DbConn, DbPool,
-        models::{DueReminder, FreeWhy, PlanNotice, PlanOwner, Reminder, run_clock},
+        models::{DueReminder, FreeWhy, PlanName, PlanNotice, PlanOwner, Reminder, run_clock},
     },
     mail,
 };
@@ -81,8 +81,14 @@ fn moment(date: &NaiveDateTime) -> String {
     date.format("%A, %B %-d, %Y, at %-I:%M %p UTC").to_string()
 }
 
+/// Two-step codes, which the apps show only with Premium (DESIGN.md, "What the
+/// server refuses", decision 2): said for Premium and Families, whose people
+/// lose them when the plan ends. The keys stay in the items.
+const CODES_YOURS: &str = "Without Premium, two-step login codes don't show on your items; their keys stay, and the codes come back with Premium.";
+const CODES_MEMBERS: &str = "Without Premium, members' two-step login codes don't show on their own items; the keys stay, and the codes come back with Premium.";
+
 /// What stops for whose plan it is, said as of then (`after`) or of now.
-fn what_stops(whose: &PlanOwner, name: &str, after: bool) -> String {
+fn what_stops(whose: &PlanOwner, plan: Option<PlanName>, name: &str, after: bool) -> String {
     let (nothing, now, have, stop) = if after {
         ("After that, nothing", "", "have", "stop too")
     } else {
@@ -90,7 +96,7 @@ fn what_stops(whose: &PlanOwner, name: &str, after: bool) -> String {
     };
     match whose {
         PlanOwner::User(_) => format!(
-            "{}our own plan no longer gives you attaching files, sending files, or the data breach report.",
+            "{}our own plan no longer gives you attaching files, sending files, or the data breach report. {CODES_YOURS}",
             if after {
                 "After that, y"
             } else {
@@ -98,7 +104,12 @@ fn what_stops(whose: &PlanOwner, name: &str, after: bool) -> String {
             }
         ),
         PlanOwner::Organization(_) => format!(
-            "{nothing} new can be added to {name}{now}: no new people, shared items, shared folders, groups, or attachments. Premium features its members {have} through {name} {stop}."
+            "{nothing} new can be added to {name}{now}: no new people, shared items, shared folders, groups, or attachments. Premium features its members {have} through {name} {stop}.{}",
+            if plan == Some(PlanName::Families) {
+                format!(" {CODES_MEMBERS}")
+            } else {
+                String::new()
+            }
         ),
         PlanOwner::Msp(_) => format!(
             "{nothing} new can be added to {name}'s clients{now}: no new people, shared items, shared folders, groups, or attachments, and {name} can't take on new clients or invite staff. Premium features your staff and your clients' people {have} through {name} {stop}."
@@ -158,7 +169,7 @@ fn words(due: &DueReminder, grace_days: i64) -> (String, Vec<String>) {
                     format!("The free months for {name} end on {}.{pool}", moment(ends)),
                 ),
             };
-            (subject, vec![first, what_stops(&due.whose, name, true), what_keeps(&due.whose, name)])
+            (subject, vec![first, what_stops(&due.whose, due.row.name(), name, true), what_keeps(&due.whose, name)])
         }
         Reminder::GraceThreeDays => {
             let paid = due.row.until.map(|until| moment(&until)).unwrap_or_default();
@@ -179,7 +190,7 @@ fn words(due: &DueReminder, grace_days: i64) -> (String, Vec<String>) {
                     ),
                 )
             };
-            (subject, vec![first, what_stops(&due.whose, name, true), what_keeps(&due.whose, name)])
+            (subject, vec![first, what_stops(&due.whose, due.row.name(), name, true), what_keeps(&due.whose, name)])
         }
         Reminder::GraceEnded => {
             let (subject, first) = if person {
@@ -201,7 +212,7 @@ fn words(due: &DueReminder, grace_days: i64) -> (String, Vec<String>) {
             };
             let mut keeps = what_keeps(&due.whose, name);
             keeps.push_str(" Once it's paid, everything works as it did.");
-            (subject, vec![first, what_stops(&due.whose, name, false), keeps])
+            (subject, vec![first, what_stops(&due.whose, due.row.name(), name, false), keeps])
         }
     }
 }
@@ -320,7 +331,7 @@ mod tests {
             paragraphs,
             vec![
                 "Your free trial of Premium ends on Monday, March 1, 2027, at 12:00 PM UTC.",
-                "After that, your own plan no longer gives you attaching files, sending files, or the data breach report.",
+                "After that, your own plan no longer gives you attaching files, sending files, or the data breach report. Without Premium, two-step login codes don't show on your items; their keys stay, and the codes come back with Premium.",
                 "Nothing is deleted. Your items and the files already attached to them stay, and you can still open, change, export, and delete all of it.",
             ]
         );
@@ -362,7 +373,7 @@ mod tests {
         assert_eq!(subject, "Your PassBundle Premium has ended");
         assert_eq!(
             paragraphs[1],
-            "Your own plan no longer gives you attaching files, sending files, or the data breach report."
+            "Your own plan no longer gives you attaching files, sending files, or the data breach report. Without Premium, two-step login codes don't show on your items; their keys stay, and the codes come back with Premium."
         );
 
         let msp = PlanOwner::Msp("northwind".to_owned().into());
@@ -372,5 +383,65 @@ mod tests {
             paragraphs[1],
             "Nothing new can be added to Northwind IT's clients now: no new people, shared items, shared folders, groups, or attachments, and Northwind IT can't take on new clients or invite staff. Premium features your staff and your clients' people had through Northwind IT have stopped too."
         );
+    }
+
+    /// Two-step codes need Premium in the apps (decision 2), so the reminders
+    /// for Premium and Families say what happens to them; Business's and a
+    /// pool's don't, since their members' shared items keep their codes.
+    #[test]
+    fn premium_and_families_reminders_say_two_step_codes_stop_showing_and_the_keys_stay() {
+        let family = |r: Plan| Plan {
+            plan: "families".to_owned(),
+            ..r
+        };
+        let (_, paragraphs) =
+            words(&due(acme(), Some("The Lopez family"), Reminder::TrialOneDay, family(row(Some("offer"), None))), 14);
+        assert_eq!(
+            paragraphs[1],
+            "After that, nothing new can be added to The Lopez family: no new people, shared items, shared folders, groups, or attachments. Premium features its members have through The Lopez family stop too. Without Premium, members' two-step login codes don't show on their own items; the keys stay, and the codes come back with Premium."
+        );
+        let paid = family(row(None, Some(noon())));
+        let (_, paragraphs) = words(&due(acme(), Some("The Lopez family"), Reminder::GraceThreeDays, paid.clone()), 14);
+        assert!(paragraphs[1].ends_with(
+            "Without Premium, members' two-step login codes don't show on their own items; the keys stay, and the codes come back with Premium."
+        ));
+        let (_, paragraphs) = words(&due(acme(), Some("The Lopez family"), Reminder::GraceEnded, paid), 14);
+        assert_eq!(
+            paragraphs[1],
+            "Nothing new can be added to The Lopez family now: no new people, shared items, shared folders, groups, or attachments. Premium features its members had through The Lopez family have stopped too. Without Premium, members' two-step login codes don't show on their own items; the keys stay, and the codes come back with Premium."
+        );
+
+        // A person's Premium, before it ends and once it has.
+        let ana = PlanOwner::User("ana".to_owned().into());
+        let premium = |r: Plan| Plan {
+            plan: "premium".to_owned(),
+            ..r
+        };
+        for reminder in [Reminder::TrialSevenDays, Reminder::TrialOneDay] {
+            let (_, paragraphs) = words(&due(ana.clone(), None, reminder, premium(row(Some("offer"), None))), 14);
+            assert!(paragraphs[1].ends_with(
+                "Without Premium, two-step login codes don't show on your items; their keys stay, and the codes come back with Premium."
+            ));
+        }
+        for reminder in [Reminder::GraceThreeDays, Reminder::GraceEnded] {
+            let (_, paragraphs) = words(&due(ana.clone(), None, reminder, premium(row(None, Some(noon())))), 14);
+            assert!(paragraphs[1].ends_with(
+                "Without Premium, two-step login codes don't show on your items; their keys stay, and the codes come back with Premium."
+            ));
+        }
+
+        // Business and a pool say nothing about codes.
+        let msp = PlanOwner::Msp("northwind".to_owned().into());
+        for reminder in [Reminder::TrialSevenDays, Reminder::GraceThreeDays, Reminder::GraceEnded] {
+            let plan_row = if reminder == Reminder::TrialSevenDays {
+                row(Some("trial"), None)
+            } else {
+                row(None, Some(noon()))
+            };
+            for whose in [acme(), msp.clone()] {
+                let (_, paragraphs) = words(&due(whose, Some("Acme"), reminder, plan_row.clone()), 14);
+                assert!(paragraphs.iter().all(|p| !p.contains("two-step")), "{paragraphs:?}");
+            }
+        }
     }
 }
