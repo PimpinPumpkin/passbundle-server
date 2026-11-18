@@ -15,8 +15,9 @@
 // try. So a slow or broken receiver, or one person with many, holds up only
 // their own events. The worker takes a lease on a destination before
 // sending, so two servers sharing a database don't send the same events at
-// once. A destination that keeps failing for a day is turned off, and its
-// owners are told by email (at most once a day).
+// once, and gives its leases back when the server stops normally, so a
+// restart sends at once. A destination that keeps failing for a day is
+// turned off, and its owners are told by email (at most once a day).
 // See DESIGN.md, "Sending events to security tools", and docs/event-streaming.md
 // in the meta repo.
 
@@ -32,12 +33,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{TimeDelta, Utc};
+use chrono::{NaiveDateTime, TimeDelta, Utc};
 use dashmap::DashMap;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
 use reqwest::{Client, StatusCode, header};
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     CONFIG,
@@ -88,6 +90,9 @@ const PAUSE_AFTER: TimeDelta = TimeDelta::hours(24);
 const PAUSE_AFTER_FAILURES: i32 = 10;
 /// How long a worker holds a destination: longer than a turn can take.
 const LEASE: TimeDelta = TimeDelta::seconds(120);
+/// How long a normal shutdown waits for the turns under way to end, and
+/// then for a database connection to give back the leases still held.
+const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// Why a send didn't work, and whether trying again can help.
 #[derive(Debug)]
@@ -847,16 +852,92 @@ pub fn collect_allowed(user: &crate::db::models::UserId) -> bool {
 }
 
 /// Starts the delivery worker. It wakes when an event is queued, and every
-/// few seconds for retries. If it ever stops (a bug), it starts again.
+/// few seconds for retries. If it ever stops (a bug), it starts again, until
+/// the server stops.
 pub fn start(pool: DbPool) {
     tokio::spawn(async move {
-        loop {
+        while !STOPPING.is_cancelled() {
             if let Err(e) = tokio::spawn(run(pool.clone())).await {
                 error!("The event streaming worker stopped ({e}); starting it again");
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
+}
+
+/// Set once the server is stopping normally (shutdown): the worker gives
+/// no more turns, and a send under way is cut off.
+static STOPPING: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
+
+/// One permit for each turn under way, so shutdown can wait for them.
+static SLOTS: Semaphore = Semaphore::const_new(PARALLEL);
+
+/// The leases this server's worker holds.
+static HELD: LazyLock<Held> = LazyLock::new(Held::default);
+
+/// The leases a server's worker holds, by destination, each with when it
+/// ends (which only its holder knows), so shutdown can give back the ones
+/// still held, and only those.
+#[derive(Default)]
+struct Held(Mutex<HashMap<String, NaiveDateTime>>);
+
+impl Held {
+    /// Takes a destination for `lease` (EventDestination::claim) and keeps
+    /// the lease.
+    async fn claim(&self, uuid: &str, lease: TimeDelta, conn: &DbConn) -> Option<NaiveDateTime> {
+        let until = EventDestination::claim(uuid, lease, conn).await?;
+        if let Ok(mut held) = self.0.lock() {
+            held.insert(uuid.to_owned(), until);
+        }
+        Some(until)
+    }
+
+    /// Gives a destination back (EventDestination::release) and forgets the
+    /// lease.
+    async fn release(&self, uuid: &str, until: NaiveDateTime, conn: &DbConn) {
+        EventDestination::release(uuid, until, conn).await;
+        if let Ok(mut held) = self.0.lock()
+            && held.get(uuid) == Some(&until)
+        {
+            held.remove(uuid);
+        }
+    }
+
+    /// Gives back every lease still held, and returns how many the database
+    /// still had as this server's: one that ran out and another server took
+    /// stays that server's.
+    async fn release_all(&self, conn: &DbConn) -> usize {
+        let held: Vec<(String, NaiveDateTime)> = match self.0.lock() {
+            Ok(mut held) => held.drain().collect(),
+            Err(_) => return 0,
+        };
+        EventDestination::release_all(held, conn).await
+    }
+}
+
+/// Stops the worker as the server shuts down normally (SIGTERM or Ctrl-C,
+/// from Rocket's shutdown), and gives back the leases it holds, so a server
+/// that starts on the same database sends to those destinations at once
+/// instead of waiting for the leases to run out (as it still does after a
+/// crash). A send under way is cut off: what it sent isn't marked sent, so
+/// it goes again (at least once). Only this server's leases are given back.
+pub async fn shutdown(pool: &DbPool) {
+    STOPPING.cancel();
+    // The turns under way end at once, each giving back its own lease.
+    let all = u32::try_from(PARALLEL).unwrap_or(u32::MAX);
+    if tokio::time::timeout(STOP_WAIT, SLOTS.acquire_many(all)).await.is_err() {
+        warn!("Event streaming: turns still under way as the server stops");
+    }
+    // Any a turn couldn't give back (it couldn't reach the database, or
+    // hasn't ended).
+    let Ok(Ok(conn)) = tokio::time::timeout(STOP_WAIT, pool.get()).await else {
+        warn!("Event streaming: couldn't reach the database to give back its leases as the server stops");
+        return;
+    };
+    let given = HELD.release_all(&conn).await;
+    if given > 0 {
+        info!("Event streaming: gave back {given} destinations' leases as the server stops");
+    }
 }
 
 /// At most this many destinations one person set up are sent to at once.
@@ -980,20 +1061,22 @@ impl Drop for Turn {
 /// Finds the destinations with events due, and gives them turns fairly, each
 /// on its own task.
 async fn run(pool: DbPool) {
-    let slots = Arc::new(Semaphore::new(PARALLEL));
     let fair: Arc<Mutex<Fair>> = Arc::default();
     let mut pruned = Instant::now();
     loop {
+        if STOPPING.is_cancelled() {
+            return;
+        }
         let due = candidates(&pool).await;
         let chosen = match fair.lock() {
             Ok(mut f) => {
                 f.register(&due);
-                pick(&due, &f, slots.available_permits())
+                pick(&due, &f, SLOTS.available_permits())
             }
             Err(_) => return,
         };
         for who in chosen {
-            let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            let Ok(slot) = SLOTS.try_acquire() else {
                 break;
             };
             let turn = {
@@ -1033,6 +1116,7 @@ async fn run(pool: DbPool) {
         tokio::select! {
             () = WAKE.notified() => {}
             () = tokio::time::sleep(Duration::from_secs(5)) => {}
+            () = STOPPING.cancelled() => return,
         }
     }
 }
@@ -1068,17 +1152,20 @@ fn person_key(created_by: Option<&crate::db::models::UserId>, scope: &str) -> St
 /// something or stopped with more due: then the worker looks again right
 /// away, for events queued meanwhile.
 async fn deliver(pool: &DbPool, uuid: &str) -> bool {
+    if STOPPING.is_cancelled() {
+        return false;
+    }
     let Ok(conn) = pool.get().await else {
         return false;
     };
-    let Some(lease) = EventDestination::claim(uuid, LEASE, &conn).await else {
+    let Some(lease) = HELD.claim(uuid, LEASE, &conn).await else {
         return false;
     };
     drop(conn);
     let again = deliver_claimed(pool, uuid).await;
     if let Ok(conn) = pool.get().await {
         EventDestination::refresh_due(uuid, &conn).await;
-        EventDestination::release(uuid, lease, &conn).await;
+        HELD.release(uuid, lease, &conn).await;
     }
     again
 }
@@ -1093,6 +1180,9 @@ enum End {
     Slow(String),
     /// It failed (recorded already).
     Failed,
+    /// The server is stopping: what was being sent isn't marked sent, so it
+    /// goes again.
+    Stopped,
 }
 
 /// A turn whose sending averaged more than this per event, over at least
@@ -1108,6 +1198,9 @@ async fn deliver_claimed(pool: &DbPool, uuid: &str) -> bool {
     let mut sending = Duration::ZERO;
     let mut was_failing = false;
     let end = loop {
+        if STOPPING.is_cancelled() {
+            break End::Stopped;
+        }
         let Ok(conn) = pool.get().await else {
             break End::Failed;
         };
@@ -1167,7 +1260,13 @@ async fn deliver_claimed(pool: &DbPool, uuid: &str) -> bool {
         }
         let events: Vec<(String, String)> = due.iter().map(|d| (d.event_uuid.clone(), d.payload.clone())).collect();
         let sent_at = Instant::now();
-        let (sent, failure) = send(&target, &events, deadline).await;
+        let done = tokio::select! {
+            () = STOPPING.cancelled() => None,
+            done = send(&target, &events, deadline) => Some(done),
+        };
+        let Some((sent, failure)) = done else {
+            break End::Stopped;
+        };
         sending += sent_at.elapsed();
         let Ok(conn) = pool.get().await else {
             break End::Failed;
@@ -1233,6 +1332,7 @@ async fn deliver_claimed(pool: &DbPool, uuid: &str) -> bool {
                 sending.as_secs()
             ))
         }
+        End::Stopped => return false,
         other => other,
     };
     let Ok(conn) = pool.get().await else {
@@ -1251,7 +1351,7 @@ async fn deliver_claimed(pool: &DbPool, uuid: &str) -> bool {
             }
             true
         }
-        End::Done | End::More | End::Failed => false,
+        End::Done | End::More | End::Failed | End::Stopped => false,
     }
 }
 
@@ -1573,5 +1673,76 @@ mod tests {
         );
         assert_eq!(Failure::retry("10.0.0.1 closed the connection").summary(), "Sending to it failed.");
         assert_eq!(Failure::stop("Its secrets can't be read").summary(), "Its secrets can't be read");
+    }
+}
+
+/// What a server gives back as it stops normally, on real rows in a SQLite
+/// database of the test's own, with two servers (each its own Held) on it.
+#[cfg(all(test, sqlite))]
+mod lease_tests {
+    use super::*;
+    use crate::db::models::{DestinationAdded, MAX_DESTINATIONS};
+
+    /// A destination of an organization's own.
+    async fn destination(conn: &DbConn) -> String {
+        let mut user = User::new(&format!("{}@example.test", crate::util::get_uuid()), None);
+        user.save(conn).await.unwrap();
+        let org = Organization::new("Contoso".to_owned(), "billing@example.test", None, None);
+        org.save(conn).await.unwrap();
+        let d = EventDestination::new(Some(org.uuid), None, "SIEM".into(), EventKind::Webhook, user.uuid);
+        assert_eq!(d.insert_capped(MAX_DESTINATIONS, conn).await.unwrap(), DestinationAdded::Yes);
+        d.uuid
+    }
+
+    /// Whether anyone holds it now: a free one can be taken (and is then
+    /// given back at once).
+    async fn held(uuid: &str, conn: &DbConn) -> bool {
+        match EventDestination::claim(uuid, LEASE, conn).await {
+            Some(until) => {
+                EventDestination::release(uuid, until, conn).await;
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// DESIGN.md, "Leases": a server that stops normally gives back the
+    /// leases it still holds, so a restart sends at once; never another
+    /// server's, even on a destination it held before.
+    #[rocket::async_test]
+    async fn a_server_that_stops_gives_back_its_own_leases_and_no_one_elses() {
+        let conn = DbPool::for_test().await;
+        let (sending, given_back, ran_out, theirs) =
+            (destination(&conn).await, destination(&conn).await, destination(&conn).await, destination(&conn).await);
+        let (this_server, other_server) = (Held::default(), Held::default());
+
+        // This server is sending to one destination.
+        this_server.claim(&sending, LEASE, &conn).await.expect("free");
+        // It had another, and its turn gave it back already.
+        let until = this_server.claim(&given_back, LEASE, &conn).await.expect("free");
+        this_server.release(&given_back, until, &conn).await;
+        // Its lease on a third ran out (a turn that hung), and the other
+        // server took it.
+        this_server.claim(&ran_out, TimeDelta::seconds(-1), &conn).await.expect("free");
+        other_server.claim(&ran_out, LEASE, &conn).await.expect("the lease ran out");
+        // The other server holds one of its own.
+        other_server.claim(&theirs, LEASE, &conn).await.expect("free");
+        for d in [&sending, &ran_out, &theirs] {
+            assert!(held(d, &conn).await);
+        }
+
+        // This server stops: only the lease it still has goes back.
+        assert_eq!(this_server.release_all(&conn).await, 1);
+        assert!(!held(&sending, &conn).await, "this server's lease, given back");
+        assert!(held(&ran_out, &conn).await, "the other server's, on one this server held before");
+        assert!(held(&theirs, &conn).await, "the other server's own");
+        // Nothing is left to give back.
+        assert_eq!(this_server.release_all(&conn).await, 0);
+
+        // The other server stops too: both of its leases go back.
+        assert_eq!(other_server.release_all(&conn).await, 2);
+        for d in [&sending, &given_back, &ran_out, &theirs] {
+            assert!(!held(d, &conn).await);
+        }
     }
 }

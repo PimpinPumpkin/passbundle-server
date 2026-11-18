@@ -404,8 +404,10 @@ pub enum Looked {
 
 /// Asks the provider about `customer`, who pays for `whose` plan, and writes
 /// its answer to `plans`, with when it was asked and that the provider set
-/// it. The people a change reaches are told to sync. Every webhook it was
-/// owed for is then answered.
+/// it. The people a change reaches are told to sync. Every webhook about the
+/// customer that came before it asked is then answered; one that came while
+/// it waited for the answer is still owed a look, since the answer may be
+/// from before what that webhook says changed.
 pub async fn look(billing: &Billing, whose: &PlanOwner, customer: &str, conn: &DbConn) -> Looked {
     let _one = ONE_AT_A_TIME.lock().await;
     look_held(billing, whose, customer, conn).await
@@ -439,6 +441,7 @@ fn answered_since(checked_at: Option<NaiveDateTime>, since: NaiveDateTime) -> bo
 
 /// `look`, with `ONE_AT_A_TIME` held.
 async fn look_held(billing: &Billing, whose: &PlanOwner, customer: &str, conn: &DbConn) -> Looked {
+    let asked_at = Utc::now().naive_utc();
     let Ok(answer) = billing.provider().standing(customer, whose).await else {
         warn!(
             "The payment provider couldn't be asked about the plan of {whose}. Its last answer stands, and it'll be asked again."
@@ -462,7 +465,7 @@ async fn look_held(billing: &Billing, whose: &PlanOwner, customer: &str, conn: &
             return Looked::Failed;
         }
     };
-    if let Err(e) = BillingEvent::answered(billing.name, customer, conn).await {
+    if let Err(e) = BillingEvent::answered(billing.name, customer, asked_at, conn).await {
         warn!("Couldn't note that the webhooks about the plan of {whose} were answered: {e:#?}");
     }
     if changed {
@@ -473,16 +476,36 @@ async fn look_held(billing: &Billing, whose: &PlanOwner, customer: &str, conn: &
     Looked::Answered
 }
 
-/// The look a webhook asked for, about `customer`. A customer the server
-/// never gave the provider is nobody it knows: the webhook is dropped.
+/// The look webhook `event_id` asked for, about `customer`, once it's its
+/// turn: none if a look that began after the webhook came (another
+/// webhook's, or the billing job's) has answered it already, since that
+/// answer says what the webhook was about.
+pub async fn look_for_webhook(billing: &Billing, customer: &str, event_id: &str, conn: &DbConn) -> Looked {
+    let _one = ONE_AT_A_TIME.lock().await;
+    match BillingEvent::owed(billing.name, event_id, conn).await {
+        Ok(false) => return Looked::Answered,
+        Ok(true) => {}
+        Err(e) => warn!("Couldn't tell whether a webhook was answered already, so it's looked at: {e:#?}"),
+    }
+    look_at_customer_held(billing, customer, conn).await
+}
+
+/// The look the webhooks about `customer` are owed. A customer the server
+/// never gave the provider is nobody it knows: the webhooks are dropped.
 pub async fn look_at_customer(billing: &Billing, customer: &str, conn: &DbConn) -> Looked {
+    let _one = ONE_AT_A_TIME.lock().await;
+    look_at_customer_held(billing, customer, conn).await
+}
+
+/// `look_at_customer`, with `ONE_AT_A_TIME` held.
+async fn look_at_customer_held(billing: &Billing, customer: &str, conn: &DbConn) -> Looked {
     match BillingCustomer::whose(billing.name, customer, conn).await {
-        Ok(Some(whose)) => look(billing, &whose, customer, conn).await,
+        Ok(Some(whose)) => look_held(billing, &whose, customer, conn).await,
         Ok(None) => {
             info!(
                 "A webhook from the payment provider was about a customer this server doesn't know, and was dropped."
             );
-            if let Err(e) = BillingEvent::answered(billing.name, customer, conn).await {
+            if let Err(e) = BillingEvent::answered(billing.name, customer, Utc::now().naive_utc(), conn).await {
                 warn!("Couldn't drop the webhooks about a customer this server doesn't know: {e:#?}");
             }
             Looked::Answered

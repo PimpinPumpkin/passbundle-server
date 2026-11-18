@@ -12,6 +12,7 @@ mod keykeeper_cipher_history;
 pub mod keykeeper_device_approval;
 mod keykeeper_enrollment;
 mod keykeeper_event_streaming;
+mod keykeeper_everyone;
 mod keykeeper_folder_looks;
 mod keykeeper_joining;
 mod keykeeper_member_health;
