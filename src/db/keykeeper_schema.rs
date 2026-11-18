@@ -18,6 +18,7 @@ table! {
         all_clients -> Bool,
         client_access -> Nullable<Text>,
         install_commands -> Bool,
+        script_access -> Bool,
     }
 }
 
