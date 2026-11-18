@@ -940,6 +940,21 @@ async fn set_default(
         None
     };
 
+    let name = policy_name(t);
+    let state = if !data.enabled {
+        "off"
+    } else if t == Kind::AdminTwoStep && admin_level(new.as_ref()).everyone() {
+        "on for everyone"
+    } else {
+        "on"
+    };
+    // Keykeeper: each client that takes it, in its own view of its MSP's
+    // actions (keykeeper_msp_activity.rs); the MSP's Activity has the summary.
+    let (pushed, pushed_detail) = if required {
+        ("client_policy_required", name.to_owned())
+    } else {
+        ("client_policy_pushed", format!("{name} to {state}"))
+    };
     let (mut changed, mut kept, mut refused, mut listed) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for client in clients {
         let Some(org) = Organization::find_by_uuid(&client.org_uuid, &conn).await else {
@@ -977,7 +992,14 @@ async fn set_default(
             continue;
         }
         match apply(&org.uuid, t, Some(&default), &headers, &conn).await {
-            Ok(()) => changed.push(client_json(&org)),
+            Ok(()) => {
+                Audit::by(pushed, &headers)
+                    .org(&org.uuid, &org.name)
+                    .detail(pushed_detail.clone())
+                    .record(&msp_id, &conn)
+                    .await?;
+                changed.push(client_json(&org));
+            }
             Err(e) => refused.push(refused_json(&org, &e)),
         }
     }
@@ -994,7 +1016,6 @@ async fn set_default(
         outcome.push(format!("{} refused it", clients_phrase(refused.len())));
     }
     let outcome = outcome.join(", ");
-    let name = policy_name(t);
     let stopped = was_required && !required;
     if required && !was_required {
         // High for security tools: it overrides what clients chose.
@@ -1011,13 +1032,6 @@ async fn set_default(
         }
         // Stopping a requirement changes the default only if it changed too.
         if !stopped || old != new {
-            let state = if !data.enabled {
-                "off"
-            } else if t == Kind::AdminTwoStep && admin_level(new.as_ref()).everyone() {
-                "on for everyone"
-            } else {
-                "on"
-            };
             // Two-step login for admins is a security setting, high for security tools.
             let action = if t == Kind::AdminTwoStep {
                 "admin_two_step_default_set"

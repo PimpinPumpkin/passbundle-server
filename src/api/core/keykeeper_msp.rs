@@ -191,6 +191,36 @@ pub(super) async fn record_member_confirmed(
     .await
 }
 
+/// A change to one of the MSP's people in its clients, for each client's own
+/// view of its MSP's actions (keykeeper_msp_activity.rs): who made it (or
+/// invited the person, for someone joining the staff) and whom it's about.
+/// The MSP's own Activity has the MSP-wide entry instead.
+struct StaffChange<'a> {
+    msp_id: &'a MspId,
+    actor: Option<&'a UserId>,
+    actor_email: &'a str,
+    target_email: &'a str,
+}
+
+impl StaffChange<'_> {
+    async fn record(
+        &self,
+        event: &'static str,
+        org_id: &OrganizationId,
+        detail: Option<String>,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let mut entry = MspEvent::new(self.msp_id.clone(), event);
+        entry.actor_uuid = self.actor.cloned();
+        entry.actor_email = Some(self.actor_email.to_owned());
+        entry.org_uuid = Some(org_id.clone());
+        entry.org_name = Organization::find_by_uuid(org_id, conn).await.map(|o| o.name);
+        entry.target_email = Some(self.target_email.to_owned());
+        entry.detail = detail;
+        entry.insert(conn).await
+    }
+}
+
 /// The memberships this MSP created, as a set.
 async fn msp_membership_ids(msp_id: &MspId, conn: &DbConn) -> HashSet<MembershipId> {
     MspMembership::find_by_msp(msp_id, conn).await.into_iter().map(|m| m.membership_uuid).collect()
@@ -241,12 +271,31 @@ impl Grant {
             },
         }
     }
+
+    /// The role in a word, for a client's view of its MSP's actions: "owner",
+    /// "admin", or "custom" (a custom role, with "items" when it sees every
+    /// vault item).
+    fn in_words(&self) -> &'static str {
+        match (self.atype, &self.custom) {
+            (MembershipType::Owner, _) => "owner",
+            (MembershipType::Admin, _) => "admin",
+            (_, Some(_)) if self.access_all => "custom items",
+            _ => "custom",
+        }
+    }
+
+    /// Whether a membership already has this role.
+    async fn matches(&self, member: &Membership, conn: &DbConn) -> bool {
+        member.atype == self.atype as i32
+            && member.access_all == self.access_all
+            && keykeeper_roles::find(&member.uuid, conn).await == self.custom
+    }
 }
 
 /// Gives someone the MSP's access to one client: a new membership waiting to
 /// be confirmed, recorded as the MSP's. Leaves any membership they already
 /// have alone, since the client granted it, and never adds someone the client
-/// removed or revoked (keykeeper_offboarding.rs).
+/// removed or revoked (keykeeper_offboarding.rs). Says whether it added one.
 async fn add_msp_membership(
     msp_id: &MspId,
     org_id: &OrganizationId,
@@ -254,11 +303,11 @@ async fn add_msp_membership(
     grant: &Grant,
     invited_by: &str,
     conn: &DbConn,
-) -> EmptyResult {
+) -> Result<bool, crate::error::Error> {
     if Membership::find_by_user_and_org(user_id, org_id, conn).await.is_some()
         || RemovedMember::exists(org_id, user_id, conn).await
     {
-        return Ok(());
+        return Ok(false);
     }
     let mut member = Membership::new(user_id.clone(), org_id.clone(), Some(invited_by.to_owned()));
     member.atype = grant.atype as i32;
@@ -269,7 +318,7 @@ async fn add_msp_membership(
     if let Some(custom) = &grant.custom {
         keykeeper_roles::set(&member.uuid, Some(custom), conn).await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Brings someone's memberships in the MSP's clients in line with their role
@@ -279,7 +328,9 @@ async fn add_msp_membership(
 /// Memberships a client granted itself are left alone, and so is anyone the
 /// client removed or revoked. Additions and role changes happen only in
 /// clients where `actor`, who made the change, has a place of their own
-/// (keykeeper_offboarding.rs); removals happen everywhere.
+/// (keykeeper_offboarding.rs); removals happen everywhere. Each client
+/// touched gets an entry in its own view of its MSP's actions: the person
+/// added, given another role, or removed, by `actor` (`invited_by`).
 pub(super) async fn sync_staff_memberships(
     msp_id: &MspId,
     staff: &MspStaff,
@@ -290,6 +341,13 @@ pub(super) async fn sync_staff_memberships(
     let reach = staff.reach(conn).await;
     let roles = staff.client_roles(conn).await?;
     let ours = msp_membership_ids(msp_id, conn).await;
+    let email = User::find_by_uuid(&staff.user_uuid, conn).await.map(|u| u.email).unwrap_or_default();
+    let change = StaffChange {
+        msp_id,
+        actor,
+        actor_email: invited_by,
+        target_email: &email,
+    };
     for client in MspClient::find_by_msp(msp_id, conn).await {
         let Some(grant) = Grant::for_staff_in(staff, &roles, &client.org_uuid) else {
             return Ok(());
@@ -301,19 +359,28 @@ pub(super) async fn sync_staff_memberships(
         } && !RemovedMember::exists(&client.org_uuid, &staff.user_uuid, conn).await;
         match Membership::find_by_user_and_org(&staff.user_uuid, &client.org_uuid, conn).await {
             None if reached && allowed => {
-                add_msp_membership(msp_id, &client.org_uuid, &staff.user_uuid, &grant, invited_by, conn).await?;
+                if add_msp_membership(msp_id, &client.org_uuid, &staff.user_uuid, &grant, invited_by, conn).await? {
+                    let words = Some(grant.in_words().to_owned());
+                    change.record("client_staff_added", &client.org_uuid, words, conn).await?;
+                }
             }
             Some(mut member) if ours.contains(&member.uuid) => {
                 if reached && !allowed {
                     continue;
                 }
                 if reached {
+                    let changed = !grant.matches(&member, conn).await;
                     member.atype = grant.atype as i32;
                     member.access_all = grant.access_all;
                     member.save(conn).await?;
                     keykeeper_roles::set(&member.uuid, grant.custom.as_ref(), conn).await?;
+                    if changed {
+                        let words = Some(grant.in_words().to_owned());
+                        change.record("client_staff_role_changed", &client.org_uuid, words, conn).await?;
+                    }
                 } else {
                     member.delete(conn).await?;
+                    change.record("client_staff_removed", &client.org_uuid, None, conn).await?;
                 }
             }
             _ => {}
@@ -648,12 +715,15 @@ async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientD
     MspMembership::new(owner.uuid.clone(), msp_id.clone()).insert(&conn).await?;
 
     // New clients reach MSP admins and technicians with every client.
+    let mut added = Vec::new();
     for staff in MspStaff::find_by_msp(&msp_id, &conn).await {
         if staff.user_uuid == headers.user.uuid || staff.reach(&conn).await.is_some() {
             continue;
         }
-        if let Some(grant) = Grant::for_staff(&staff) {
-            add_msp_membership(&msp_id, &org.uuid, &staff.user_uuid, &grant, &headers.user.email, &conn).await?;
+        if let Some(grant) = Grant::for_staff(&staff)
+            && add_msp_membership(&msp_id, &org.uuid, &staff.user_uuid, &grant, &headers.user.email, &conn).await?
+        {
+            added.push((staff.user_uuid.clone(), grant.in_words()));
         }
     }
 
@@ -666,6 +736,18 @@ async fn create_client(msp_id: MspId, headers: Headers, data: Json<CreateClientD
         })
         .record(&msp_id, &conn)
         .await?;
+    // The new client's own view of its MSP's actions names who joined it.
+    for (user_id, words) in added {
+        let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
+        StaffChange {
+            msp_id: &msp_id,
+            actor: Some(&headers.user.uuid),
+            actor_email: &headers.user.email,
+            target_email: &email,
+        }
+        .record("client_staff_added", &org.uuid, Some(words.to_owned()), &conn)
+        .await?;
+    }
     watch.settle(&conn).await?;
     Ok(Json(org.to_json()))
 }
@@ -1119,11 +1201,19 @@ async fn remove_staff(msp_id: MspId, user_id: UserId, headers: Headers, conn: Db
     }
     let memberships = staff_memberships(&msp_id, &user_id, &conn).await;
     ensure_owners_remain(&memberships, &conn).await?;
+    let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
+    let change = StaffChange {
+        msp_id: &msp_id,
+        actor: Some(&headers.user.uuid),
+        actor_email: &headers.user.email,
+        target_email: &email,
+    };
     for member in memberships {
+        let org_id = member.org_uuid.clone();
         member.delete(&conn).await?;
+        change.record("client_staff_removed", &org_id, None, &conn).await?;
     }
     staff.delete(&conn).await?;
-    let email = User::find_by_uuid(&user_id, &conn).await.map(|u| u.email).unwrap_or_default();
     // An old invitation link mustn't bring them back, nor an old seal vouch for them.
     MspInvite::delete_by_msp_and_email(&msp_id, &email, &conn).await?;
     let clients = MspClient::find_by_msp(&msp_id, &conn).await.into_iter().map(|c| c.org_uuid).collect();
@@ -1192,7 +1282,7 @@ async fn pending_confirmations(msp_id: MspId, headers: Headers, conn: DbConn) ->
 
 const MAX_EVENTS: i64 = 500;
 
-fn parse_before(before: Option<&str>) -> Result<Option<chrono::NaiveDateTime>, crate::error::Error> {
+pub(super) fn parse_before(before: Option<&str>) -> Result<Option<chrono::NaiveDateTime>, crate::error::Error> {
     let Some(before) = before.filter(|b| !b.is_empty()) else {
         return Ok(None);
     };
