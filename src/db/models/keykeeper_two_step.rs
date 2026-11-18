@@ -276,11 +276,12 @@ impl RevokedUntilAccepted {
     }
 }
 
-/// How long "Not now" hides the nudge to set up two-step login.
+/// How long "Not now" hides the nudges about two-step login.
 pub const TWO_STEP_NUDGE_DAYS: i64 = 90;
 
-/// When an account last said "Not now" to the nudge to set up two-step login
-/// (DESIGN.md, "A nudge for everyone else"): one row per account, so it's the
+/// When an account last said "Not now" to a nudge about two-step login, to
+/// set it up or to add a stronger method than email codes (DESIGN.md, "A
+/// nudge for everyone else"): one row per account, for both, so it's the
 /// same on every device. Nothing else is kept.
 pub struct TwoStepNudgeDismissal;
 

@@ -34,9 +34,10 @@
 // in someone who doesn't meet it (check_api_key), and for someone it covers,
 // an API key's token isn't taken where admins act (api_key_refused).
 //
-// For everyone no rule covers who has no two-step login at all, the web vault
-// and the extension show a nudge to set it up (nudge), which "Not now" hides
-// for 90 days on every device.
+// For everyone no rule covers who has no two-step login at all, the web vault,
+// the extension, and the apps show a nudge to set it up (nudge), and for
+// someone whose only second step is email codes, a nudge to add a stronger
+// one. "Not now" on either hides both for 90 days on every device.
 //
 // See DESIGN.md, "Two-step login for admins" and "Two-step login for
 // everyone", in the meta repo.
@@ -1274,10 +1275,48 @@ fn a_method(atype: i32, data: &str) -> bool {
     }
 }
 
-/// Whether someone has any two-step login at all, whether or not it counts
-/// for the rule.
-async fn has_any_method(user_id: &UserId, conn: &DbConn) -> bool {
-    TwoFactor::find_by_user(user_id, conn).await.iter().any(|tf| tf.enabled && a_method(tf.atype, &tf.data))
+/// Which nudge the vault page shows. See DESIGN.md, "A nudge for everyone
+/// else".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nudge {
+    /// No two-step login at all: set one up.
+    SetUp,
+    /// Email codes and nothing else: add an authenticator app, a security
+    /// key, or a passkey.
+    Stronger,
+}
+
+impl Nudge {
+    /// The answer's `nudge`.
+    fn word(self) -> &'static str {
+        match self {
+            Self::SetUp => "setUp",
+            Self::Stronger => "stronger",
+        }
+    }
+}
+
+/// The nudge someone's own two-step methods call for (the enabled ones, by
+/// upstream's type number and their data), whoever they are: none at all,
+/// set one up; email codes alone, add a stronger one; anything else (an
+/// authenticator app, a security key or passkey with a key, a YubiKey, or
+/// Duo, with email codes or without), nothing.
+fn nudge_for<'a>(methods: impl IntoIterator<Item = (i32, &'a str)>) -> Option<Nudge> {
+    let mut email = false;
+    for (atype, data) in methods {
+        if !a_method(atype, data) {
+            continue;
+        }
+        if atype != TwoFactorType::Email as i32 {
+            return None;
+        }
+        email = true;
+    }
+    Some(if email {
+        Nudge::Stronger
+    } else {
+        Nudge::SetUp
+    })
 }
 
 /// Whether an organization is waiting for this person to turn on two-step
@@ -1292,29 +1331,49 @@ async fn upstream_waits(user_id: &UserId, conn: &DbConn) -> bool {
     false
 }
 
-/// Whether to nudge this person to set up two-step login: they have none at
-/// all, no rule covers them (they'd get a setup session instead), no
-/// organization is waiting on it for upstream's policy (its own notice says
-/// so), and they haven't said "Not now" in the last 90 days. See DESIGN.md, "A
-/// nudge for everyone else".
-async fn nudge_shows(user_id: &UserId, conn: &DbConn) -> ApiResult<bool> {
-    Ok(!has_any_method(user_id, conn).await
-        && requirements(user_id, conn).await?.is_empty()
-        && !upstream_waits(user_id, conn).await
-        && !TwoStepNudgeDismissal::hidden(user_id, conn).await)
+/// Which nudge this person sees, if any: to set up two-step login when they
+/// have none at all, or to add a stronger method when email codes are all
+/// they have; only when no rule covers them (they'd get a setup session
+/// instead), no organization is waiting on it for upstream's policy (its own
+/// notice says so), and they haven't said "Not now" to either in the last 90
+/// days. See DESIGN.md, "A nudge for everyone else".
+async fn nudge_of(user_id: &UserId, conn: &DbConn) -> ApiResult<Option<Nudge>> {
+    let methods = TwoFactor::find_by_user(user_id, conn).await;
+    let Some(nudge) = nudge_for(methods.iter().filter(|tf| tf.enabled).map(|tf| (tf.atype, tf.data.as_str()))) else {
+        return Ok(None);
+    };
+    if !requirements(user_id, conn).await?.is_empty()
+        || upstream_waits(user_id, conn).await
+        || TwoStepNudgeDismissal::hidden(user_id, conn).await
+    {
+        return Ok(None);
+    }
+    Ok(Some(nudge))
 }
 
-/// Whether the web vault and the extension show the nudge on the vault page.
+/// The answer: which nudge (`nudge`, `setUp` or `stronger`, or null), and
+/// `show` as clients from before the second nudge read it: the first nudge
+/// only, since their words would tell someone with email codes that their
+/// password is all that protects them.
+fn nudge_json(nudge: Option<Nudge>) -> Value {
+    json!({
+        "show": nudge == Some(Nudge::SetUp),
+        "nudge": nudge.map(Nudge::word),
+    })
+}
+
+/// Which nudge the web vault, the extension, and the apps show on the vault
+/// page.
 #[get("/keykeeper/two-step-nudge")]
 async fn get_nudge(headers: Headers, conn: DbConn) -> JsonResult {
-    Ok(Json(json!({ "show": nudge_shows(&headers.user.uuid, &conn).await? })))
+    Ok(Json(nudge_json(nudge_of(&headers.user.uuid, &conn).await?)))
 }
 
-/// "Not now": hidden for 90 days, on every device.
+/// "Not now", to either nudge: both hidden for 90 days, on every device.
 #[post("/keykeeper/two-step-nudge/dismiss")]
 async fn dismiss_nudge(headers: Headers, conn: DbConn) -> JsonResult {
     TwoStepNudgeDismissal::dismiss(&headers.user.uuid, &conn).await?;
-    Ok(Json(json!({ "show": false })))
+    Ok(Json(nudge_json(None)))
 }
 
 #[cfg(test)]
@@ -1373,6 +1432,37 @@ mod tests {
             let n = t as i32;
             assert!(!a_method(n, ""), "{n}");
         }
+    }
+
+    #[test]
+    fn email_codes_alone_call_for_a_stronger_method_and_anything_else_ends_both_nudges() {
+        let email = (TwoFactorType::Email as i32, "");
+        let app = (TwoFactorType::Authenticator as i32, "");
+        let key = (TwoFactorType::Webauthn as i32, r#"[{"id":1,"name":"Key"}]"#);
+        let no_key = (TwoFactorType::Webauthn as i32, "[]");
+        let duo = (TwoFactorType::Duo as i32, "");
+        let yubikey = (TwoFactorType::YubiKey as i32, "");
+        let remembered = (TwoFactorType::Remember as i32, "");
+        assert_eq!(nudge_for([]), Some(Nudge::SetUp));
+        // A remembered device or a security key method without a key isn't
+        // a second step.
+        assert_eq!(nudge_for([remembered, no_key]), Some(Nudge::SetUp));
+        assert_eq!(nudge_for([email]), Some(Nudge::Stronger));
+        assert_eq!(nudge_for([email, no_key, remembered]), Some(Nudge::Stronger));
+        for stronger in [app, key, duo, yubikey] {
+            assert_eq!(nudge_for([email, stronger]), None, "{stronger:?}");
+            assert_eq!(nudge_for([stronger, email]), None, "{stronger:?}");
+            assert_eq!(nudge_for([stronger]), None, "{stronger:?}");
+        }
+    }
+
+    #[test]
+    fn show_stays_the_first_nudge_for_clients_from_before_the_second() {
+        assert_eq!(nudge_json(Some(Nudge::SetUp)), json!({ "show": true, "nudge": "setUp" }));
+        // Clients that read only `show` know only the first nudge's words, so
+        // someone with email codes isn't told their password is all they have.
+        assert_eq!(nudge_json(Some(Nudge::Stronger)), json!({ "show": false, "nudge": "stronger" }));
+        assert_eq!(nudge_json(None), json!({ "show": false, "nudge": null }));
     }
 
     #[test]
@@ -1561,27 +1651,105 @@ mod tests {
         assert!(RevokedUntilAccepted::is(&held.uuid, &conn).await);
     }
 
+    async fn email_codes(user: &User, conn: &DbConn) {
+        TwoFactor::new(user.uuid.clone(), TwoFactorType::Email, String::new()).save(conn).await.unwrap();
+    }
+
+    async fn authenticator(user: &User, conn: &DbConn) {
+        TwoFactor::new(user.uuid.clone(), TwoFactorType::Authenticator, String::new()).save(conn).await.unwrap();
+    }
+
     #[rocket::async_test]
     async fn the_nudge_is_for_someone_with_no_two_step_login_whom_no_rule_covers() {
         let conn = crate::db::DbPool::for_test().await;
         let ana = person("ana", &conn).await;
-        assert!(nudge_shows(&ana.uuid, &conn).await.unwrap());
+        assert_eq!(nudge_of(&ana.uuid, &conn).await.unwrap(), Some(Nudge::SetUp));
         // Not now hides it.
         TwoStepNudgeDismissal::dismiss(&ana.uuid, &conn).await.unwrap();
         assert!(TwoStepNudgeDismissal::hidden(&ana.uuid, &conn).await);
-        assert!(!nudge_shows(&ana.uuid, &conn).await.unwrap());
+        assert_eq!(nudge_of(&ana.uuid, &conn).await.unwrap(), None);
 
-        // Any method at all ends it, email codes included.
+        // Someone with an authenticator app isn't nudged.
         let ben = person("ben", &conn).await;
-        TwoFactor::new(ben.uuid.clone(), TwoFactorType::Email, String::new()).save(&conn).await.unwrap();
-        assert!(!nudge_shows(&ben.uuid, &conn).await.unwrap());
+        authenticator(&ben, &conn).await;
+        assert_eq!(nudge_of(&ben.uuid, &conn).await.unwrap(), None);
 
         // Someone a rule covers gets a setup session instead.
         let cy = person("cy", &conn).await;
         let org = organization("Acme Dental", &conn).await;
         join(&cy, &org, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
-        assert!(nudge_shows(&cy.uuid, &conn).await.unwrap());
+        assert_eq!(nudge_of(&cy.uuid, &conn).await.unwrap(), Some(Nudge::SetUp));
         OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Everyone, &conn).await.unwrap();
-        assert!(!nudge_shows(&cy.uuid, &conn).await.unwrap());
+        assert_eq!(nudge_of(&cy.uuid, &conn).await.unwrap(), None);
+    }
+
+    #[rocket::async_test]
+    async fn email_codes_alone_get_the_nudge_to_a_stronger_method_until_one_is_set_up() {
+        let conn = crate::db::DbPool::for_test().await;
+        let dee = person("dee", &conn).await;
+        email_codes(&dee, &conn).await;
+        assert_eq!(nudge_of(&dee.uuid, &conn).await.unwrap(), Some(Nudge::Stronger));
+        // An authenticator app beside the email codes ends it.
+        authenticator(&dee, &conn).await;
+        assert_eq!(nudge_of(&dee.uuid, &conn).await.unwrap(), None);
+
+        // So does a security key, but not a security key method left with
+        // no key.
+        let eli = person("eli", &conn).await;
+        email_codes(&eli, &conn).await;
+        TwoFactor::new(eli.uuid.clone(), TwoFactorType::Webauthn, "[]".to_owned()).save(&conn).await.unwrap();
+        assert_eq!(nudge_of(&eli.uuid, &conn).await.unwrap(), Some(Nudge::Stronger));
+        TwoFactor::new(eli.uuid.clone(), TwoFactorType::Webauthn, r#"[{"id":1,"name":"Key"}]"#.to_owned())
+            .save(&conn)
+            .await
+            .unwrap();
+        assert_eq!(nudge_of(&eli.uuid, &conn).await.unwrap(), None);
+
+        // One dismissal for both: Not now to the first, then email codes,
+        // and the second stays hidden for the rest of the 90 days.
+        let fay = person("fay", &conn).await;
+        assert_eq!(nudge_of(&fay.uuid, &conn).await.unwrap(), Some(Nudge::SetUp));
+        TwoStepNudgeDismissal::dismiss(&fay.uuid, &conn).await.unwrap();
+        email_codes(&fay, &conn).await;
+        assert_eq!(nudge_of(&fay.uuid, &conn).await.unwrap(), None);
+        // And Not now to the second hides it.
+        let gus = person("gus", &conn).await;
+        email_codes(&gus, &conn).await;
+        TwoStepNudgeDismissal::dismiss(&gus.uuid, &conn).await.unwrap();
+        assert_eq!(nudge_of(&gus.uuid, &conn).await.unwrap(), None);
+    }
+
+    #[rocket::async_test]
+    async fn nobody_a_rule_covers_gets_the_nudge_to_a_stronger_method() {
+        let conn = crate::db::DbPool::for_test().await;
+        let org = organization("Acme Dental", &conn).await;
+        let owner = person("owner", &conn).await;
+        join(&owner, &org, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        let member = person("member", &conn).await;
+        join(&member, &org, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        for user in [&owner, &member] {
+            email_codes(user, &conn).await;
+            assert_eq!(nudge_of(&user.uuid, &conn).await.unwrap(), Some(Nudge::Stronger), "{}", user.email);
+        }
+        // Two-step login for admins covers the owner, not the member.
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Admins, &conn).await.unwrap();
+        assert_eq!(nudge_of(&owner.uuid, &conn).await.unwrap(), None);
+        assert_eq!(nudge_of(&member.uuid, &conn).await.unwrap(), Some(Nudge::Stronger));
+        // For everyone, the member too.
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Everyone, &conn).await.unwrap();
+        assert_eq!(nudge_of(&member.uuid, &conn).await.unwrap(), None);
+
+        // An MSP requires it of its staff, unless it turns that off.
+        let tech = person("tech", &conn).await;
+        email_codes(&tech, &conn).await;
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(&conn).await.unwrap();
+        MspStaff::new(msp.uuid.clone(), tech.uuid.clone(), crate::db::models::MspRole::Technician)
+            .insert(&conn)
+            .await
+            .unwrap();
+        assert_eq!(nudge_of(&tech.uuid, &conn).await.unwrap(), None);
+        MspStaffTwoStep::set(&msp.uuid, false, &conn).await.unwrap();
+        assert_eq!(nudge_of(&tech.uuid, &conn).await.unwrap(), Some(Nudge::Stronger));
     }
 }
