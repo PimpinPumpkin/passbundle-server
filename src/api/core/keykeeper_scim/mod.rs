@@ -803,7 +803,10 @@ async fn invite(caller: &ScimCaller, email: &str, conn: &DbConn) -> Result<Membe
     JoinSeal::set(&org.uuid, email, SealKind::Invite, None, conn).await?;
     if CONFIG.mail_enabled() {
         let hours = invite_hours(&org.uuid, conn).await;
-        if let Err(e) = mail::send_invite(&user, org.uuid.clone(), member.uuid.clone(), &org.name, None, hours).await {
+        let member_health = crate::db::models::OrgMemberHealth::enabled(&org.uuid, conn).await?;
+        if let Err(e) =
+            mail::send_invite(&user, org.uuid.clone(), member.uuid.clone(), &org.name, None, hours, member_health).await
+        {
             error!("Couldn't send a provisioning invitation: {e:?}");
             if created.is_some() {
                 user.delete(conn).await?;

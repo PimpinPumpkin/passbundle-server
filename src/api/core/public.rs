@@ -159,12 +159,21 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                     .await?;
             }
 
-            // Keykeeper: the organization's invitation lifetime.
+            // Keykeeper: the organization's invitation lifetime, and whether
+            // its admins see members' own passwords' numbers.
             let hours = invite_hours(&org_id, &conn).await;
+            let member_health = crate::db::models::OrgMemberHealth::enabled(&org_id, &conn).await?;
             if CONFIG.mail_enabled()
-                && let Err(e) =
-                    mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email), hours)
-                        .await
+                && let Err(e) = mail::send_invite(
+                    &user,
+                    org_id.clone(),
+                    new_member.uuid.clone(),
+                    &org_name,
+                    Some(org_email),
+                    hours,
+                    member_health,
+                )
+                .await
             {
                 // Upon error delete the user, invite and org member records when needed
                 if user_created {

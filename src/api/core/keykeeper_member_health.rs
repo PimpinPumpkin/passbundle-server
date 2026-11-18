@@ -11,6 +11,11 @@
 // does; the server keeps a report only then, and deletes the numbers once no
 // organization sees them (the last one turns it off, or the member leaves it,
 // is removed, or is revoked there; MemberHealth::forget_unless_seen).
+//
+// An MSP's staff see the same numbers for the clients they manage, in the MSP
+// console (`msp_member_health`): only clients they reach where they're a
+// confirmed owner or admin, as the client's own owners and admins are, and
+// never the numbers of the MSP's own people in a client.
 
 use std::{collections::HashMap, net::IpAddr};
 
@@ -24,15 +29,15 @@ use crate::{
     db::{
         DbConn,
         models::{
-            EventType, MemberHealth, Membership, MembershipStatus, MembershipType, Msp, MspClient, OrgMemberHealth,
-            Organization, OrganizationId, OwnCounts, UserId, msp_memberships_among,
+            EventType, MemberHealth, Membership, MembershipStatus, MembershipType, Msp, MspClient, MspId,
+            OrgMemberHealth, Organization, OrganizationId, OwnCounts, UserId, msp_memberships_among,
         },
     },
     util::format_date,
 };
 
 pub fn routes() -> Vec<Route> {
-    routes![put_own_health, own_health_seen_by, member_health, get_setting, put_setting]
+    routes![put_own_health, own_health_seen_by, member_health, msp_member_health, get_setting, put_setting]
 }
 
 /// The report as an app sends it: whole numbers, `exposed` left out (or
@@ -116,40 +121,29 @@ async fn own_health_seen_by(headers: Headers, conn: DbConn) -> JsonResult {
     Ok(Json(json!({ "object": "list", "data": data, "continuationToken": null })))
 }
 
-/// Whether the caller is a confirmed owner or admin.
-async fn owner_or_admin(org_id: &OrganizationId, headers: &Headers, conn: &DbConn) -> bool {
-    Membership::find_by_user_and_org(&headers.user.uuid, org_id, conn).await.is_some_and(|m| {
+/// Whether someone is a confirmed owner or admin of the organization.
+async fn owner_or_admin(org_id: &OrganizationId, user: &UserId, conn: &DbConn) -> bool {
+    Membership::find_by_user_and_org(user, org_id, conn).await.is_some_and(|m| {
         m.status == MembershipStatus::Confirmed as i32
             && (m.atype == MembershipType::Owner as i32 || m.atype == MembershipType::Admin as i32)
     })
 }
 
-/// For an organization's owners and admins: each confirmed member's numbers,
-/// by membership id, or none reported yet. An MSP's people in a client are
-/// left out. Anyone else gets "not found", whether the organization exists
-/// or not: upstream's web vault signs out on 403. With "Members' own
-/// passwords" off, it answers as if there were nobody to list (`on: false`),
-/// never a member's numbers, which another organization may still see: the
-/// page can then say the setting is off and where to turn it on, which a 404
-/// couldn't tell apart from someone who isn't an owner or admin.
-#[get("/keykeeper/organizations/<org_id>/member-health")]
-async fn member_health(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
-    if !owner_or_admin(&org_id, &headers, &conn).await {
-        err_code!("Organization not found", Status::NotFound.code)
-    }
-    if !OrgMemberHealth::enabled(&org_id, &conn).await? {
-        return Ok(Json(json!({ "object": "list", "data": [], "on": false, "continuationToken": null })));
-    }
-    let confirmed = Membership::find_confirmed_by_org(&org_id, &conn).await;
-    let from_msp = msp_memberships_among(confirmed.iter().map(|m| m.uuid.clone()).collect(), &conn).await?;
+/// Each confirmed member's numbers, by membership id, or none reported yet,
+/// as the organization's owners and admins see them. An MSP's people in a
+/// client are left out: a client never sees its MSP's people's numbers, and
+/// the MSP console doesn't count them as the client's.
+async fn member_rows(org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Vec<Value>> {
+    let confirmed = Membership::find_confirmed_by_org(org_id, conn).await;
+    let from_msp = msp_memberships_among(confirmed.iter().map(|m| m.uuid.clone()).collect(), conn).await?;
     let members: Vec<Membership> = confirmed.into_iter().filter(|m| !from_msp.contains(&m.uuid)).collect();
     let reported: HashMap<_, _> =
-        MemberHealth::find_by_users(members.iter().map(|m| m.user_uuid.clone()).collect(), &conn)
+        MemberHealth::find_by_users(members.iter().map(|m| m.user_uuid.clone()).collect(), conn)
             .await?
             .into_iter()
             .map(|row| (row.user_uuid.clone(), row))
             .collect();
-    let data: Vec<Value> = members
+    Ok(members
         .iter()
         .map(|m| {
             let mut row = reported.get(&m.user_uuid).map_or_else(
@@ -164,8 +158,77 @@ async fn member_health(org_id: OrganizationId, headers: Headers, conn: DbConn) -
             row["memberId"] = json!(m.uuid);
             row
         })
-        .collect();
+        .collect())
+}
+
+/// For an organization's owners and admins: each confirmed member's numbers,
+/// by membership id, or none reported yet. An MSP's people in a client are
+/// left out. Anyone else gets "not found", whether the organization exists
+/// or not: upstream's web vault signs out on 403. With "Members' own
+/// passwords" off, it answers as if there were nobody to list (`on: false`),
+/// never a member's numbers, which another organization may still see: the
+/// page can then say the setting is off and where to turn it on, which a 404
+/// couldn't tell apart from someone who isn't an owner or admin.
+#[get("/keykeeper/organizations/<org_id>/member-health")]
+async fn member_health(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+    if !owner_or_admin(&org_id, &headers.user.uuid, &conn).await {
+        err_code!("Organization not found", Status::NotFound.code)
+    }
+    if !OrgMemberHealth::enabled(&org_id, &conn).await? {
+        return Ok(Json(json!({ "object": "list", "data": [], "on": false, "continuationToken": null })));
+    }
+    let data = member_rows(&org_id, &conn).await?;
     Ok(Json(json!({ "object": "list", "data": data, "on": true, "continuationToken": null })))
+}
+
+/// The clients of an MSP whose members' numbers one of its staff sees in the
+/// MSP console: those they reach (a technician limited to chosen clients
+/// reaches only those) where they're a confirmed owner or admin, as the
+/// client's own owners and admins are. So a technician with a custom role
+/// there, one waiting to be confirmed, and one the client revoked or removed
+/// see nothing of it. Anyone who isn't the MSP's staff gets "not found", as
+/// for the rest of the MSP's API, whether the MSP exists or not.
+async fn msp_clients_seen(msp_id: &MspId, user: &UserId, conn: &DbConn) -> ApiResult<Vec<OrganizationId>> {
+    let staff = super::keykeeper_msp::staff_member(msp_id, user, conn).await?;
+    let reach = staff.reach(conn).await;
+    let mut seen = Vec::new();
+    for client in MspClient::find_by_msp(msp_id, conn).await {
+        if reach.as_ref().is_some_and(|r| !r.contains(&client.org_uuid)) {
+            continue;
+        }
+        if owner_or_admin(&client.org_uuid, user, conn).await {
+            seen.push(client.org_uuid);
+        }
+    }
+    Ok(seen)
+}
+
+/// One client in the MSP console: whether it has "Members' own passwords"
+/// on, and, only then, each of its own confirmed members' numbers. With it
+/// off, nobody's: another organization may still see someone's numbers, and
+/// this one doesn't.
+async fn msp_client_view(org_id: &OrganizationId, conn: &DbConn) -> ApiResult<Value> {
+    let on = OrgMemberHealth::enabled(org_id, conn).await?;
+    let members = if on {
+        member_rows(org_id, conn).await?
+    } else {
+        Vec::new()
+    };
+    Ok(json!({ "organizationId": org_id, "on": on, "members": members }))
+}
+
+/// For an MSP's console: each client the caller manages (`msp_clients_seen`),
+/// with its members' numbers as its own owners and admins see them, by
+/// membership id; the console names them from the client's member list and
+/// adds them up for the clients list. Never which items, and never the
+/// numbers of the MSP's own people in a client.
+#[get("/keykeeper/msp/<msp_id>/member-health")]
+async fn msp_member_health(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
+    let mut data = Vec::new();
+    for org_id in msp_clients_seen(&msp_id, &headers.user.uuid, &conn).await? {
+        data.push(msp_client_view(&org_id, &conn).await?);
+    }
+    Ok(Json(json!({ "object": "list", "data": data, "continuationToken": null })))
 }
 
 /// Turns an organization's "Members' own passwords" on or off, if that's a
@@ -273,9 +336,11 @@ async fn put_setting(org_id: OrganizationId, headers: Headers, data: Json<Settin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
     use crate::db::{
         DbPool,
-        models::{MspMembership, User},
+        models::{MspMembership, MspRole, MspStaff, TechnicianAccess, User},
     };
 
     #[test]
@@ -465,5 +530,185 @@ mod tests {
         assert!(kept(&ben, &conn).await);
         contoso.delete(&conn).await.unwrap();
         assert!(!kept(&ben, &conn).await);
+    }
+
+    /// A client of the MSP, as keykeeper_offboarding's tests make one:
+    /// MspClient::new seals an install token with the server's keys, which
+    /// tests don't load.
+    async fn msp_client(name: &str, msp: &Msp, conn: &DbConn) -> Organization {
+        let org = organization(name, conn).await;
+        MspClient {
+            org_uuid: org.uuid.clone(),
+            msp_uuid: msp.uuid.clone(),
+            created_at: chrono::Utc::now().naive_utc(),
+            preset: None,
+            enrollment_token: None,
+            enrollment_token_created_at: None,
+            everyone_collection: None,
+            templates_collection: None,
+            enrollment_secret: None,
+            enrollment_token_hash: None,
+            client_seal: None,
+        }
+        .insert(conn)
+        .await
+        .unwrap();
+        org
+    }
+
+    /// Someone on an MSP's staff, reaching every client.
+    async fn staff(name: &str, msp: &Msp, role: MspRole, conn: &DbConn) -> User {
+        let user = person(name, conn).await;
+        MspStaff::new(msp.uuid.clone(), user.uuid.clone(), role).insert(conn).await.unwrap();
+        user
+    }
+
+    /// A membership the MSP made, as its people get in its clients.
+    async fn through(
+        msp: &Msp,
+        user: &User,
+        org: &Organization,
+        atype: MembershipType,
+        status: MembershipStatus,
+        conn: &DbConn,
+    ) -> Membership {
+        let member = join(user, org, atype, status, conn).await;
+        MspMembership::new(member.uuid.clone(), msp.uuid.clone()).insert(conn).await.unwrap();
+        member
+    }
+
+    /// The clients whose members' numbers someone sees in the MSP console,
+    /// or why not.
+    async fn seen_in_console(msp: &Msp, user: &User, conn: &DbConn) -> Result<HashSet<OrganizationId>, String> {
+        msp_clients_seen(&msp.uuid, &user.uuid, conn)
+            .await
+            .map(|orgs| orgs.into_iter().collect())
+            .map_err(|e| e.message().to_owned())
+    }
+
+    fn set(orgs: &[&Organization]) -> Result<HashSet<OrganizationId>, String> {
+        Ok(orgs.iter().map(|o| o.uuid.clone()).collect())
+    }
+
+    #[rocket::async_test]
+    async fn only_the_msps_staff_who_manage_a_client_see_its_members_numbers_in_the_console() {
+        let conn = DbPool::for_test().await;
+        let northwind = Msp::new("Northwind IT".to_owned());
+        northwind.insert(&conn).await.unwrap();
+        let litware = Msp::new("Litware IT".to_owned());
+        litware.insert(&conn).await.unwrap();
+        let contoso = msp_client("Contoso", &northwind, &conn).await;
+        let fabrikam = msp_client("Fabrikam", &northwind, &conn).await;
+        let elsewhere = msp_client("Woodgrove", &litware, &conn).await;
+
+        // An MSP admin, an owner of each client: both.
+        let admin = staff("admin", &northwind, MspRole::Admin, &conn).await;
+        for org in [&contoso, &fabrikam] {
+            through(&northwind, &admin, org, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        }
+        assert_eq!(seen_in_console(&northwind, &admin, &conn).await, set(&[&contoso, &fabrikam]));
+
+        // A technician assigned only to Fabrikam: not Contoso, even as an
+        // admin there that Contoso made itself.
+        let tech = staff("tech", &northwind, MspRole::Technician, &conn).await;
+        let mut record = MspStaff::find(&northwind.uuid, &tech.uuid, &conn).await.unwrap();
+        let only_fabrikam = TechnicianAccess {
+            all_clients: false,
+            clients: vec![fabrikam.uuid.clone()],
+            ..TechnicianAccess::default()
+        };
+        record.set_access(&only_fabrikam, &conn).await.unwrap();
+        through(&northwind, &tech, &fabrikam, MembershipType::Admin, MembershipStatus::Confirmed, &conn).await;
+        join(&tech, &contoso, MembershipType::Admin, MembershipStatus::Confirmed, &conn).await;
+        assert_eq!(seen_in_console(&northwind, &tech, &conn).await, set(&[&fabrikam]));
+
+        // Staff whose place in Contoso isn't an owner's or admin's, confirmed:
+        // waiting for the key, a custom role, or revoked by the client.
+        for (name, atype, status) in [
+            ("waiting", MembershipType::Admin, MembershipStatus::Accepted),
+            ("custom", MembershipType::User, MembershipStatus::Confirmed),
+            ("revoked", MembershipType::Admin, MembershipStatus::Revoked),
+        ] {
+            let who = staff(name, &northwind, MspRole::Technician, &conn).await;
+            through(&northwind, &who, &contoso, atype, status, &conn).await;
+            assert_eq!(seen_in_console(&northwind, &who, &conn).await, set(&[]), "{name}");
+        }
+        // Nor a client they were never added to.
+        let new_tech = staff("new", &northwind, MspRole::Technician, &conn).await;
+        assert_eq!(seen_in_console(&northwind, &new_tech, &conn).await, set(&[]));
+
+        // Another MSP's staff, even an owner of Contoso; Contoso's own admin;
+        // and an MSP that doesn't exist: "not found", as the MSP's API answers.
+        let other = staff("other", &litware, MspRole::Admin, &conn).await;
+        join(&other, &contoso, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        through(&litware, &other, &elsewhere, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        assert_eq!(seen_in_console(&northwind, &other, &conn).await, Err("MSP not found".to_owned()));
+        assert_eq!(seen_in_console(&litware, &other, &conn).await, set(&[&elsewhere]));
+        let own_admin = person("own-admin", &conn).await;
+        join(&own_admin, &contoso, MembershipType::Admin, MembershipStatus::Confirmed, &conn).await;
+        assert_eq!(seen_in_console(&northwind, &own_admin, &conn).await, Err("MSP not found".to_owned()));
+        let nowhere = Msp::new("Nowhere".to_owned());
+        assert_eq!(seen_in_console(&nowhere, &admin, &conn).await, Err("MSP not found".to_owned()));
+    }
+
+    #[rocket::async_test]
+    async fn the_console_shows_a_clients_own_members_numbers_only_while_it_has_it_on() {
+        let conn = DbPool::for_test().await;
+        let northwind = Msp::new("Northwind IT".to_owned());
+        northwind.insert(&conn).await.unwrap();
+        let contoso = msp_client("Contoso", &northwind, &conn).await;
+        let admin = staff("admin", &northwind, MspRole::Admin, &conn).await;
+        through(&northwind, &admin, &contoso, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        let tech = staff("tech", &northwind, MspRole::Technician, &conn).await;
+        through(&northwind, &tech, &contoso, MembershipType::Admin, MembershipStatus::Confirmed, &conn).await;
+        let ana = person("ana", &conn).await;
+        let anas = join(&ana, &contoso, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        let ben = person("ben", &conn).await;
+        let bens = join(&ben, &contoso, MembershipType::Admin, MembershipStatus::Confirmed, &conn).await;
+        let invited = person("invited", &conn).await;
+        join(&invited, &contoso, MembershipType::User, MembershipStatus::Invited, &conn).await;
+
+        // Off (a client added without the defaults): it says so, and lists nobody.
+        let off = msp_client_view(&contoso.uuid, &conn).await.unwrap();
+        assert_eq!(off, json!({ "organizationId": contoso.uuid, "on": false, "members": [] }));
+
+        turn(&contoso, true, &admin, &conn).await;
+        MemberHealth::report(&ana.uuid, counts(4, 1, 2, Some(1)), &conn).await.unwrap();
+        // The MSP's own people have numbers too, which the console never counts as the client's.
+        for who in [&admin, &tech] {
+            MemberHealth::report(&who.uuid, counts(9, 9, 9, Some(9)), &conn).await.unwrap();
+        }
+        let on = msp_client_view(&contoso.uuid, &conn).await.unwrap();
+        assert_eq!(on["on"], true);
+        let rows = on["members"].as_array().unwrap();
+        let ids: HashSet<&str> = rows.iter().map(|r| r["memberId"].as_str().unwrap()).collect();
+        assert_eq!(ids, HashSet::from([anas.uuid.as_str(), bens.uuid.as_str()]));
+        let anas_row = rows.iter().find(|r| r["memberId"] == json!(anas.uuid)).unwrap();
+        assert_eq!(
+            (&anas_row["logins"], &anas_row["weak"], &anas_row["reused"], &anas_row["exposed"]),
+            (&json!(4), &json!(1), &json!(2), &json!(1))
+        );
+        let bens_row = rows.iter().find(|r| r["memberId"] == json!(bens.uuid)).unwrap();
+        assert!(bens_row["reportedAt"].is_null() && bens_row["logins"].is_null(), "{bens_row}");
+        // Numbers and when, by membership id: nothing that names an item or a person.
+        for row in rows {
+            let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["exposed", "exposedCheckedAt", "logins", "memberId", "reportedAt", "reused", "weak"],
+                "{row}"
+            );
+        }
+
+        // Off again: nobody's numbers, though Ana's stay for another
+        // organization that still sees them.
+        let fabrikam = organization("Fabrikam", &conn).await;
+        join(&ana, &fabrikam, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        turn(&fabrikam, true, &ana, &conn).await;
+        turn(&contoso, false, &admin, &conn).await;
+        assert!(kept(&ana, &conn).await);
+        let off = msp_client_view(&contoso.uuid, &conn).await.unwrap();
+        assert_eq!(off, json!({ "organizationId": contoso.uuid, "on": false, "members": [] }));
     }
 }

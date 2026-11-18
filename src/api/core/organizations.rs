@@ -1245,8 +1245,10 @@ async fn send_invite(
                 new_member.uuid.clone(),
                 &org_name,
                 Some(headers.user.email.clone()),
-                // Keykeeper: the organization's invitation lifetime.
+                // Keykeeper: the organization's invitation lifetime, and
+                // whether its admins see members' own passwords' numbers.
                 invite_hours(&org_id, &conn).await,
+                crate::db::models::OrgMemberHealth::enabled(&org_id, &conn).await?,
             )
             .await
             {
@@ -1409,10 +1411,20 @@ async fn reinvite_member_impl(
     };
 
     if CONFIG.mail_enabled() {
-        // Keykeeper: the organization's invitation lifetime.
+        // Keykeeper: the organization's invitation lifetime, and whether its
+        // admins see members' own passwords' numbers.
         let hours = invite_hours(org_id, conn).await;
-        mail::send_invite(&user, org_id.clone(), member.uuid, &org_name, Some(invited_by_email.to_owned()), hours)
-            .await?;
+        let member_health = crate::db::models::OrgMemberHealth::enabled(org_id, conn).await?;
+        mail::send_invite(
+            &user,
+            org_id.clone(),
+            member.uuid,
+            &org_name,
+            Some(invited_by_email.to_owned()),
+            hours,
+            member_health,
+        )
+        .await?;
     } else if user.password_hash.is_empty() {
         let invitation = Invitation::new(&user.email);
         invitation.save(conn).await?;
