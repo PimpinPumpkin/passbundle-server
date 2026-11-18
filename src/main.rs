@@ -643,6 +643,16 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .attach(util::AppHeaders())
         .attach(util::Cors())
         .attach(util::BetterLogging::new(extra_debug, basepath))
+        // Keykeeper: on a normal shutdown (the signal handlers below), event
+        // streaming stops sending and gives back its leases, so a restarted
+        // server sends at once.
+        .attach(rocket::fairing::AdHoc::on_shutdown("Event streaming", |rocket| {
+            Box::pin(async move {
+                if let Some(pool) = rocket.state::<db::DbPool>() {
+                    keykeeper_streaming::shutdown(pool).await;
+                }
+            })
+        }))
         .ignite()
         .await?;
 
