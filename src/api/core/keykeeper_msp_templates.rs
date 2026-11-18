@@ -311,7 +311,21 @@ async fn record_copies(
     if let (Some(org), Some(name)) = (&only, &name) {
         audit = audit.org(org, name);
     }
-    audit.record(&msp_id, &conn).await
+    audit.record(&msp_id, &conn).await?;
+    // Keykeeper: and each client's share, for its own view of its MSP's
+    // actions (keykeeper_msp_activity.rs).
+    for copy in &copies {
+        let name = crate::db::models::Organization::find_by_uuid(&copy.organization_id, &conn)
+            .await
+            .map(|o| o.name)
+            .unwrap_or_default();
+        Audit::by("client_template_sent", &headers)
+            .org(&copy.organization_id, &name)
+            .detail(template_id)
+            .record(&msp_id, &conn)
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]

@@ -85,6 +85,9 @@ pub use self::keykeeper_msp::{
     MspPolicy, MspRequiredHadOwn, MspRole, MspStaff, MspTemplate, MspTemplateCopy, TechnicianAccess, email_in_domains,
     exempt_from_member_policies, exempt_from_two_step_policy, parse_enrollment_domains,
 };
+// Keykeeper: for tests that each client-only entry is one a client sees.
+#[cfg(test)]
+pub use self::keykeeper_msp::CLIENT_ONLY_EVENTS;
 pub use self::keykeeper_msp_seats::ClientSeats;
 pub use self::keykeeper_new_device::{KnownDeviceToken, NewDeviceCheck};
 pub use self::keykeeper_offboarding::RemovedMember;

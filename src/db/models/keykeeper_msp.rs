@@ -799,6 +799,24 @@ impl MspMembership {
         .await
     }
 
+    /// Whether a membership came from an MSP, where a database error is an
+    /// error rather than "no": for checks that let the client's own people
+    /// see something the MSP's people mustn't.
+    pub async fn try_is_msp_membership(
+        membership_uuid: &MembershipId,
+        conn: &DbConn,
+    ) -> Result<bool, crate::error::Error> {
+        conn.run(move |conn| {
+            msp_memberships::table
+                .filter(msp_memberships::membership_uuid.eq(membership_uuid))
+                .count()
+                .get_result::<i64>(conn)
+                .map(|n| n > 0)
+                .map_res("Error loading an MSP membership")
+        })
+        .await
+    }
+
     pub async fn find_by_msp(msp_uuid: &MspId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             msp_memberships::table.filter(msp_memberships::msp_uuid.eq(msp_uuid)).load::<Self>(conn).unwrap_or_default()
@@ -987,6 +1005,26 @@ impl MspEnrollmentJoin {
     }
 }
 
+/// Entries written for one client's own view of what its MSP did there, and
+/// nowhere else (DESIGN.md, "The client sees its MSP's actions"). Each one is
+/// a client's share of an MSP-wide change that already has its own entry
+/// (someone added to the staff, a default changed, a template sent to
+/// several clients), so the MSP's Activity and its event destinations leave
+/// them out rather than show the same change once per client.
+pub const CLIENT_ONLY_EVENTS: &[&str] = &[
+    "client_staff_added",
+    "client_staff_role_changed",
+    "client_staff_removed",
+    "client_policy_pushed",
+    "client_policy_required",
+    "client_template_sent",
+];
+
+/// Whether an entry is only for the client's own view (CLIENT_ONLY_EVENTS).
+fn is_client_only_event(event: &str) -> bool {
+    CLIENT_ONLY_EVENTS.contains(&event)
+}
+
 /// One entry in an MSP's audit log.
 #[derive(Identifiable, Queryable, Insertable)]
 #[diesel(table_name = msp_events)]
@@ -1032,8 +1070,11 @@ impl MspEvent {
             })
             .await;
         inserted?;
-        // And to the MSP's security tools, if it sends its events to any.
-        super::keykeeper_event_streaming::stream_msp(self, conn).await;
+        // And to the MSP's security tools, if it sends its events to any,
+        // which get the MSP-wide entry rather than each client's share of it.
+        if !is_client_only_event(&self.event) {
+            super::keykeeper_event_streaming::stream_msp(self, conn).await;
+        }
         Ok(())
     }
 
@@ -1065,7 +1106,8 @@ impl MspEvent {
 
     /// The newest events first, older than `before` if given. With `only`,
     /// just the MSP-wide events and those about the clients listed; never
-    /// those about the clients in `except`.
+    /// those about the clients in `except`. Never the entries written only
+    /// for a client's own view (CLIENT_ONLY_EVENTS).
     pub async fn find_by_msp(
         msp_uuid: &MspId,
         before: Option<NaiveDateTime>,
@@ -1075,7 +1117,10 @@ impl MspEvent {
         conn: &DbConn,
     ) -> Vec<Self> {
         conn.run(move |conn| {
-            let mut query = msp_events::table.filter(msp_events::msp_uuid.eq(msp_uuid)).into_boxed();
+            let mut query = msp_events::table
+                .filter(msp_events::msp_uuid.eq(msp_uuid))
+                .filter(msp_events::event.ne_all(CLIENT_ONLY_EVENTS))
+                .into_boxed();
             if let Some(before) = before {
                 query = query.filter(msp_events::created_at.lt(before));
             }
@@ -1084,6 +1129,32 @@ impl MspEvent {
             }
             if !except.is_empty() {
                 query = query.filter(msp_events::org_uuid.is_null().or(msp_events::org_uuid.ne_all(except)));
+            }
+            query.order(msp_events::created_at.desc()).limit(limit).load::<Self>(conn).unwrap_or_default()
+        })
+        .await
+    }
+
+    /// One client's entries of the kinds listed, newest first, older than
+    /// `before` if given: only those about that organization, never the
+    /// MSP-wide ones or another client's.
+    pub async fn find_by_client(
+        msp_uuid: &MspId,
+        org_uuid: &OrganizationId,
+        kinds: &[&str],
+        before: Option<NaiveDateTime>,
+        limit: i64,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        let kinds: Vec<String> = kinds.iter().map(|k| (*k).to_owned()).collect();
+        conn.run(move |conn| {
+            let mut query = msp_events::table
+                .filter(msp_events::msp_uuid.eq(msp_uuid))
+                .filter(msp_events::org_uuid.eq(org_uuid))
+                .filter(msp_events::event.eq_any(kinds))
+                .into_boxed();
+            if let Some(before) = before {
+                query = query.filter(msp_events::created_at.lt(before));
             }
             query.order(msp_events::created_at.desc()).limit(limit).load::<Self>(conn).unwrap_or_default()
         })
