@@ -588,10 +588,14 @@ fn applying_row(
     }
 }
 
-/// The MSP an organization is a client of now, and the MSP's name.
+/// The MSP whose pool covers an organization now, and the MSP's name: the
+/// MSP it's a client of, unless it joined with a code, when it keeps its own
+/// plan until the owner decides who pays (DESIGN.md, "Plans and billing",
+/// decision 14).
 pub(super) fn covering_msp(conn: &mut DbConnInner, org: &OrganizationId) -> Query<Option<(MspId, String)>> {
     let msp = msp_clients::table
         .filter(msp_clients::org_uuid.eq(org))
+        .filter(msp_clients::joined_with_code.eq(false))
         .select(msp_clients::msp_uuid)
         .first::<MspId>(conn)
         .optional()?;
@@ -600,6 +604,16 @@ pub(super) fn covering_msp(conn: &mut DbConnInner, org: &OrganizationId) -> Quer
     };
     let name = msps::table.filter(msps::uuid.eq(&msp)).select(msps::name).first::<String>(conn)?;
     Ok(Some((msp, name)))
+}
+
+/// The MSP an organization is a client of now, whether or not its pool
+/// covers it: its staff are never the organization's seats.
+fn client_of(conn: &mut DbConnInner, org: &OrganizationId) -> Query<Option<MspId>> {
+    msp_clients::table
+        .filter(msp_clients::org_uuid.eq(org))
+        .select(msp_clients::msp_uuid)
+        .first::<MspId>(conn)
+        .optional()
 }
 
 /// A confirmed owner of the organization.
@@ -687,7 +701,8 @@ fn plan_now(
     let state = row.as_ref().map(|row| row.state_at(at, terms.grace_days));
     let gives = match (row.as_ref().and_then(Plan::name), whose) {
         (Some(name), PlanOwner::Organization(org)) => {
-            let seats = seats(conn, org, covered_by.as_ref().map(|(msp, _)| msp))?;
+            let staff_of = client_of(conn, org)?;
+            let seats = seats(conn, org, staff_of.as_ref())?;
             Some(name.gives(seats, terms))
         }
         (Some(name), _) => Some(name.gives(0, terms)),
@@ -1083,8 +1098,11 @@ pub async fn people_a_plan_reaches(whose: &PlanOwner, conn: &DbConn) -> ApiResul
                     .load::<UserId>(conn)?
                     .into_iter()
                     .collect();
+                // Keykeeper: the clients its pool covers, not those that
+                // joined with a code and keep their own plan.
                 let clients = msp_clients::table
                     .filter(msp_clients::msp_uuid.eq(msp))
+                    .filter(msp_clients::joined_with_code.eq(false))
                     .select(msp_clients::org_uuid)
                     .load::<OrganizationId>(conn)?;
                 for client in clients {
@@ -1523,6 +1541,7 @@ mod tests {
             enrollment_secret: None,
             enrollment_token_hash: None,
             client_seal: None,
+            joined_with_code: false,
         }
         .insert(conn)
         .await
@@ -2003,6 +2022,74 @@ mod tests {
         set(&whose, open(PlanName::Business), &conn).await;
         let plan = conn.run(|conn| plan_now(conn, &whose, None, noon(), &terms)).await.unwrap();
         assert_eq!(plan.storage_gb(&terms), Some(10));
+    }
+
+    /// Makes `org` a client of `msp` that joined with a code its owner
+    /// entered (DESIGN.md, "An organization that already uses PassBundle").
+    async fn joined_with_code(msp: &Msp, org: &Organization, conn: &DbConn) {
+        take_on(msp, org, conn).await;
+        conn.run(move |conn| {
+            diesel::update(msp_clients::table.filter(msp_clients::org_uuid.eq(&org.uuid)))
+                .set(msp_clients::joined_with_code.eq(true))
+                .execute(conn)
+        })
+        .await
+        .unwrap();
+    }
+
+    #[rocket::async_test]
+    async fn a_client_that_joined_with_a_code_keeps_its_own_plan() {
+        // Until the owner decides who pays (decision 14), joining an MSP with
+        // a code changes nothing about it: its own row applies, its owners
+        // manage it, the MSP's people aren't its seats, and a change to the
+        // pool doesn't reach its members.
+        let conn = DbPool::for_test().await;
+        let northwind = msp("Northwind IT", &conn).await;
+        let clinic = organization("Lakeside Clinic", &conn).await;
+        let owner = person("owner", &conn).await;
+        let member = person("member", &conn).await;
+        join(&owner, &clinic, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        join(&member, &clinic, MembershipType::User, MembershipStatus::Confirmed, &conn).await;
+        let admin = person("admin", &conn).await;
+        staff(&northwind, &admin, MspRole::Admin, &conn).await;
+        join(&admin, &clinic, MembershipType::Owner, MembershipStatus::Accepted, &conn).await;
+        joined_with_code(&northwind, &clinic, &conn).await;
+
+        let own = set(&of_org(&clinic), open(PlanName::Business), &conn).await;
+        // The pool has ended: it doesn't cover the clinic, so that's nothing to it.
+        set(&of_msp(&northwind), paid(PlanName::Msp, noon() - TimeDelta::days(400), false), &conn).await;
+        let gets = gets_at(&owner, noon(), &conn).await;
+        let plan = &gets.organizations[&clinic.uuid];
+        assert_eq!(plan.row.as_ref(), Some(&own));
+        assert_eq!(plan.state, Some(PlanState::Active));
+        assert_eq!(plan.covered_by, None);
+        assert!(plan.may_manage);
+        assert!(gets.premium_from_organization);
+        let whose = of_org(&clinic);
+        assert!(may_manage_plan(&owner.uuid, &whose, &conn).await.unwrap());
+        assert!(!may_manage_plan(&admin.uuid, &whose, &conn).await.unwrap());
+
+        // Its seats are its own people, without the MSP's.
+        let terms = Terms {
+            org_storage_gb_per_person: 2,
+            org_storage_min_gb: 1,
+            ..site_terms()
+        };
+        let plan = conn.run(|conn| plan_now(conn, &whose, None, noon(), &terms)).await.unwrap();
+        assert_eq!(plan.storage_gb(&terms), Some(4));
+
+        // A change to the pool reaches the MSP's staff, not the clinic's people.
+        let reached = people_a_plan_reaches(&of_msp(&northwind), &conn).await.unwrap();
+        assert!(reached.contains(&admin.uuid));
+        assert!(!reached.contains(&member.uuid) && !reached.contains(&owner.uuid));
+
+        // The same client made in the console is the pool's, as before.
+        let lake = organization("Lakeside Two", &conn).await;
+        join(&owner, &lake, MembershipType::Owner, MembershipStatus::Confirmed, &conn).await;
+        take_on(&northwind, &lake, &conn).await;
+        let gets = gets_at(&owner, noon(), &conn).await;
+        assert_eq!(gets.organizations[&lake.uuid].covered_by.as_ref().map(|(id, _)| id), Some(&northwind.uuid));
+        assert_eq!(gets.organizations[&lake.uuid].state, Some(PlanState::Ended));
     }
 
     #[rocket::async_test]

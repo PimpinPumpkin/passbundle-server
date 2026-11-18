@@ -27,6 +27,10 @@ pub struct RemovedMember {
     pub msp_uuid: Option<MspId>,
     /// Revoked rather than removed: restoring them clears it.
     pub revoked: bool,
+    /// Taken out by removing their MSP as a whole, not removed or revoked by
+    /// the organization itself: joining an MSP with a code doesn't keep them
+    /// out (DESIGN.md, "Offboarding", "Taken out with the MSP").
+    pub with_msp: bool,
 }
 
 impl RemovedMember {
@@ -45,6 +49,7 @@ impl RemovedMember {
             removed_at: Utc::now().naive_utc(),
             msp_uuid: msp.cloned(),
             revoked,
+            with_msp: false,
         };
         conn.run(move |conn| {
             conn.transaction(|conn| {
@@ -55,6 +60,41 @@ impl RemovedMember {
                 )
                 .execute(conn)?;
                 diesel::insert_into(removed_members::table).values(&row).execute(conn)?;
+                Ok::<(), diesel::result::Error>(())
+            })
+            .map_res("Error recording a removal")
+        })
+        .await
+    }
+
+    /// Records that removing their MSP took this person out of the
+    /// organization, unless it already has a record of them: a removal or
+    /// revocation the organization made itself is never replaced by one that
+    /// came with the MSP.
+    pub async fn record_with_msp(
+        org_uuid: &OrganizationId,
+        user_uuid: &UserId,
+        msp: &MspId,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let row = Self {
+            org_uuid: org_uuid.clone(),
+            user_uuid: user_uuid.clone(),
+            removed_at: Utc::now().naive_utc(),
+            msp_uuid: Some(msp.clone()),
+            revoked: false,
+            with_msp: true,
+        };
+        conn.run(move |conn| {
+            conn.transaction(|conn| {
+                let known = removed_members::table
+                    .filter(removed_members::org_uuid.eq(&row.org_uuid))
+                    .filter(removed_members::user_uuid.eq(&row.user_uuid))
+                    .count()
+                    .get_result::<i64>(conn)?;
+                if known == 0 {
+                    diesel::insert_into(removed_members::table).values(&row).execute(conn)?;
+                }
                 Ok::<(), diesel::result::Error>(())
             })
             .map_res("Error recording a removal")

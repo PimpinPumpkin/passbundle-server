@@ -1578,6 +1578,12 @@ fn msp_code(action: &str) -> (i32, &'static str, &'static str) {
         "msp_created" => (9100, "Created the MSP", "low"),
         "client_created" => (9101, "Added a client", "low"),
         "client_removed_msp" => (9102, "A client stopped being managed by the MSP", "high"),
+        "link_code_created" => (9103, "Made a code for an organization to join the MSP", "medium"),
+        "link_code_revoked" => (9104, "Revoked a code for joining the MSP", "low"),
+        "link_code_used" => (9105, "An organization's owner used a code to join the MSP", "medium"),
+        "client_joined" => (9106, "An organization that already used PassBundle joined as a client", "medium"),
+        // Like a client removing its MSP: the MSP's people lose it at once.
+        "client_moved_away" => (9107, "A client moved to another MSP", "high"),
         "staff_invited" => (9110, "Invited someone to the MSP's staff", "medium"),
         "staff_added" => (9116, "Added someone to the MSP's staff", "medium"),
         "staff_invite_accepted" => (9111, "Joined the MSP's staff", "medium"),

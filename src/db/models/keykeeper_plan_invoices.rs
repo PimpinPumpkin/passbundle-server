@@ -87,8 +87,10 @@ impl OrgSeats {
 }
 
 /// The organizations the seats job reads each day: each with a Business plan
-/// of its own, and whether it's an MSP's client now, when its seats are the
-/// MSP's and its own reading is 0.
+/// of its own, and whether an MSP's pool covers it now, when its seats are the
+/// MSP's and its own reading is 0. A client that joined with a code keeps its
+/// own plan (DESIGN.md, "Plans and billing", decision 14), so it's read as its
+/// own.
 pub async fn business_orgs_of_their_own(conn: &DbConn) -> ApiResult<Vec<(OrganizationId, bool)>> {
     conn.run(move |conn| {
         let orgs = plans::table
@@ -96,8 +98,12 @@ pub async fn business_orgs_of_their_own(conn: &DbConn) -> ApiResult<Vec<(Organiz
             .filter(plans::org_uuid.is_not_null())
             .select(plans::org_uuid.assume_not_null())
             .load::<OrganizationId>(conn)?;
-        let clients: HashSet<OrganizationId> =
-            msp_clients::table.select(msp_clients::org_uuid).load::<OrganizationId>(conn)?.into_iter().collect();
+        let clients: HashSet<OrganizationId> = msp_clients::table
+            .filter(msp_clients::joined_with_code.eq(false))
+            .select(msp_clients::org_uuid)
+            .load::<OrganizationId>(conn)?
+            .into_iter()
+            .collect();
         Ok::<_, diesel::result::Error>(
             orgs.into_iter()
                 .map(|org| {

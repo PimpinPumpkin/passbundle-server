@@ -20,6 +20,7 @@ mod keykeeper_install_tokens;
 mod keykeeper_joining;
 mod keykeeper_member_health;
 mod keykeeper_msp;
+mod keykeeper_msp_link;
 pub mod keykeeper_msp_seats;
 mod keykeeper_new_device;
 mod keykeeper_offboarding;
@@ -88,6 +89,12 @@ pub use self::keykeeper_msp::{
 // Keykeeper: for tests that each client-only entry is one a client sees.
 #[cfg(test)]
 pub use self::keykeeper_msp::CLIENT_ONLY_EVENTS;
+// Keykeeper: an organization that already uses PassBundle joins an MSP
+// (`src/api/core/keykeeper_msp_link.rs`).
+pub use self::keykeeper_msp_link::{
+    MAX_OPEN_LINK_CODES, MspLinkCode, begin_write, commit as commit_write, find_link_code, rollback as rollback_write,
+    shown_link_code,
+};
 pub use self::keykeeper_msp_seats::ClientSeats;
 pub use self::keykeeper_new_device::{KnownDeviceToken, NewDeviceCheck};
 pub use self::keykeeper_offboarding::RemovedMember;

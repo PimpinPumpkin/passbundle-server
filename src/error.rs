@@ -173,6 +173,13 @@ impl Error {
         &self.message
     }
 
+    /// Keykeeper: the status a refusal answers with, for unit tests that a
+    /// refusal is "not found" or a plain 400, never 403.
+    #[cfg(test)]
+    pub const fn status_code(&self) -> u16 {
+        self.code
+    }
+
     #[must_use]
     pub fn silent(mut self) -> Self {
         self.silent = true;

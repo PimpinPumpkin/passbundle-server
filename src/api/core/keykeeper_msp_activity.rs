@@ -30,11 +30,12 @@ pub fn routes() -> Vec<Route> {
 /// and people joining it with that command; the MSP's default policies
 /// reaching it, required of it, or put back; and the MSP's templates sent to
 /// it, with the collection they go in. Plus the entry for the MSP making it a
-/// client. A kind left out here (single sign-on, provisioning, script tokens,
+/// client, or for its own owner joining it to the MSP with a code. A kind left out here (single sign-on, provisioning, script tokens,
 /// and anything added later) stays the MSP's until someone decides the client
 /// should see it.
 pub(super) const CLIENT_KINDS: &[&str] = &[
     "client_created",
+    "client_joined",
     "client_staff_added",
     "client_staff_role_changed",
     "client_staff_removed",
@@ -194,6 +195,7 @@ mod tests {
             enrollment_secret: None,
             enrollment_token_hash: None,
             client_seal: None,
+            joined_with_code: false,
         }
         .insert(conn)
         .await

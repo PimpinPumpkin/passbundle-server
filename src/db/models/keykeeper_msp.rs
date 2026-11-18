@@ -239,6 +239,11 @@ pub struct MspClient {
     /// says it's this MSP's client. Apps write into a client only where it
     /// checks out. See DESIGN.md, "Joins a hacked server can't forge".
     pub client_seal: Option<String>,
+    /// The organization was one of its own and joined with a code its owner
+    /// entered, rather than being made in the MSP's console. Until the owner
+    /// decides who pays (DESIGN.md, "Plans and billing", decision 14), it
+    /// keeps its own plan: the MSP's pool doesn't cover it.
+    pub joined_with_code: bool,
 }
 
 /// Someone who joined a client through its enrollment token, and when.
@@ -575,6 +580,7 @@ impl MspClient {
             enrollment_secret: None,
             enrollment_token_hash: Some(token.hash),
             client_seal: None,
+            joined_with_code: false,
         })
     }
 

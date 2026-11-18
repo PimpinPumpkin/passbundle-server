@@ -18,6 +18,7 @@ mod keykeeper_joining;
 mod keykeeper_member_health;
 mod keykeeper_msp;
 mod keykeeper_msp_activity;
+mod keykeeper_msp_link;
 mod keykeeper_msp_policies;
 pub mod keykeeper_msp_seats;
 mod keykeeper_msp_templates;
@@ -94,6 +95,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_folder_looks::routes());
     routes.append(&mut keykeeper_msp::routes());
     routes.append(&mut keykeeper_msp_activity::routes());
+    routes.append(&mut keykeeper_msp_link::routes());
     routes.append(&mut keykeeper_msp_policies::routes());
     routes.append(&mut keykeeper_msp_seats::routes());
     routes.append(&mut keykeeper_msp_templates::routes());

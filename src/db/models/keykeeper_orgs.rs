@@ -134,4 +134,32 @@ impl OrgSetup {
         self.enrollment_secret = secret;
         Ok(())
     }
+
+    /// Hands the install command to an MSP the organization joins with a
+    /// code: its token, when it was made, and its join secret go from here,
+    /// and the caller puts them on the organization's msp_clients row, so
+    /// commands already run keep working and the MSP manages it (DESIGN.md,
+    /// "An organization that already uses PassBundle"). The preset and the
+    /// collection people who join get stay here too, for when it leaves.
+    pub async fn hand_over_enrollment_token(&mut self, conn: &DbConn) -> EmptyResult {
+        let org = self.org_uuid.clone();
+        conn.run(move |conn| {
+            diesel::update(org_setups::table.filter(org_setups::org_uuid.eq(org)))
+                .set((
+                    org_setups::enrollment_token.eq(None::<String>),
+                    org_setups::enrollment_token_hash.eq(None::<String>),
+                    org_setups::enrollment_token_created_at.eq(None::<NaiveDateTime>),
+                    org_setups::enrollment_secret.eq(None::<String>),
+                ))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error handing over the install command")
+        })
+        .await?;
+        self.enrollment_token = None;
+        self.enrollment_token_hash = None;
+        self.enrollment_token_created_at = None;
+        self.enrollment_secret = None;
+        Ok(())
+    }
 }
