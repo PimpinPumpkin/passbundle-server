@@ -3745,12 +3745,27 @@ async fn put_reset_password_enrollment(
     }
 
     if reset_password_key.is_some() {
-        PasswordOrOtpData {
+        let proof = PasswordOrOtpData {
             master_password_hash: reset_request.master_password_hash,
             otp: reset_request.otp,
+        };
+        // Keykeeper: a confirmed member whose organization enrolls everyone
+        // automatically, and who isn't enrolled yet, enrolls without their
+        // master password, as accepting an invitation does. Their app does
+        // this at unlock when the organization turned automatic enrollment on
+        // after they joined, and an app unlocked with a PIN, biometrics, or a
+        // reload doesn't have the password. Replacing an enrollment still
+        // needs it, so a session alone can fill an empty enrollment the
+        // organization requires but never change one. See DESIGN.md,
+        // "Enrolling at unlock".
+        let automatic = proof.master_password_hash.is_none()
+            && proof.otp.is_none()
+            && membership.status == MembershipStatus::Confirmed as i32
+            && membership.reset_password_key.is_none()
+            && OrgPolicy::org_is_reset_password_auto_enroll(&org_id, &conn).await;
+        if !automatic {
+            proof.validate(&headers.user, true, &conn).await?;
         }
-        .validate(&headers.user, true, &conn)
-        .await?;
     }
 
     // Keykeeper: someone who just set their master password after their first
