@@ -162,12 +162,16 @@ impl<'a> Audit<'a> {
 }
 
 /// Logs a confirmation in a client organization, called from upstream's
-/// confirm. Nothing happens for organizations without an MSP.
+/// confirm. Nothing happens for organizations without an MSP. `automatic`
+/// is the confirming app saying it let them in on its own, as the MSP
+/// console and the background work do, so nobody compared fingerprints
+/// (DESIGN.md, "Key fingerprints"): the entry's detail says "automatic".
 pub(super) async fn record_member_confirmed(
     org_id: &OrganizationId,
     member_user_id: &UserId,
     headers_user: &User,
     ip: String,
+    automatic: bool,
     conn: &DbConn,
 ) -> EmptyResult {
     let Some(client) = MspClient::find_by_org(org_id, conn).await else {
@@ -181,7 +185,7 @@ pub(super) async fn record_member_confirmed(
         ip: Some(ip),
         org: Some((org_id, &org_name)),
         target_email: Some(&target),
-        detail: None,
+        detail: automatic.then(|| "automatic".to_owned()),
     }
     .record(&client.msp_uuid, conn)
     .await
@@ -444,6 +448,11 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
                 "role": member_role.as_str(),
                 "access": access,
                 "removedByClient": removed_by,
+                // Keykeeper: the public key the server holds for them, the
+                // one clients' keys are encrypted to when they're confirmed,
+                // so the console can show its fingerprint phrase to compare
+                // with theirs (DESIGN.md, "Key fingerprints").
+                "publicKey": user.public_key,
             }));
         }
     }

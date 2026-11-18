@@ -1515,6 +1515,11 @@ async fn accept_invite(
 struct ConfirmData {
     id: Option<MembershipId>,
     key: Option<String>,
+    // Keykeeper: the confirming app let them in on its own, without anyone
+    // comparing fingerprints, which the MSP's activity log says. Only a
+    // word for the log: it changes nothing about the confirm.
+    #[serde(default)]
+    keykeeper_automatic: bool,
 }
 
 #[derive(Deserialize)]
@@ -1582,7 +1587,7 @@ async fn confirm_invite(
 ) -> EmptyResult {
     let data = data.into_inner();
     let user_key = data.key.unwrap_or_default();
-    confirm_invite_impl(&org_id, &member_id, &user_key, &headers, &conn, &nt).await
+    confirm_invite_marked(&org_id, &member_id, &user_key, data.keykeeper_automatic, &headers, &conn, &nt).await
 }
 
 // Keykeeper: visible to its siblings, whose tests confirm members with it.
@@ -1590,6 +1595,20 @@ pub(super) async fn confirm_invite_impl(
     org_id: &OrganizationId,
     member_id: &MembershipId,
     key: &str,
+    headers: &AdminHeaders,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+) -> EmptyResult {
+    confirm_invite_marked(org_id, member_id, key, false, headers, conn, nt).await
+}
+
+// Keykeeper: upstream's confirm, with whether the confirming app did it on
+// its own (`automatic`), for the MSP's activity log only.
+async fn confirm_invite_marked(
+    org_id: &OrganizationId,
+    member_id: &MembershipId,
+    key: &str,
+    automatic: bool,
     headers: &AdminHeaders,
     conn: &DbConn,
     nt: &Notify<'_>,
@@ -1699,6 +1718,7 @@ pub(super) async fn confirm_invite_impl(
             &member_to_confirm.user_uuid,
             &headers.user,
             headers.ip.ip.to_string(),
+            automatic,
             conn,
         )
         .await?;
