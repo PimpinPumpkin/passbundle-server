@@ -400,7 +400,13 @@ pub(super) async fn carry_client_removals(
         if &removal.user_uuid == inviter
             && Membership::find_by_user_and_org(joining, &removal.org_uuid, conn).await.is_none()
         {
-            RemovedMember::record(&removal.org_uuid, joining, Some(msp), false, conn).await?;
+            // Keykeeper: kept out the way their inviter is: by the client
+            // itself, or only with the MSP (DESIGN.md, "Taken out with the MSP").
+            if removal.with_msp {
+                RemovedMember::record_with_msp(&removal.org_uuid, joining, msp, conn).await?;
+            } else {
+                RemovedMember::record(&removal.org_uuid, joining, Some(msp), false, conn).await?;
+            }
         }
     }
     Ok(())
@@ -465,8 +471,11 @@ pub(super) async fn cut_msp_out(
     let destinations = delete_destinations(org_id, people, conn).await?;
     let staff_seals = JoinSeal::delete_kind(org_id, SealKind::Staff, conn).await?;
 
+    // Keykeeper: marked as taken out with the MSP, so joining an MSP with a
+    // code later doesn't keep them out; a removal or revocation the client
+    // made itself stays as it was (DESIGN.md, "Taken out with the MSP").
     for person in people {
-        RemovedMember::record(org_id, person, Some(msp_id), false, conn).await?;
+        RemovedMember::record_with_msp(org_id, person, msp_id, conn).await?;
     }
 
     let sso = SsoConfig::find(org_id, conn).await.map(|config| {
@@ -548,6 +557,7 @@ mod tests {
             enrollment_secret: None,
             enrollment_token_hash: None,
             client_seal: None,
+            joined_with_code: false,
         }
         .insert(conn)
         .await
@@ -682,6 +692,32 @@ mod tests {
         // And Mia no longer reads Acme's activity; Bob does.
         assert_eq!(clients_closed_to(&msp, &mia.uuid, &conn).await, HashSet::from([acme.uuid.clone()]));
         assert!(clients_closed_to(&msp, &bob.uuid, &conn).await.is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn people_taken_out_with_the_msp_are_marked_so_and_the_clients_own_removals_stay_its_own() {
+        let conn = DbPool::for_test().await;
+        let mia = person("mia", &conn).await;
+        let tom = person("tom", &conn).await;
+        let msp = msp(&[&mia, &tom], &conn).await;
+        let acme = client("Acme Dental", &msp, &[&mia, &tom], &conn).await;
+        // Acme revoked Tom itself, before removing the MSP.
+        RemovedMember::record(&acme.uuid, &tom.uuid, Some(&msp), true, &conn).await.unwrap();
+        let people = HashSet::from([mia.uuid.clone(), tom.uuid.clone()]);
+        cut_msp_out(&acme.uuid, &msp, &people, &conn).await.unwrap();
+        let mias = RemovedMember::try_find(&acme.uuid, &mia.uuid, &conn).await.unwrap().unwrap();
+        assert!(mias.with_msp && !mias.revoked);
+        let toms = RemovedMember::try_find(&acme.uuid, &tom.uuid, &conn).await.unwrap().unwrap();
+        assert!(!toms.with_msp && toms.revoked);
+
+        // Someone joining the staff afterward is kept out the way whoever
+        // invited them is: with the MSP, or by Acme itself.
+        let invited_by_mia = person("mia-invite", &conn).await;
+        carry_client_removals(&msp, &mia.uuid, &invited_by_mia.uuid, &conn).await.unwrap();
+        assert!(RemovedMember::try_find(&acme.uuid, &invited_by_mia.uuid, &conn).await.unwrap().unwrap().with_msp);
+        let invited_by_tom = person("tom-invite", &conn).await;
+        carry_client_removals(&msp, &tom.uuid, &invited_by_tom.uuid, &conn).await.unwrap();
+        assert!(!RemovedMember::try_find(&acme.uuid, &invited_by_tom.uuid, &conn).await.unwrap().unwrap().with_msp);
     }
 
     #[rocket::async_test]

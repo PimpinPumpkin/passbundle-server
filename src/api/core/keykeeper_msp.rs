@@ -195,15 +195,15 @@ pub(super) async fn record_member_confirmed(
 /// view of its MSP's actions (keykeeper_msp_activity.rs): who made it (or
 /// invited the person, for someone joining the staff) and whom it's about.
 /// The MSP's own Activity has the MSP-wide entry instead.
-struct StaffChange<'a> {
-    msp_id: &'a MspId,
-    actor: Option<&'a UserId>,
-    actor_email: &'a str,
-    target_email: &'a str,
+pub(super) struct StaffChange<'a> {
+    pub msp_id: &'a MspId,
+    pub actor: Option<&'a UserId>,
+    pub actor_email: &'a str,
+    pub target_email: &'a str,
 }
 
 impl StaffChange<'_> {
-    async fn record(
+    pub async fn record(
         &self,
         event: &'static str,
         org_id: &OrganizationId,
@@ -227,7 +227,7 @@ async fn msp_membership_ids(msp_id: &MspId, conn: &DbConn) -> HashSet<Membership
 }
 
 /// What a staff member's membership looks like in each client they reach.
-struct Grant {
+pub(super) struct Grant {
     atype: MembershipType,
     /// Every vault item in the client.
     access_all: bool,
@@ -237,7 +237,7 @@ struct Grant {
 impl Grant {
     /// MSP admins are owners. Technicians are admins, or regular members with
     /// their custom role and, if it includes them, every vault item.
-    fn for_staff(staff: &MspStaff) -> Option<Self> {
+    pub fn for_staff(staff: &MspStaff) -> Option<Self> {
         let role = staff.role()?;
         let custom = (role == MspRole::Technician).then(|| staff.custom_role()).flatten();
         Some(Self::with(role, custom))
@@ -275,7 +275,7 @@ impl Grant {
     /// The role in a word, for a client's view of its MSP's actions: "owner",
     /// "admin", or "custom" (a custom role, with "items" when it sees every
     /// vault item).
-    fn in_words(&self) -> &'static str {
+    pub fn in_words(&self) -> &'static str {
         match (self.atype, &self.custom) {
             (MembershipType::Owner, _) => "owner",
             (MembershipType::Admin, _) => "admin",
@@ -296,7 +296,7 @@ impl Grant {
 /// be confirmed, recorded as the MSP's. Leaves any membership they already
 /// have alone, since the client granted it, and never adds someone the client
 /// removed or revoked (keykeeper_offboarding.rs). Says whether it added one.
-async fn add_msp_membership(
+pub(super) async fn add_msp_membership(
     msp_id: &MspId,
     org_id: &OrganizationId,
     user_id: &UserId,
@@ -574,6 +574,11 @@ async fn get_msp(msp_id: MspId, headers: Headers, conn: DbConn) -> JsonResult {
             // That an MSP admin's browser, holding the client's key, made it this
             // MSP's client. The apps check it before writing anything there.
             "seal": client.client_seal,
+            // Keykeeper: the organization joined with a code its own owner
+            // entered, so its own owner confirms the MSP's first people there,
+            // and it keeps its own plan (DESIGN.md, "An organization that
+            // already uses PassBundle").
+            "joinedWithCode": client.joined_with_code,
             // Keykeeper: the MSP's people this client took out itself, and how
             // many people it removed since the install command's token was
             // made, who may still have the command (DESIGN.md, "Offboarding").
@@ -1381,6 +1386,13 @@ async fn get_organization_msp(org_id: OrganizationId, headers: Headers, conn: Db
                 .unwrap_or_default();
             staff.push(json!({
                 "memberId": member.uuid,
+                // Keykeeper: their account and the public key the server holds
+                // for it, the one confirming them encrypts the organization's
+                // key to, so the Members page shows its fingerprint phrase
+                // to compare with theirs (DESIGN.md, "An organization that
+                // already uses PassBundle").
+                "userId": user.uuid,
+                "publicKey": user.public_key,
                 "email": user.email,
                 "name": user.name,
                 "type": member.atype,
@@ -1416,57 +1428,77 @@ async fn remove_organization_msp(org_id: OrganizationId, headers: Headers, conn:
     if caller.atype != MembershipType::Owner as i32 || caller_is_msp {
         err_code!("Only the organization's own owners can remove its MSP", rocket::http::Status::Forbidden.code)
     }
+    Ok(Json(detach_msp(&org_id, client, &headers, "client_removed_msp", &conn).await?))
+}
+
+/// Takes an MSP out of one of its clients, for removing it and for moving to
+/// another (keykeeper_msp_link.rs): the MSP's people and what they made there
+/// go, the organization keeps how people join, its preset, and the collection
+/// people who join get as its own, and the MSP's activity log records `event`
+/// by the client's owner. Answers with what went, for the owner to see.
+pub(super) async fn detach_msp(
+    org_id: &OrganizationId,
+    client: MspClient,
+    headers: &Headers,
+    event: &'static str,
+    conn: &DbConn,
+) -> Result<Value, crate::error::Error> {
     let msp_id = client.msp_uuid.clone();
-    let msp_name = Msp::find_by_uuid(&msp_id, &conn).await.map(|m| m.name).unwrap_or_default();
+    let msp_name = Msp::find_by_uuid(&msp_id, conn).await.map(|m| m.name).unwrap_or_default();
     // Fails closed: if the MSP's memberships can't be read, nothing changes
     // and the owner can try again.
     let ours: HashSet<MembershipId> =
-        MspMembership::try_find_by_msp(&msp_id, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();
+        MspMembership::try_find_by_msp(&msp_id, conn).await?.into_iter().map(|m| m.membership_uuid).collect();
     let mut people = HashSet::new();
-    for member in Membership::find_by_org(&org_id, &conn).await {
+    for member in Membership::find_by_org(org_id, conn).await {
         if ours.contains(&member.uuid) {
             people.insert(member.user_uuid.clone());
         }
     }
     // What they made here stops working first, while it's still known whose it was.
-    let mut summary = super::keykeeper_offboarding::cut_msp_out(&org_id, &msp_id, &people, &conn).await?;
-    for member in Membership::find_by_org(&org_id, &conn).await {
+    let mut summary = super::keykeeper_offboarding::cut_msp_out(org_id, &msp_id, &people, conn).await?;
+    for member in Membership::find_by_org(org_id, conn).await {
         if ours.contains(&member.uuid) {
-            member.delete(&conn).await?;
+            member.delete(conn).await?;
         }
     }
     // How people join stays as it was: a client that followed its MSP's
     // default keeps it as its own, rather than falling back to the server's.
-    let (joining, _) = effective_joining(&org_id, &conn).await;
-    if crate::db::models::OrgJoining::find(&org_id, &conn).await.is_none() {
-        crate::db::models::OrgJoining::new(org_id.clone(), joining).save(&conn).await?;
+    let (joining, _) = effective_joining(org_id, conn).await;
+    if crate::db::models::OrgJoining::find(org_id, conn).await.is_none() {
+        crate::db::models::OrgJoining::new(org_id.clone(), joining).save(conn).await?;
     }
     // The organization keeps its preset and the collection people who join
     // get, as a company's own. Not the install command: its token was the
     // MSP's, so the owners make a new one in the admin console.
-    if OrgSetup::find_by_org(&org_id, &conn).await.is_none() {
+    if OrgSetup::find_by_org(org_id, conn).await.is_none() {
         OrgSetup::new(org_id.clone(), client.preset.clone(), client.everyone_collection.clone(), false)?
-            .insert(&conn)
+            .insert(conn)
             .await?;
     }
-    client.delete(&conn).await?;
+    let joined_with_code = client.joined_with_code;
+    client.delete(conn).await?;
     // Keykeeper: it has 30 days (PLAN_TRIAL_DAYS) from now to make its own
     // arrangement, where plans are enforced (DESIGN.md, "The trial clock").
-    crate::db::models::after_leaving_msp(&org_id, &conn).await?;
+    // One that joined with a code kept its own plan all along, which stays
+    // as it is (DESIGN.md, "Plans and billing", decision 14).
+    if !joined_with_code {
+        crate::db::models::after_leaving_msp(org_id, conn).await?;
+    }
     // A staff change that ran at the same moment may have added one back.
     let ours: HashSet<MembershipId> =
-        MspMembership::try_find_by_msp(&msp_id, &conn).await?.into_iter().map(|m| m.membership_uuid).collect();
-    for member in Membership::find_by_org(&org_id, &conn).await {
+        MspMembership::try_find_by_msp(&msp_id, conn).await?.into_iter().map(|m| m.membership_uuid).collect();
+    for member in Membership::find_by_org(org_id, conn).await {
         if ours.contains(&member.uuid) {
             people.insert(member.user_uuid.clone());
-            member.delete(&conn).await?;
+            member.delete(conn).await?;
         }
     }
     // The MSP keeps a record that the client removed it.
-    let org_name = Organization::find_by_uuid(&org_id, &conn).await.map(|o| o.name).unwrap_or_default();
-    Audit::by("client_removed_msp", &headers).org(&org_id, &org_name).record(&msp_id, &conn).await?;
+    let org_name = Organization::find_by_uuid(org_id, conn).await.map(|o| o.name).unwrap_or_default();
+    Audit::by(event, headers).org(org_id, &org_name).record(&msp_id, conn).await?;
     summary["msp"] = json!({ "id": msp_id, "name": msp_name });
     summary["peopleRemoved"] = json!(people.len());
     summary["installCommandRemoved"] = json!(true);
-    Ok(Json(summary))
+    Ok(summary)
 }

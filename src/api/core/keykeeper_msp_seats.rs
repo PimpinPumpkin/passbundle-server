@@ -84,6 +84,21 @@ async fn read_now(msp_id: &MspId, conn: &DbConn) -> ApiResult<Vec<Reading>> {
     Ok(readings)
 }
 
+/// An organization's seats as its own: its members who joined, without the
+/// people of an MSP whose client it is, which only a client that joined with
+/// a code is while it's read as its own (DESIGN.md, "Plans and billing",
+/// decision 14). A database error is an error, never a count of none.
+async fn own_seats(org: &OrganizationId, conn: &DbConn) -> ApiResult<usize> {
+    let joined = joined_members(org, conn).await?;
+    let Some(client) = crate::db::models::MspClient::find_by_org(org, conn).await else {
+        return Ok(joined.len());
+    };
+    let staff = staff_users(&client.msp_uuid, conn).await?;
+    let ours: HashSet<MembershipId> =
+        MspMembership::try_find_by_msp(&client.msp_uuid, conn).await?.into_iter().map(|m| m.membership_uuid).collect();
+    Ok(joined.iter().filter(|(member, user)| !ours.contains(member) && !staff.contains(user)).count())
+}
+
 /// A day as the table keeps it.
 pub(crate) fn day_text(day: NaiveDate) -> String {
     day.format("%Y-%m-%d").to_string()
@@ -144,15 +159,16 @@ async fn record_msp(msp_id: &MspId, day: &str, conn: &DbConn) -> EmptyResult {
 
 /// Records the seats of each organization with a Business plan of its own,
 /// for today: its members who joined and aren't revoked, the rule for what a
-/// seat is. While it's an MSP's client its seats are the MSP's, so its own
-/// reading is 0.
+/// seat is. While an MSP's pool covers it its seats are the MSP's, so its own
+/// reading is 0. One that joined its MSP with a code keeps its own plan, and
+/// its MSP's people aren't its seats.
 async fn record_own_orgs(day: &str, conn: &DbConn) -> EmptyResult {
     let mut rows = Vec::new();
     for (org, client) in business_orgs_of_their_own(conn).await? {
         let seats = if client {
             0
         } else {
-            joined_members(&org, conn).await?.len()
+            own_seats(&org, conn).await?
         };
         rows.push(OrgSeats {
             org_uuid: org,
@@ -624,6 +640,67 @@ async fn seats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rocket::async_test]
+    async fn a_client_that_joined_with_a_code_is_read_as_its_own_not_the_pools() {
+        // Until the owner decides who pays (DESIGN.md, "Plans and billing",
+        // decision 14): the MSP's readings leave it out, and its own leave
+        // the MSP's people out.
+        use crate::db::{
+            DbPool,
+            models::{Membership, MembershipStatus, MembershipType, Msp, MspClient, MspStaff, Organization, User},
+        };
+        let conn = DbPool::for_test().await;
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(&conn).await.unwrap();
+        let mut people = Vec::new();
+        for name in ["admin", "owner", "member"] {
+            let mut user = User::new(&format!("{name}@example.test"), None);
+            user.save(&conn).await.unwrap();
+            people.push(user);
+        }
+        MspStaff::new(msp.uuid.clone(), people[0].uuid.clone(), MspRole::Admin).insert(&conn).await.unwrap();
+        let mut clients = Vec::new();
+        for (name, joined) in [("Acme Dental", true), ("Baker Law", false)] {
+            let org = Organization::new(name.to_owned(), "billing@example.test", None, None);
+            org.save(&conn).await.unwrap();
+            MspClient {
+                org_uuid: org.uuid.clone(),
+                msp_uuid: msp.uuid.clone(),
+                created_at: Utc::now().naive_utc(),
+                preset: None,
+                enrollment_token: None,
+                enrollment_token_created_at: None,
+                everyone_collection: None,
+                templates_collection: None,
+                enrollment_secret: None,
+                enrollment_token_hash: None,
+                client_seal: None,
+                joined_with_code: joined,
+            }
+            .insert(&conn)
+            .await
+            .unwrap();
+            for (user, atype) in [
+                (&people[0], MembershipType::Owner),
+                (&people[1], MembershipType::Owner),
+                (&people[2], MembershipType::User),
+            ] {
+                let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
+                member.atype = atype as i32;
+                member.status = MembershipStatus::Confirmed as i32;
+                member.save(&conn).await.unwrap();
+                if user.uuid == people[0].uuid {
+                    MspMembership::new(member.uuid.clone(), msp.uuid.clone()).insert(&conn).await.unwrap();
+                }
+            }
+            clients.push(org);
+        }
+        let read: Vec<(String, i64)> =
+            read_now(&msp.uuid, &conn).await.unwrap().into_iter().map(|r| (r.name, r.seats)).collect();
+        assert_eq!(read, vec![("Baker Law".to_owned(), 2)]);
+        assert_eq!(own_seats(&clients[0].uuid, &conn).await.unwrap(), 2);
+    }
 
     fn row(org: &str, day: &str, seats: i32, name: &str) -> DayReading {
         DayReading::from(&ClientSeats {

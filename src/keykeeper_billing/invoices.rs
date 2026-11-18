@@ -735,6 +735,7 @@ mod tests {
             enrollment_secret: None,
             enrollment_token_hash: None,
             client_seal: None,
+            joined_with_code: false,
         }
         .insert(conn)
         .await

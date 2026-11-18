@@ -34,6 +34,21 @@ table! {
         enrollment_secret -> Nullable<Text>,
         enrollment_token_hash -> Nullable<Text>,
         client_seal -> Nullable<Text>,
+        joined_with_code -> Bool,
+    }
+}
+
+table! {
+    msp_link_codes (uuid) {
+        uuid -> Text,
+        msp_uuid -> Text,
+        selector -> Text,
+        code_hash -> Text,
+        label -> Nullable<Text>,
+        created_by_uuid -> Nullable<Text>,
+        created_by_email -> Text,
+        created_at -> Timestamp,
+        expires_at -> Timestamp,
     }
 }
 
@@ -601,6 +616,7 @@ table! {
         removed_at -> Timestamp,
         msp_uuid -> Nullable<Text>,
         revoked -> Bool,
+        with_msp -> Bool,
     }
 }
 

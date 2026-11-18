@@ -152,7 +152,9 @@ pub async fn after_leaving_msp(org: &OrganizationId, conn: &DbConn) -> ApiResult
 
 /// Every organization that isn't an MSP's client, and every MSP, with no row
 /// gets a trial from `at`: the job finds them, so the clock starts for an
-/// organization nobody has opened since enforcement was turned on.
+/// organization nobody has opened since enforcement was turned on. A client
+/// that joined with a code keeps its own plan (pool_clients), so it counts as
+/// an organization here.
 fn start_missing_trials(conn: &mut DbConnInner, at: NaiveDateTime, days: i64) -> Query<usize> {
     let with_rows: HashSet<String> = plans::table
         .select((plans::org_uuid, plans::msp_uuid))
@@ -161,8 +163,7 @@ fn start_missing_trials(conn: &mut DbConnInner, at: NaiveDateTime, days: i64) ->
         .flat_map(|(org, msp)| [org.map(|id| id.to_string()), msp.map(|id| id.to_string())])
         .flatten()
         .collect();
-    let clients: HashSet<OrganizationId> =
-        msp_clients::table.select(msp_clients::org_uuid).load::<OrganizationId>(conn)?.into_iter().collect();
+    let clients = pool_clients(conn)?;
     let mut missing: Vec<PlanOwner> = organizations::table
         .select(organizations::uuid)
         .load::<OrganizationId>(conn)?
@@ -290,11 +291,22 @@ fn owner_of(row: &Plan) -> Option<PlanOwner> {
     }
 }
 
+/// The clients an MSP's pool covers: every MSP's client except those that
+/// joined with a code, which keep their own plan until the owner decides who
+/// pays (DESIGN.md, "Plans and billing", decision 14).
+fn pool_clients(conn: &mut DbConnInner) -> Query<HashSet<OrganizationId>> {
+    Ok(msp_clients::table
+        .filter(msp_clients::joined_with_code.eq(false))
+        .select(msp_clients::org_uuid)
+        .load::<OrganizationId>(conn)?
+        .into_iter()
+        .collect())
+}
+
 /// The rows the clock looks at: every one but a client's own, which is
 /// ignored while its MSP's pool covers it.
 fn rows_in_force(conn: &mut DbConnInner) -> Query<Vec<(Plan, PlanOwner)>> {
-    let clients: HashSet<OrganizationId> =
-        msp_clients::table.select(msp_clients::org_uuid).load::<OrganizationId>(conn)?.into_iter().collect();
+    let clients = pool_clients(conn)?;
     Ok(plans::table
         .load::<Plan>(conn)?
         .into_iter()
@@ -389,8 +401,11 @@ fn due_reminders_at(conn: &mut DbConnInner, at: NaiveDateTime, grace_days: i64) 
             PlanOwner::Msp(msp) => {
                 let name =
                     msps::table.filter(msps::uuid.eq(msp)).select(msps::name).first::<String>(conn).optional()?;
-                let clients =
-                    msp_clients::table.filter(msp_clients::msp_uuid.eq(msp)).count().get_result::<i64>(conn)?;
+                let clients = msp_clients::table
+                    .filter(msp_clients::msp_uuid.eq(msp))
+                    .filter(msp_clients::joined_with_code.eq(false))
+                    .count()
+                    .get_result::<i64>(conn)?;
                 (name, usize::try_from(clients).unwrap_or(0))
             }
         };
@@ -677,6 +692,7 @@ mod database_tests {
             enrollment_secret: None,
             enrollment_token_hash: None,
             client_seal: None,
+            joined_with_code: false,
         }
         .insert(conn)
         .await

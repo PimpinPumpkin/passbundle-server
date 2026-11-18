@@ -95,11 +95,14 @@ pub async fn all_msps(conn: &DbConn) -> ApiResult<Vec<MspId>> {
     conn.run(move |conn| msps::table.select(msps::uuid).load::<MspId>(conn).map_res("Error loading MSPs")).await
 }
 
-/// An MSP's clients now, with their names, by name.
+/// An MSP's clients now that its pool covers, with their names, by name: not
+/// those that joined with a code, which keep their own plan until the owner
+/// decides who pays (DESIGN.md, "Plans and billing", decision 14).
 pub async fn clients_now(msp_uuid: &MspId, conn: &DbConn) -> ApiResult<Vec<(OrganizationId, String)>> {
     conn.run(move |conn| {
         let ids = msp_clients::table
             .filter(msp_clients::msp_uuid.eq(msp_uuid))
+            .filter(msp_clients::joined_with_code.eq(false))
             .select(msp_clients::org_uuid)
             .load::<OrganizationId>(conn)
             .map_res("Error loading an MSP's clients")?;
