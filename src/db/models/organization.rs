@@ -685,6 +685,10 @@ impl Membership {
             "usesKeyConnector": false, // Not supported
             "accessSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
 
+            // Keykeeper: provisioning (Microsoft Entra ID) manages them, so the
+            // admin console says to change them there (keykeeper_scim.rs).
+            "keykeeperProvisioned": super::managed_by_directory(self, conn).await,
+
             "object": "organizationUserUserDetails",
         }))
     }

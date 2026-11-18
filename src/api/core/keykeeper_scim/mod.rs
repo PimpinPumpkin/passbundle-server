@@ -46,10 +46,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Collection, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation, JoinSeal, Membership,
-            MembershipId, MembershipStatus, MspClient, OrgPolicy, OrgSetup, Organization, OrganizationId,
-            RevokedUntilAccepted, ScimGroup, ScimPerson, ScimToken, ScimUser, SealKind, User, invite_hours,
-            looks_like_scim_token, remove_group_member,
+            CollectionUser, EventType, Group, GroupId, GroupUser, Invitation, JoinSeal, Membership, MembershipId,
+            MembershipStatus, OrgPolicy, Organization, OrganizationId, RevokedUntilAccepted, ScimGroup, ScimPerson,
+            ScimToken, ScimUser, SealKind, User, invite_hours, looks_like_scim_token, remove_group_member,
         },
     },
     mail,
@@ -754,16 +753,6 @@ fn keep(scim: &mut ScimUser, fields: &UserFields) {
     scim.attributes = serde_json::to_string(&fields.attributes).unwrap_or_else(|_| "{}".into());
 }
 
-/// The collection everyone who joins gets (the Business preset's "Everyone"),
-/// if the organization has one: an MSP's client's, or a company's own.
-async fn everyone_collection(org: &OrganizationId, conn: &DbConn) -> Option<Collection> {
-    let id = match MspClient::find_by_org(org, conn).await {
-        Some(client) => client.everyone_collection,
-        None => OrgSetup::find_by_org(org, conn).await.and_then(|s| s.everyone_collection),
-    }?;
-    Collection::find_by_uuid_and_org(&id, org, conn).await
-}
-
 /// Invites someone as a regular member, exactly as the Members page's invite
 /// does on this server (its email, or without email, its no-mail rules), but
 /// with no invitation seal: no owner's or admin's browser chose this address.
@@ -829,7 +818,7 @@ async fn invite(caller: &ScimCaller, email: &str, conn: &DbConn) -> Result<Membe
         }
     }
     log_scim_event(EventType::OrganizationUserInvited, &member.uuid, &org.uuid, &caller.ip, conn).await;
-    if let Some(collection) = everyone_collection(&org.uuid, conn).await
+    if let Some(collection) = super::keykeeper_everyone::everyone_collection(&org.uuid, conn).await
         // A grant there already stays as it is: Can edit would widen a
         // narrower one, as for joins with the install command.
         && CollectionUser::find_by_collection_and_user(&collection.uuid, &member.user_uuid, conn).await.is_none()

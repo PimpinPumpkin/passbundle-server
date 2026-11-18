@@ -359,6 +359,21 @@ pub fn protected_membership(atype: i32, access_all: bool, custom_role: bool, msp
     atype != MembershipType::User as i32 || access_all || custom_role || msp_staff
 }
 
+/// Whether provisioning manages this member now, so the admin console marks
+/// them "From Microsoft Entra ID" and says to change them there: the
+/// organization has a token, the directory invited or matched them, and
+/// they're a regular member it may change. Never someone provisioning never
+/// changes (an owner, admin, custom role, anyone with access to every item,
+/// or an MSP's staff), whom the directory can only note as turned off.
+pub async fn managed_by_directory(member: &Membership, conn: &DbConn) -> bool {
+    if ScimUser::find(&member.uuid, conn).await.is_none() || ScimToken::find(&member.org_uuid, conn).await.is_none() {
+        return false;
+    }
+    let custom = super::keykeeper_roles::find(&member.uuid, conn).await.is_some();
+    let staff = super::MspMembership::find_by_membership(&member.uuid, conn).await.is_some();
+    !protected_membership(member.atype, member.access_all, custom, staff)
+}
+
 impl ScimPerson {
     pub async fn load(member: Membership, conn: &DbConn) -> Option<Self> {
         let user = User::find_by_uuid(&member.user_uuid, conn).await?;
@@ -472,6 +487,86 @@ mod tests {
         ] {
             assert!(!looks_like_scim_token(bad), "{bad}");
         }
+    }
+
+    async fn confirmed(name: &str, atype: MembershipType, org: &OrganizationId, conn: &DbConn) -> Membership {
+        let mut user = User::new(&format!("{name}@example.test"), None);
+        user.save(conn).await.unwrap();
+        let mut member = Membership::new(user.uuid.clone(), org.clone(), None);
+        member.atype = atype as i32;
+        member.status = super::super::MembershipStatus::Confirmed as i32;
+        member.access_all = atype != MembershipType::User;
+        member.save(conn).await.unwrap();
+        member
+    }
+
+    async fn link(member: &Membership, provisioned: bool, conn: &DbConn) {
+        let mut scim = ScimUser::new(member.uuid.clone(), member.org_uuid.clone(), provisioned);
+        scim.set_user_name(&format!("{}@contoso.onmicrosoft.com", member.uuid));
+        scim.save(conn).await.unwrap();
+    }
+
+    /// Whom the members list marks, checking its field against the helper.
+    async fn marked(members: &[&Membership], conn: &DbConn) -> Vec<MembershipId> {
+        let mut marked = Vec::new();
+        for member in members {
+            let json = member.to_json_details_for_admin(false, false, conn).await.unwrap();
+            let managed = managed_by_directory(member, conn).await;
+            assert_eq!(json["keykeeperProvisioned"], managed);
+            if managed {
+                marked.push(member.uuid.clone());
+            }
+        }
+        marked
+    }
+
+    #[rocket::async_test]
+    async fn the_admin_console_marks_regular_members_the_directory_manages_while_it_has_a_token() {
+        use super::super::{
+            Msp, MspMembership, Organization,
+            keykeeper_roles::{self, CustomPermissions},
+        };
+        let conn = crate::db::DbPool::for_test().await;
+        let org = Organization::new("Contoso".to_owned(), "billing@example.test", None, None);
+        org.save(&conn).await.unwrap();
+        // Invited by the directory, and matched by it (already a member).
+        let invited = confirmed("invited", MembershipType::User, &org.uuid, &conn).await;
+        link(&invited, true, &conn).await;
+        let matched = confirmed("matched", MembershipType::User, &org.uuid, &conn).await;
+        link(&matched, false, &conn).await;
+        // Nothing from the directory.
+        let own = confirmed("own", MembershipType::User, &org.uuid, &conn).await;
+        // People provisioning never changes, with a row (its note that the
+        // directory asked to turn them off, or a link from before a promotion).
+        let admin = confirmed("admin", MembershipType::Admin, &org.uuid, &conn).await;
+        link(&admin, false, &conn).await;
+        let custom = confirmed("custom", MembershipType::User, &org.uuid, &conn).await;
+        keykeeper_roles::set(
+            &custom.uuid,
+            Some(&CustomPermissions {
+                manage_users: true,
+                ..Default::default()
+            }),
+            &conn,
+        )
+        .await
+        .unwrap();
+        link(&custom, true, &conn).await;
+        let staff = confirmed("staff", MembershipType::User, &org.uuid, &conn).await;
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(&conn).await.unwrap();
+        MspMembership::new(staff.uuid.clone(), msp.uuid.clone()).insert(&conn).await.unwrap();
+        link(&staff, false, &conn).await;
+        let everyone = [&invited, &matched, &own, &admin, &custom, &staff];
+
+        // No token: provisioning is off, so nobody is the directory's.
+        assert_eq!(marked(&everyone, &conn).await, Vec::<MembershipId>::new());
+        let (_, token) = ScimToken::generate(org.uuid.clone(), "owner@example.test");
+        token.replace(&conn).await.unwrap();
+        assert_eq!(marked(&everyone, &conn).await, vec![invited.uuid.clone(), matched.uuid.clone()]);
+        // Revoked: off again.
+        ScimToken::delete(&org.uuid, &conn).await.unwrap();
+        assert_eq!(marked(&everyone, &conn).await, Vec::<MembershipId>::new());
     }
 
     #[test]

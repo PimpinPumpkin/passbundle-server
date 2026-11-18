@@ -1573,7 +1573,8 @@ async fn confirm_invite(
     confirm_invite_impl(&org_id, &member_id, &user_key, &headers, &conn, &nt).await
 }
 
-async fn confirm_invite_impl(
+// Keykeeper: visible to its siblings, whose tests confirm members with it.
+pub(super) async fn confirm_invite_impl(
     org_id: &OrganizationId,
     member_id: &MembershipId,
     key: &str,
@@ -1663,6 +1664,11 @@ async fn confirm_invite_impl(
         && let Some(client) = crate::db::models::MspClient::find_by_org(org_id, conn).await
     {
         super::keykeeper_msp_templates::give_templates(&member_to_confirm, &client, conn).await?;
+    }
+    // Keykeeper: and everyone who joins as a member gets its Everyone
+    // collection, invited by email or any other way (keykeeper_everyone.rs).
+    if save_result.is_ok() {
+        super::keykeeper_everyone::give_everyone(&member_to_confirm, conn).await?;
     }
     // Keykeeper: an approval settles an earlier removal, and the invitation's
     // seal has done its work (keykeeper_offboarding.rs).
