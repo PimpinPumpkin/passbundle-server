@@ -23,6 +23,7 @@ use crate::{
             MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey,
             OrganizationId, TwoFactor, TwoFactorType, User, UserId, exempt_from_member_policies, invite_hours,
             keykeeper_folder_permissions::{self as folder_permissions, Access, Extras, Grid},
+            keykeeper_roles::{self, FolderAccess, GroupState, Reach},
         },
     },
     mail,
@@ -204,6 +205,37 @@ impl CollectionMembershipData {
     fn grid_over(&self, stored: Option<Grid>) -> ApiResult<Grid> {
         folder_permissions::resolve(self.read_only, self.hide_passwords, self.manage, self.keykeeper.as_ref(), stored)
     }
+}
+
+/// Keykeeper: a folder's access as a save asks for it, each grant resolved
+/// over the stored one as the save will resolve it, for a custom role's check
+/// (keykeeper_roles::check_folder_access). Members with access to all items
+/// are left out, as the save skips them, and so is `skip` (a custom role's own
+/// entry in a folder it makes).
+async fn asked_folder_access(
+    collection: &CollectionId,
+    org_id: &OrganizationId,
+    groups: &[CollectionGroupData],
+    users: &[CollectionMembershipData],
+    stored: &folder_permissions::Stored,
+    skip: Option<&UserId>,
+    conn: &DbConn,
+) -> ApiResult<FolderAccess> {
+    let mut asked = FolderAccess::default();
+    for group in groups {
+        asked.groups.push((group.id.clone(), group.grid_over(stored.group(collection, &group.id))?));
+    }
+    for user in users {
+        let Some(member) = Membership::find_by_uuid_and_org(&user.id, org_id, conn).await else {
+            err!("User is not part of organization")
+        };
+        if member.access_all || skip == Some(&member.user_uuid) {
+            continue;
+        }
+        let grid = user.grid_over(stored.user(&member.user_uuid, collection))?;
+        asked.users.push((member, grid));
+    }
+    Ok(asked)
 }
 
 #[derive(Deserialize)]
@@ -545,9 +577,12 @@ async fn post_organization_collections(
     data.validate(&org_id, &conn).await?;
 
     // Keykeeper: and a regular member who manages a folder (admitted to read
-    // what its dialog needs) doesn't make folders: owners and admins do.
-    if (headers.membership.atype == MembershipType::Manager && !headers.membership.access_all)
-        || headers.membership.atype == MembershipType::User
+    // what its dialog needs) doesn't make folders: owners, admins, and custom
+    // roles that manage shared folders do.
+    let custom = headers.custom_permissions.as_ref().is_some_and(|r| r.manage_collections);
+    if !custom
+        && ((headers.membership.atype == MembershipType::Manager && !headers.membership.access_all)
+            || headers.membership.atype == MembershipType::User)
     {
         err!("You don't have permission to create collections")
     }
@@ -555,7 +590,26 @@ async fn post_organization_collections(
     // ended (DESIGN.md, "What happens when payment stops").
     super::keykeeper_plan_limits::refuse_if_ended(&org_id, &conn).await?;
 
-    let collection = Collection::new(org_id.clone(), data.name, data.external_id);
+    // Keykeeper: a custom role sets no directory id, and gives others no more
+    // than it has in the new folder: every capability but manage, which it
+    // gets itself (keykeeper_roles::check_folder_access). Its own entry, which
+    // upstream's dialog adds as Can manage, is replaced by that.
+    let external_id = if custom {
+        None
+    } else {
+        data.external_id
+    };
+    let collection = Collection::new(org_id.clone(), data.name, external_id);
+    let creator = custom.then(|| headers.membership.user_uuid.clone());
+    if let Some(creator) = &creator {
+        let reach = Reach::of(creator, &org_id, &conn).await?.with_new(&collection.uuid);
+        let stored = folder_permissions::Stored::default();
+        let asked =
+            asked_folder_access(&collection.uuid, &org_id, &data.groups, &data.users, &stored, Some(creator), &conn)
+                .await?;
+        keykeeper_roles::check_folder_access(&reach, creator, &org_id, &collection.uuid, &stored, &asked, &conn)
+            .await?;
+    }
     collection.save(&conn).await?;
 
     log_event(
@@ -579,11 +633,15 @@ async fn post_organization_collections(
             err!("User is not part of organization")
         };
 
-        if member.access_all {
+        if member.access_all || creator.as_ref() == Some(&member.user_uuid) {
             continue;
         }
 
         folder_permissions::save_user(&member.user_uuid, &collection.uuid, &user.grid()?, &conn).await?;
+    }
+    if creator.is_some() && !headers.membership.access_all {
+        folder_permissions::save_user(&headers.membership.user_uuid, &collection.uuid, &Grid::EVERY_ITEM, &conn)
+            .await?;
     }
 
     // Keykeeper: with `assigned`, which upstream's web vault reads.
@@ -628,9 +686,25 @@ async fn post_bulk_access_collections(
     for u in &data.users {
         u.grid()?;
     }
-    for col_id in &data.collection_ids {
-        if !folder_permissions::manages(&headers.membership.user_uuid, &org_id, col_id, &conn).await? {
-            err!("Collection not found", "The current user isn't a manager for this collection")
+    // Keykeeper: a custom role that manages shared folders, on the folders it
+    // reaches, giving no more than it has (keykeeper_roles::check_folder_access).
+    let custom = headers.custom_permissions.is_some();
+    if custom {
+        let actor = &headers.membership.user_uuid;
+        let reach = Reach::of(actor, &org_id, &conn).await?;
+        for col_id in &data.collection_ids {
+            if Collection::find_by_uuid_and_org(col_id, &org_id, &conn).await.is_none() {
+                err!("Collection not found")
+            }
+            let stored = folder_permissions::Stored::of_collection(col_id, &conn).await?;
+            let asked = asked_folder_access(col_id, &org_id, &data.groups, &data.users, &stored, None, &conn).await?;
+            keykeeper_roles::check_folder_access(&reach, actor, &org_id, col_id, &stored, &asked, &conn).await?;
+        }
+    } else {
+        for col_id in &data.collection_ids {
+            if !folder_permissions::manages(&headers.membership.user_uuid, &org_id, col_id, &conn).await? {
+                err!("Collection not found", "The current user isn't a manager for this collection")
+            }
         }
     }
 
@@ -639,7 +713,7 @@ async fn post_bulk_access_collections(
             err!("Collection not found")
         };
 
-        if !collection.is_manageable_by_user(&headers.membership.user_uuid, &conn).await? {
+        if !custom && !collection.is_manageable_by_user(&headers.membership.user_uuid, &conn).await? {
             err!("Collection not found", "The current user isn't a manager for this collection")
         }
 
@@ -705,11 +779,23 @@ async fn put_organization_collection_update(
         err!("Collection not found")
     };
 
+    // Keykeeper: the grants as they are, so a grant sent back without our grid
+    // keeps the one it had. A custom role that manages shared folders changes
+    // only one it reaches, giving no more than it has, and leaves its
+    // directory id alone (keykeeper_roles::check_folder_access).
+    let stored = folder_permissions::Stored::of_collection(&col_id, &conn).await?;
+    if headers.custom_permissions.is_some() {
+        let actor = &headers.user.uuid;
+        let reach = Reach::of(actor, &org_id, &conn).await?;
+        let asked = asked_folder_access(&col_id, &org_id, &data.groups, &data.users, &stored, None, &conn).await?;
+        keykeeper_roles::check_folder_access(&reach, actor, &org_id, &col_id, &stored, &asked, &conn).await?;
+    } else {
+        collection.external_id = match data.external_id {
+            Some(external_id) if !external_id.trim().is_empty() => Some(external_id),
+            _ => None,
+        };
+    }
     collection.name = data.name;
-    collection.external_id = match data.external_id {
-        Some(external_id) if !external_id.trim().is_empty() => Some(external_id),
-        _ => None,
-    };
 
     collection.save(&conn).await?;
 
@@ -724,9 +810,8 @@ async fn put_organization_collection_update(
     )
     .await;
 
-    // Keykeeper: each grant with its grid, checked in validate(). A grant
-    // sent back without our grid keeps the one it had.
-    let stored = folder_permissions::Stored::of_collection(&col_id, &conn).await?;
+    // Keykeeper: each grant with its grid, checked in validate(), over the
+    // one it had (read above).
     CollectionGroup::delete_all_by_collection(&col_id, &org_id, &conn).await?;
 
     for group in data.groups {
@@ -765,6 +850,11 @@ async fn delete_organization_collection_impl(
     let Some(collection) = Collection::find_by_uuid_and_org(col_id, org_id, conn).await else {
         err!("Collection not found", "Collection does not exist or does not belong to this organization")
     };
+    // Keykeeper: a custom role that manages shared folders deletes one it
+    // reaches and can delete items in (keykeeper_roles::Reach).
+    if headers.custom_permissions.is_some() {
+        Reach::of(&headers.user.uuid, org_id, conn).await?.ensure_may_delete_folder(col_id)?;
+    }
     log_event(
         EventType::CollectionDeleted,
         &collection.uuid,
@@ -809,6 +899,13 @@ async fn bulk_delete_organization_collections(
     let collections = data.ids;
 
     let headers = ManagerHeaders::from_loose(headers, &collections, &conn).await?;
+    // Keykeeper: a custom role's folders are all checked before any goes.
+    if headers.custom_permissions.is_some() {
+        let reach = Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+        for col_id in &collections {
+            reach.ensure_may_delete_folder(col_id)?;
+        }
+    }
 
     for col_id in collections {
         delete_organization_collection_impl(&org_id, &col_id, &headers, &conn).await?;
@@ -825,6 +922,11 @@ async fn get_org_collection_detail(
 ) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
+    }
+    // Keykeeper: a custom role that manages shared folders reads the ones it
+    // reaches.
+    if headers.custom_permissions.is_some() {
+        Reach::of(&headers.user.uuid, &org_id, &conn).await?.ensure_reaches(&col_id)?;
     }
     match Collection::find_by_uuid_and_user(&col_id, headers.user.uuid.clone(), &conn).await {
         None => err!("Collection not found"),
@@ -885,6 +987,11 @@ async fn get_collection_users(
     let Some(collection) = Collection::find_by_uuid_and_org(&col_id, &org_id, &conn).await else {
         err!("Collection not found in Organization")
     };
+    // Keykeeper: a custom role that manages shared folders reads the ones it
+    // reaches.
+    if headers.custom_permissions.is_some() {
+        Reach::of(&headers.user.uuid, &org_id, &conn).await?.ensure_reaches(&col_id)?;
+    }
 
     // Keykeeper: each grant's grid.
     let extras = Extras::for_collections(std::slice::from_ref(&collection.uuid), &conn).await?;
@@ -913,8 +1020,23 @@ async fn get_org_details(data: OrgIdData, headers: ManagerHeadersLoose, conn: Db
         err_code!("Resource not found.", "Organization id's do not match", Status::NotFound.code);
     }
 
+    // Keykeeper: a custom role with reports, or that manages shared folders,
+    // without access to all items, gets the items it reaches: what its own
+    // vault shows of the organization (DESIGN.md, "Roles and permissions").
     if !headers.membership.has_full_access() {
-        err_code!("Resource not found.", "User does not have full access", Status::NotFound.code);
+        if headers.custom_permissions.is_none() {
+            err_code!("Resource not found.", "User does not have full access", Status::NotFound.code);
+        }
+        let reached: Vec<Cipher> = Cipher::find_by_user_visible(&headers.user.uuid, &conn)
+            .await
+            .into_iter()
+            .filter(|c| c.organization_uuid.as_ref() == Some(&data.organization_id))
+            .collect();
+        return Ok(Json(json!({
+            "data": org_details_json(reached, &headers.host, &headers.user.uuid, &conn).await?,
+            "object": "list",
+            "continuationToken": null,
+        })));
     }
 
     Ok(Json(json!({
@@ -930,7 +1052,16 @@ async fn get_org_details_impl(
     user_id: &UserId,
     conn: &DbConn,
 ) -> Result<Value, crate::Error> {
-    let ciphers = Cipher::find_by_org(org_id, conn).await;
+    org_details_json(Cipher::find_by_org(org_id, conn).await, host, user_id, conn).await
+}
+
+/// Keykeeper: these items as the organization's admin view lists them.
+async fn org_details_json(
+    ciphers: Vec<Cipher>,
+    host: &str,
+    user_id: &UserId,
+    conn: &DbConn,
+) -> Result<Value, crate::error::Error> {
     let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await?;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
@@ -1111,7 +1242,7 @@ async fn send_invite(
         err!("Invalid type")
     };
     // Keykeeper: a Custom role with our permissions is a regular member plus those permissions.
-    let custom_role = crate::db::models::keykeeper_roles::CustomPermissions::from_request(raw_type, &data.permissions)?;
+    let custom_role = keykeeper_roles::CustomPermissions::from_request(raw_type, &data.permissions)?;
     // Keykeeper: custom roles are a company feature, which a family doesn't have.
     if raw_type == "4" {
         super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
@@ -1134,24 +1265,27 @@ async fn send_invite(
     // HACK: This converts the Custom role which has the `Manage all collections` box checked into an access_all flag
     // Since the parent checkbox is not sent to the server we need to check and verify the child checkboxes
     // If the box is not checked, the user will still be a manager, but not with the access_all permission
+    // Keykeeper: or a custom role given access to all items, which only owners
+    // and admins give (ensure_regular_grant).
     let access_all = new_type >= MembershipType::Admin
         || (raw_type.eq("4")
             && data.permissions.get("editAnyCollection") == Some(&json!(true))
             && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
-            && data.permissions.get("createNewCollections") == Some(&json!(true)));
+            && data.permissions.get("createNewCollections") == Some(&json!(true)))
+        || keykeeper_roles::access_all_requested(custom_role.as_ref(), &data.permissions);
     // Keykeeper: a custom role can only add regular members.
-    crate::db::models::keykeeper_roles::ensure_regular_grant(
+    keykeeper_roles::ensure_regular_grant(
         headers.custom_permissions.as_ref(),
         new_type,
         custom_role.as_ref(),
         access_all,
     )?;
-    // Keykeeper: and only to collections it reaches, without groups.
-    if headers.custom_permissions.is_some() {
-        if !data.groups.is_empty() {
-            err!("Your role can't add people to groups")
-        }
-        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+    // Keykeeper: and only to collections it reaches, and to groups only with
+    // manage groups, each within its reach.
+    if let Some(acting_as) = &headers.custom_permissions {
+        let reach = Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+        let asked: HashSet<GroupId> = data.groups.iter().cloned().collect();
+        keykeeper_roles::check_member_groups(acting_as, &reach, &org_id, true, &HashSet::new(), &asked, &conn).await?;
         for col in data.collections.iter().flatten() {
             reach.ensure_grant(&col.id, &col.grid()?)?;
         }
@@ -1219,7 +1353,7 @@ async fn send_invite(
             super::keykeeper_two_step::accepted_without_them(vec![new_member.uuid.clone()], &conn).await?;
         }
         if custom_role.is_some() {
-            crate::db::models::keykeeper_roles::set(&new_member.uuid, custom_role.as_ref(), &conn).await?;
+            keykeeper_roles::set(&new_member.uuid, custom_role.as_ref(), &conn).await?;
         }
         // Keykeeper: the invitation's seal, or none, so an earlier one never vouches for this.
         let seal = data.keykeeper_seals.iter().find(|(e, _)| e.eq_ignore_ascii_case(email)).map(|(_, seal)| seal);
@@ -1365,13 +1499,8 @@ async fn ensure_may_reinvite(
     conn: &DbConn,
 ) -> EmptyResult {
     if let Some(member) = Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
-        crate::db::models::keykeeper_roles::ensure_regular_target(
-            headers.custom_permissions.as_ref(),
-            &headers.user.uuid,
-            &member,
-            conn,
-        )
-        .await?;
+        keykeeper_roles::ensure_regular_target(headers.custom_permissions.as_ref(), &headers.user.uuid, &member, conn)
+            .await?;
     }
     Ok(())
 }
@@ -1629,7 +1758,7 @@ async fn confirm_invite_marked(
         err!("The specified user isn't a member of the organization")
     };
     // Keykeeper: a custom role only confirms regular members.
-    crate::db::models::keykeeper_roles::ensure_regular_target(
+    keykeeper_roles::ensure_regular_target(
         headers.custom_permissions.as_ref(),
         &headers.user.uuid,
         &member_to_confirm,
@@ -1811,7 +1940,7 @@ async fn edit_member(
         err!("Invalid type")
     };
     // Keykeeper: a Custom role with our permissions is a regular member plus those permissions.
-    let custom_role = crate::db::models::keykeeper_roles::CustomPermissions::from_request(raw_type, &data.permissions)?;
+    let custom_role = keykeeper_roles::CustomPermissions::from_request(raw_type, &data.permissions)?;
     // Keykeeper: custom roles are a company feature, which a family doesn't have.
     if raw_type == "4" {
         super::keykeeper_plan_limits::refuse_company_feature(&org_id, &conn).await?;
@@ -1825,24 +1954,27 @@ async fn edit_member(
     // HACK: This converts the Custom role which has the `Manage all collections` box checked into an access_all flag
     // Since the parent checkbox is not sent to the server we need to check and verify the child checkboxes
     // If the box is not checked, the user will still be a manager, but not with the access_all permission
+    // Keykeeper: or a custom role given access to all items, which only owners
+    // and admins give (ensure_regular_grant).
     let access_all = new_type >= MembershipType::Admin
         || (raw_type.eq("4")
             && data.permissions.get("editAnyCollection") == Some(&json!(true))
             && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
-            && data.permissions.get("createNewCollections") == Some(&json!(true)));
+            && data.permissions.get("createNewCollections") == Some(&json!(true)))
+        || keykeeper_roles::access_all_requested(custom_role.as_ref(), &data.permissions);
 
     let Some(mut member_to_edit) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
         err!("The specified user isn't member of the organization")
     };
     // Keykeeper: a custom role only edits regular members, and only into regular members.
-    crate::db::models::keykeeper_roles::ensure_regular_target(
+    keykeeper_roles::ensure_regular_target(
         headers.custom_permissions.as_ref(),
         &headers.user.uuid,
         &member_to_edit,
         &conn,
     )
     .await?;
-    crate::db::models::keykeeper_roles::ensure_regular_grant(
+    keykeeper_roles::ensure_regular_grant(
         headers.custom_permissions.as_ref(),
         new_type as i32,
         custom_role.as_ref(),
@@ -1852,16 +1984,14 @@ async fn edit_member(
     // our grid keeps the one it had (folder_permissions::resolve).
     let stored = folder_permissions::Stored::of_member(&member_to_edit.user_uuid, &org_id, &conn).await?;
     // Keykeeper: a custom role changes only collections it reaches, giving no
-    // more than it has, and leaves groups alone. A grant it leaves as it was
-    // isn't one it gives.
-    let reach = if headers.custom_permissions.is_some() {
+    // more than it has, and someone's groups only with manage groups, each
+    // within its reach. A grant it leaves as it was isn't one it gives.
+    let reach = if let Some(acting_as) = &headers.custom_permissions {
         let current: HashSet<GroupId> =
             GroupUser::find_by_member(&member_to_edit.uuid, &conn).await.into_iter().map(|g| g.groups_uuid).collect();
         let requested: HashSet<GroupId> = data.groups.iter().flatten().cloned().collect();
-        if current != requested {
-            err!("Your role can't change someone's groups")
-        }
-        let reach = crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+        let reach = Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+        keykeeper_roles::check_member_groups(acting_as, &reach, &org_id, false, &current, &requested, &conn).await?;
         for col in data.collections.iter().flatten() {
             let had = stored.user(&member_to_edit.user_uuid, &col.id);
             let grid = col.grid_over(had)?;
@@ -1938,8 +2068,9 @@ async fn edit_member(
         }
     }
 
-    // Keykeeper: groups stay as they were for a custom role (checked above).
-    if reach.is_none() {
+    // Keykeeper: for a custom role, groups change only as checked above (none
+    // at all without manage groups).
+    if reach.is_none() || headers.custom_permissions.as_ref().is_some_and(|r| r.manage_groups) {
         GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
 
         for group_id in data.groups.iter().flatten() {
@@ -1963,7 +2094,7 @@ async fn edit_member(
     .await;
 
     // Keykeeper: keep the custom role in step with the edit.
-    crate::db::models::keykeeper_roles::set(&member_to_edit.uuid, custom_role.as_ref(), &conn).await?;
+    keykeeper_roles::set(&member_to_edit.uuid, custom_role.as_ref(), &conn).await?;
     member_to_edit.save(&conn).await?;
     watch.settle(&conn).await
 }
@@ -2032,7 +2163,7 @@ async fn delete_member_impl(
         err!("User to delete isn't member of the organization")
     };
     // Keykeeper: a custom role only removes regular members.
-    crate::db::models::keykeeper_roles::ensure_regular_target(
+    keykeeper_roles::ensure_regular_target(
         headers.custom_permissions.as_ref(),
         &headers.user.uuid,
         &member_to_delete,
@@ -2823,7 +2954,7 @@ async fn revoke_member_impl(
                 err!("You cannot revoke yourself")
             }
             // Keykeeper: a custom role only revokes regular members.
-            crate::db::models::keykeeper_roles::ensure_regular_target(
+            keykeeper_roles::ensure_regular_target(
                 headers.custom_permissions.as_ref(),
                 &headers.user.uuid,
                 &member,
@@ -2955,7 +3086,7 @@ async fn restore_member_impl(
                 err!("You cannot restore yourself")
             }
             // Keykeeper: a custom role only restores regular members.
-            crate::db::models::keykeeper_roles::ensure_regular_target(
+            keykeeper_roles::ensure_regular_target(
                 headers.custom_permissions.as_ref(),
                 &headers.user.uuid,
                 &member,
@@ -3052,14 +3183,8 @@ async fn get_groups_data(
             // Keykeeper: without access to all items, a custom member sees in
             // each group only the collections they reach themselves, as in the
             // collection list the member dialogs load with it.
-            let reach: Option<HashSet<String>> = if custom && !has_full_access {
-                Some(
-                    Collection::find_by_organization_and_user_uuid(&org_id, &headers.membership.user_uuid, &conn)
-                        .await
-                        .into_iter()
-                        .map(|c| c.uuid.to_string())
-                        .collect(),
-                )
+            let reach = if custom {
+                Some(Reach::of(&headers.membership.user_uuid, &org_id, &conn).await?)
             } else {
                 None
             };
@@ -3068,8 +3193,8 @@ async fn get_groups_data(
                 if custom || headers.folder_manager {
                     group["externalId"] = Value::Null;
                 }
-                if let (Some(reach), Some(collections)) = (&reach, group["collections"].as_array_mut()) {
-                    collections.retain(|c| c["id"].as_str().is_some_and(|id| reach.contains(id)));
+                if let Some(reach) = &reach {
+                    shown_within_reach(&mut group, reach);
                 }
                 groups_json.push(group);
             }
@@ -3108,6 +3233,16 @@ async fn get_groups_details(org_id: OrganizationId, headers: ManagerHeadersLoose
     get_groups_data(true, org_id, headers, conn).await
 }
 
+/// Keykeeper: a group as a custom role sees it: only the collections it
+/// reaches itself, and no directory id (keykeeper_roles::check_group_change
+/// keeps the rest as it was).
+fn shown_within_reach(group: &mut Value, reach: &Reach) {
+    group["externalId"] = Value::Null;
+    if let Some(collections) = group["collections"].as_array_mut() {
+        collections.retain(|c| c["id"].as_str().is_some_and(|id| reach.contains(&CollectionId::from(id.to_owned()))));
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GroupRequest {
@@ -3122,6 +3257,20 @@ struct GroupRequest {
 impl GroupRequest {
     pub fn to_group(&self, org_uuid: &OrganizationId) -> Group {
         Group::new(org_uuid.clone(), self.name.clone(), self.access_all, self.external_id.clone())
+    }
+
+    /// Keykeeper: the group this request asks for, each grant resolved over
+    /// the one it had (empty for a new group).
+    fn asked(&self, group: &GroupId, stored: &folder_permissions::Stored) -> ApiResult<GroupState> {
+        let mut grants = HashMap::new();
+        for c in &self.collections {
+            grants.insert(c.id.clone(), c.grid_over(stored.group(&c.id, group))?);
+        }
+        Ok(GroupState {
+            access_all: self.access_all,
+            grants,
+            members: self.users.iter().cloned().collect(),
+        })
     }
 
     pub fn update_group(&self, mut group: Group) -> Group {
@@ -3204,7 +3353,18 @@ async fn post_groups(
     let group_request = data.into_inner();
     group_request.validate(&org_id, &conn).await?;
 
-    let group = group_request.to_group(&org_id);
+    let mut group = group_request.to_group(&org_id);
+    let stored = folder_permissions::Stored::default();
+    let asked = group_request.asked(&group.uuid, &stored)?;
+    // Keykeeper: a custom role that manages groups makes one within what it
+    // has, without a directory id (keykeeper_roles::check_group_change).
+    let saved = if headers.custom_permissions.is_some() {
+        group.external_id = None;
+        let reach = Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+        keykeeper_roles::check_group_change(&reach, &headers.user.uuid, &org_id, None, asked, &conn).await?
+    } else {
+        asked
+    };
 
     log_event(
         EventType::GroupCreated,
@@ -3217,8 +3377,7 @@ async fn post_groups(
     )
     .await;
 
-    let stored = folder_permissions::Stored::default();
-    add_update_group(group, group_request.collections, group_request.users, org_id, &stored, &headers, &conn).await
+    add_update_group(group, saved, org_id, &headers, &conn).await
 }
 
 #[put("/organizations/<org_id>/groups/<group_id>", data = "<data>")]
@@ -3246,10 +3405,21 @@ async fn put_group(
     let group_request = data.into_inner();
     group_request.validate(&org_id, &conn).await?;
 
-    let updated_group = group_request.update_group(group);
-
-    // Keykeeper: a grant sent back without our grid keeps the one it had.
+    // Keykeeper: a grant sent back without our grid keeps the one it had. A
+    // custom role that manages groups changes one within what it has, and
+    // leaves the collections it doesn't reach as they were
+    // (keykeeper_roles::check_group_change).
     let stored = folder_permissions::Stored::of_group(&group_id, &org_id, &conn).await?;
+    let asked = group_request.asked(&group_id, &stored)?;
+    let saved = if headers.custom_permissions.is_some() {
+        let reach = Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+        let current = GroupState::of(&group, &conn).await?;
+        keykeeper_roles::check_group_change(&reach, &headers.user.uuid, &org_id, Some(&current), asked, &conn).await?
+    } else {
+        asked
+    };
+
+    let updated_group = group_request.update_group(group);
     CollectionGroup::delete_all_by_group(&group_id, &org_id, &conn).await?;
     GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
@@ -3264,29 +3434,26 @@ async fn put_group(
     )
     .await;
 
-    add_update_group(updated_group, group_request.collections, group_request.users, org_id, &stored, &headers, &conn)
-        .await
+    add_update_group(updated_group, saved, org_id, &headers, &conn).await
 }
 
 async fn add_update_group(
     mut group: Group,
-    collections: Vec<CollectionData>,
-    members: Vec<MembershipId>,
+    saved: GroupState,
     org_id: OrganizationId,
-    stored: &folder_permissions::Stored,
     headers: &AdminHeaders,
     conn: &DbConn,
 ) -> JsonResult {
+    group.access_all = saved.access_all;
     group.save(conn).await?;
 
-    // Keykeeper: each grant with its grid, checked in validate(), over the
-    // one it had (empty for a new group).
-    for col_selection in collections {
-        let grid = col_selection.grid_over(stored.group(&col_selection.id, &group.uuid))?;
-        folder_permissions::save_group(&col_selection.id, &group.uuid, &org_id, &grid, conn).await?;
+    // Keykeeper: each grant with its grid, checked in validate() and resolved
+    // over the one it had (GroupRequest::asked).
+    for (collection, grid) in &saved.grants {
+        folder_permissions::save_group(collection, &group.uuid, &org_id, grid, conn).await?;
     }
 
-    for assigned_member in members {
+    for assigned_member in saved.members {
         let mut user_entry = GroupUser::new(group.uuid.clone(), assigned_member.clone());
         user_entry.save(conn).await?;
 
@@ -3329,7 +3496,13 @@ async fn get_group_details(
         err!("Group not found", "Group uuid is invalid or does not belong to the organization")
     };
 
-    Ok(Json(group.to_json_details(&conn).await?))
+    let mut details = group.to_json_details(&conn).await?;
+    // Keykeeper: a custom role that manages groups sees the collections it
+    // reaches, as in the group list.
+    if headers.custom_permissions.is_some() {
+        shown_within_reach(&mut details, &Reach::of(&headers.user.uuid, &org_id, &conn).await?);
+    }
+    Ok(Json(details))
 }
 
 #[delete("/organizations/<org_id>/groups/<group_id>")]
@@ -3353,6 +3526,12 @@ async fn delete_group_impl(
     let Some(group) = Group::find_by_uuid_and_org(group_id, org_id, conn).await else {
         err!("Group not found", "Group uuid is invalid or does not belong to the organization")
     };
+    // Keykeeper: a custom role that manages groups deletes one within its
+    // reach (keykeeper_roles::ensure_may_delete_group).
+    if headers.custom_permissions.is_some() {
+        let reach = Reach::of(&headers.user.uuid, org_id, conn).await?;
+        keykeeper_roles::ensure_may_delete_group(&reach, &GroupState::of(&group, conn).await?)?;
+    }
 
     log_event(
         EventType::GroupDeleted,
@@ -3384,6 +3563,17 @@ async fn bulk_delete_groups(
 
     let data: BulkGroupIds = data.into_inner();
 
+    // Keykeeper: a custom role's groups are all checked before any goes.
+    if headers.custom_permissions.is_some() {
+        let reach = Reach::of(&headers.user.uuid, &org_id, &conn).await?;
+        for group_id in &data.ids {
+            let Some(group) = Group::find_by_uuid_and_org(group_id, &org_id, &conn).await else {
+                err!("Group not found", "Group uuid is invalid or does not belong to the organization")
+            };
+            keykeeper_roles::ensure_may_delete_group(&reach, &GroupState::of(&group, &conn).await?)?;
+        }
+    }
+
     for group_id in data.ids {
         delete_group_impl(&org_id, &group_id, &headers, &conn).await?;
     }
@@ -3403,7 +3593,12 @@ async fn get_group(org_id: OrganizationId, group_id: GroupId, headers: AdminHead
         err!("Group not found", "Group uuid is invalid or does not belong to the organization")
     };
 
-    Ok(Json(group.to_json()))
+    let mut shown = group.to_json();
+    // Keykeeper: a directory's id is for owners and admins.
+    if headers.custom_permissions.is_some() {
+        shown["externalId"] = Value::Null;
+    }
+    Ok(Json(shown))
 }
 
 #[get("/organizations/<org_id>/groups/<group_id>/users")]
@@ -3667,13 +3862,8 @@ async fn check_reset_password_applicable_and_permissions(
         err!("MSP staff can't be recovered by an organization")
     }
     // Keykeeper: a custom role only recovers regular members.
-    crate::db::models::keykeeper_roles::ensure_regular_target(
-        headers.custom_permissions.as_ref(),
-        &headers.user.uuid,
-        &target_user,
-        conn,
-    )
-    .await?;
+    keykeeper_roles::ensure_regular_target(headers.custom_permissions.as_ref(), &headers.user.uuid, &target_user, conn)
+        .await?;
     // Keykeeper: an MSP's people don't recover the client's own owners
     // (keykeeper_offboarding.rs).
     super::keykeeper_offboarding::protect_own_owner(&target_user, &headers.user, "recover", conn).await?;
@@ -3803,13 +3993,10 @@ async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, conn: DbC
         err!("Organization not found", "Organization id's do not match");
     }
     // Keykeeper: the export holds every item, so a custom role exports only
-    // with access to all items. A client's own custom roles can't have that
-    // yet, so for them import and export covers import.
+    // with access to all items, which owners and admins give it. Without it,
+    // import and export covers import.
     if headers.custom_permissions.is_some()
-        && !matches!(
-            crate::db::models::keykeeper_roles::Reach::of(&headers.user.uuid, &org_id, &conn).await?,
-            crate::db::models::keykeeper_roles::Reach::All
-        )
+        && !matches!(Reach::of(&headers.user.uuid, &org_id, &conn).await?, Reach::All)
     {
         err!("Exporting the organization's vault needs access to all items")
     }

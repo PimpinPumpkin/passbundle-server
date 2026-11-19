@@ -351,7 +351,24 @@ pub fn catchers() -> Vec<Catcher> {
 }
 
 #[catch(404)]
-fn api_not_found() -> Json<Value> {
+fn api_not_found(request: &rocket::Request<'_>) -> Json<Value> {
+    // Keykeeper: a custom member's role doesn't cover the request
+    // (keykeeper_roles::refuse). Upstream's error shape, so the web vault
+    // shows the words.
+    if crate::db::models::keykeeper_roles::refused_by_role(request) {
+        let message = crate::db::models::keykeeper_roles::CANT_DO_THAT_HERE;
+        return Json(json!({
+            "message": message,
+            "validationErrors": { "": [message] },
+            "errorModel": { "message": message, "object": "error" },
+            "error": "",
+            "error_description": "",
+            "exceptionMessage": null,
+            "exceptionStackTrace": null,
+            "innerExceptionMessage": null,
+            "object": "error",
+        }));
+    }
     Json(json!({
         "error": {
             "code": 404,
