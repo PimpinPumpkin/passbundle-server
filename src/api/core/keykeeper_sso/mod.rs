@@ -22,6 +22,12 @@
 // 4. The web vault redeems that code at /identity/connect/token with its PKCE
 //    verifier (redeem_code below), and link.rs decides which account it is.
 //
+// The native apps (the command-line tool, and PassBundle's desktop and phone
+// apps) are this server's clients the same way, each answered only at its
+// own listener on the computer or its scheme on the phone
+// (redirect_allowed), and authorize asks the person first for them, on a
+// page of this server's (ask_app).
+//
 // Linking an account that already has keys takes a session that proved the
 // master password, and that session's confirmation ("Linking an account"
 // below). With "Require single sign-on" on, a member who isn't linked yet
@@ -113,18 +119,55 @@ fn connector_uri() -> String {
 /// the web vault and the browser extension; for the command-line tool, its
 /// own listener on the computer it runs on, exactly as upstream's tool asks
 /// for it (`http://localhost:<port>`, the first free port of 8065 to 8070), as
-/// a native app's loopback redirect (RFC 8252). Nothing else is accepted.
-/// The code the answer carries works only with the app's PKCE verifier, the
-/// same client, and the same redirect URI (`redeem_code`).
+/// a native app's loopback redirect (RFC 8252); for PassBundle's desktop app,
+/// its own listener on a port the OS gave it (`desktop_listener`); for
+/// PassBundle's phone apps, their private-use scheme (`PHONE_REDIRECT`).
+/// Nothing else is accepted. The code the answer carries works only with the
+/// app's PKCE verifier, the same client, and the same redirect URI
+/// (`redeem_code`). See DESIGN.md, "In the desktop and phone apps".
 fn redirect_allowed(client_id: &str, redirect_uri: &str) -> Result<(), &'static str> {
     match client_id {
         "web" | "browser" if redirect_uri == connector_uri() => Ok(()),
         "cli" if CLI_LISTENER_PORTS.into_iter().any(|port| redirect_uri == format!("http://localhost:{port}")) => {
             Ok(())
         }
-        "web" | "browser" | "cli" => Err("Unsupported redirect URI"),
-        _ => Err("Single sign-on works from the web vault, the browser extension, and the command-line tool."),
+        "desktop" if desktop_listener(redirect_uri) => Ok(()),
+        "mobile" if redirect_uri == PHONE_REDIRECT => Ok(()),
+        "web" | "browser" | "cli" | "desktop" | "mobile" => Err("Unsupported redirect URI"),
+        _ => Err(
+            "Single sign-on works from the web vault, the browser extension, the command-line tool, and the PassBundle apps.",
+        ),
     }
+}
+
+/// PassBundle's phone apps' redirect: a private-use scheme named after the
+/// apps' own reverse domain name (RFC 8252, 7.1), which is their Android
+/// application id and iOS bundle id.
+pub const PHONE_REDIRECT: &str = "com.passbundle.app:/sso";
+
+/// The lowest port the desktop app's listener may be on. The OS never hands
+/// out a lower one (only an administrator's program can hold one).
+const DESKTOP_LOWEST_PORT: u16 = 1024;
+
+/// Whether this is PassBundle's desktop app's listener, exactly as it asks
+/// for it: `http://127.0.0.1:<port>/sso`, the port the OS gave it (RFC 8252,
+/// 7.3, has a server take any port for a loopback redirect), written in
+/// plain digits, from 1024 to 65535, and nothing else around it: never
+/// `localhost` or `[::1]` (RFC 8252, 8.3), never another path, a query, a
+/// fragment, or user info.
+fn desktop_listener(redirect_uri: &str) -> bool {
+    let Some(port) = redirect_uri.strip_prefix("http://127.0.0.1:").and_then(|rest| rest.strip_suffix("/sso")) else {
+        return false;
+    };
+    let digits = !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit());
+    digits && !port.starts_with('0') && port.parse::<u16>().is_ok_and(|p| p >= DESKTOP_LOWEST_PORT)
+}
+
+/// The native apps, whose answer goes to a listener or a scheme on the
+/// person's own device: authorize asks first, on a page of this server's
+/// (`ask_app`).
+fn native_app(client_id: &str) -> bool {
+    matches!(client_id, "cli" | "desktop" | "mobile")
 }
 
 /// The most email domains one organization may add.
@@ -1087,8 +1130,7 @@ fn looks_like_challenge(challenge: &str) -> bool {
 }
 
 /// What /identity/connect/authorize answers: the way to the organization's
-/// tenant, or, for the command-line tool, a page that asks first
-/// (`ask_cli`).
+/// tenant, or, for the native apps, a page that asks first (`ask_app`).
 #[derive(Responder)]
 pub enum AuthorizeAnswer {
     Redirect(Box<Redirect>),
@@ -1096,8 +1138,9 @@ pub enum AuthorizeAnswer {
 }
 
 /// Starts a sign-in: checks what the app sent, remembers it, and sends the
-/// browser to the organization's tenant; for the command-line tool, first to
-/// a page of this server's that asks (`ask_cli`).
+/// browser to the organization's tenant; for the native apps (the
+/// command-line tool, and PassBundle's desktop and phone apps), first to a
+/// page of this server's that asks (`ask_app`).
 pub async fn authorize(
     a: Authorize,
     cookies: &CookieJar<'_>,
@@ -1146,8 +1189,8 @@ pub async fn authorize(
         }
         None => None,
     };
-    if a.client_id == "cli" {
-        return Ok(AuthorizeAnswer::Confirm(ask_cli(a, &config, cookies, conn).await?));
+    if native_app(&a.client_id) {
+        return Ok(AuthorizeAnswer::Confirm(ask_app(a, &config, cookies, conn).await?));
     }
     let link = link.map(|l| (l.user_uuid, l.session_ref));
     let url = start_sign_in(a, &config, link, cookies, conn).await?;
@@ -1229,25 +1272,30 @@ async fn start_sign_in(
 }
 
 // ---------------------------------------------------------------------------
-// The command-line tool's sign-in asks first. Its answer goes to a listener
-// on the computer (`http://localhost:<port>`), where anything else listening
-// on that port (another person's program, on a shared server) could take it.
-// So a link alone, which anyone can send, must never get as far as Microsoft,
-// which may sign someone in without asking: authorize answers with a page of
-// this server's that says what the sign-in is for, and only a same-origin
-// POST from that page (its one-time token, and a SameSite=Strict cookie that
-// no other site's page can make a browser send) goes on. See DESIGN.md, "Sign
-// in with Microsoft Entra ID", "Threat model".
+// The native apps' sign-ins ask first: the command-line tool's, and
+// PassBundle's desktop and phone apps'. Their answer goes to a listener on
+// the computer (`http://localhost:<port>` for the tool,
+// `http://127.0.0.1:<port>/sso` for the desktop app) or to a private-use
+// scheme on the phone (`com.passbundle.app:`), where anything else listening
+// on that port (another person's program, on a shared computer), or another
+// app that claims the scheme, could take it. So a link alone, which anyone
+// can send, must never get as far as Microsoft, which may sign someone in
+// without asking (RFC 8252, 8.6): authorize answers with a page of this
+// server's that says what the sign-in is for, and only a same-origin POST
+// from that page (its one-time token, and a SameSite=Strict cookie that no
+// other site's page can make a browser send) goes on. See DESIGN.md, "Sign in
+// with Microsoft Entra ID", "In the desktop and phone apps" and "Threat
+// model".
 
-const CLI_CONFIRM_COOKIE: &str = "PB_SSO_CLI_CONFIRM";
+const APP_CONFIRM_COOKIE: &str = "PB_SSO_APP_CONFIRM";
 /// How long the page's question stands, as a sign-in's state does.
-const CLI_CONFIRM_TTL: Duration = Duration::from_mins(10);
+const APP_CONFIRM_TTL: Duration = Duration::from_mins(10);
 /// At most this many waiting questions; a start beyond them is refused.
-const CLI_CONFIRM_MAX: usize = 10_000;
+const APP_CONFIRM_MAX: usize = 10_000;
 
-/// A question the page asks, by its token's hash: what the tool sent, and the
+/// A question the page asks, by its token's hash: what the app sent, and the
 /// hash of the cookie the page's browser got with it.
-struct CliConfirmation {
+struct AppConfirmation {
     authorize: Authorize,
     org_uuid: OrganizationId,
     cookie_hash: String,
@@ -1258,14 +1306,14 @@ struct CliConfirmation {
 /// minutes, once, from the browser it was asked in. A restart forgets them,
 /// and the person starts the sign-in again.
 #[derive(Default)]
-struct CliConfirmations {
-    entries: DashMap<String, CliConfirmation>,
+struct AppConfirmations {
+    entries: DashMap<String, AppConfirmation>,
 }
 
-impl CliConfirmations {
-    fn remember(&self, token_hash: String, confirmation: CliConfirmation, now: Instant) -> bool {
+impl AppConfirmations {
+    fn remember(&self, token_hash: String, confirmation: AppConfirmation, now: Instant) -> bool {
         self.entries.retain(|_, c| c.expires > now);
-        if self.entries.len() >= CLI_CONFIRM_MAX {
+        if self.entries.len() >= APP_CONFIRM_MAX {
             return false;
         }
         self.entries.insert(token_hash, confirmation);
@@ -1274,37 +1322,69 @@ impl CliConfirmations {
 
     /// The question for this token, once, if it hasn't expired and the cookie
     /// is the one its browser got.
-    fn take(&self, token_hash: &str, cookie: Option<&str>, now: Instant) -> Option<CliConfirmation> {
+    fn take(&self, token_hash: &str, cookie: Option<&str>, now: Instant) -> Option<AppConfirmation> {
         let (_, confirmation) = self.entries.remove(token_hash)?;
         let cookie_matches = cookie.is_some_and(|c| ct_eq(sso_hash(c), &confirmation.cookie_hash));
         (confirmation.expires > now && cookie_matches).then_some(confirmation)
     }
 }
 
-static CLI_CONFIRMATIONS: LazyLock<CliConfirmations> = LazyLock::new(CliConfirmations::default);
+static APP_CONFIRMATIONS: LazyLock<AppConfirmations> = LazyLock::new(AppConfirmations::default);
 
 /// Text for an HTML page.
 fn html_escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
-/// The page that asks: which organization, which listener, and to go on only
-/// for a sign-in the person just started themselves.
-fn cli_confirm_page(organization: &str, listener: &str, token: &str) -> String {
+/// What the page says, by app: its title and heading, then its paragraphs,
+/// in HTML, with what came from elsewhere (the organization's name, the
+/// listener's address) escaped.
+fn confirm_words(client_id: &str, organization: &str, listener: &str) -> (&'static str, &'static str, String) {
+    let organization = html_escape(organization);
+    let listener = html_escape(listener);
+    match client_id {
+        "cli" => (
+            "Sign in to the command-line tool",
+            "Sign in to the PassBundle command-line tool?",
+            format!(
+                "<p>This signs in the <code>passbundle</code> command on the computer this browser runs on, with {organization}'s single sign-on, and hands the sign-in to the program listening at <code>{listener}</code>.</p>\n<p>Go on only if you just ran <code>passbundle login --sso</code> yourself. If a link someone sent you opened this page, close it.</p>"
+            ),
+        ),
+        "mobile" => (
+            "Sign in to the PassBundle app",
+            "Sign in to the PassBundle app?",
+            format!(
+                "<p>This signs in the PassBundle app on this phone or tablet, with {organization}'s single sign-on.</p>\n<p>Go on only if you just chose Use single sign-on in the PassBundle app yourself. If a link someone sent you opened this page, close it.</p>"
+            ),
+        ),
+        _ => (
+            "Sign in to the PassBundle app",
+            "Sign in to the PassBundle app?",
+            format!(
+                "<p>This signs in the PassBundle app on the computer this browser runs on, with {organization}'s single sign-on, and hands the sign-in to the program listening at <code>{listener}</code>.</p>\n<p>Go on only if you just chose Use single sign-on in the PassBundle app yourself. If a link someone sent you opened this page, close it.</p>"
+            ),
+        ),
+    }
+}
+
+/// The page that asks: which app, which organization, for a computer which
+/// listener, and to go on only for a sign-in the person just started
+/// themselves.
+fn confirm_page(client_id: &str, organization: &str, listener: &str, token: &str) -> String {
+    let (title, heading, words) = confirm_words(client_id, organization, listener);
     format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in to the command-line tool</title>
+<title>{title}</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}button{{font:inherit;padding:.5rem 1rem}}</style>
 </head>
 <body>
 <main>
-<h1>Sign in to the PassBundle command-line tool?</h1>
-<p>This signs in the <code>passbundle</code> command on the computer this browser runs on, with {organization}'s single sign-on, and hands the sign-in to the program listening at <code>{listener}</code>.</p>
-<p>Go on only if you just ran <code>passbundle login --sso</code> yourself. If a link someone sent you opened this page, close it.</p>
+<h1>{heading}</h1>
+{words}
 <form method="post" action="{action}">
 <input type="hidden" name="token" value="{token}">
 <button type="submit">Continue to Microsoft</button>
@@ -1313,8 +1393,6 @@ fn cli_confirm_page(organization: &str, listener: &str, token: &str) -> String {
 </body>
 </html>
 "#,
-        organization = html_escape(organization),
-        listener = html_escape(listener),
         action = html_escape(&format!("{}/identity/connect/authorize/confirm", CONFIG.domain())),
         token = html_escape(token),
     )
@@ -1325,10 +1403,11 @@ const CLI_LISTENER_PORTS: std::ops::RangeInclusive<u16> = 8065..=8070;
 
 /// What the page's policy adds to `form-action`, by path: the page's Continue
 /// posts to this server, which sends the browser on to the tenant's sign-in,
-/// back here, and on to the tool's listener, and browsers hold every step of
-/// that to the policy of the page the form was on. So the command-line tool's
-/// page (authorize's answer) names the sign-in's host and the tool's
-/// listeners; no other page does.
+/// back here, and on to the app, and browsers hold every step of that to the
+/// policy of the page the form was on. So the native apps' page (authorize's
+/// answer) names the sign-in's host, the command-line tool's listeners, the
+/// desktop app's (`http://127.0.0.1` on any port: the OS picks it), and the
+/// phones' scheme; no other page does.
 pub fn form_action_sources(path: &str) -> String {
     if !path.ends_with("/identity/connect/authorize") {
         return String::new();
@@ -1337,13 +1416,14 @@ pub fn form_action_sources(path: &str) -> String {
         .map(|a| format!(" {}", a.origin().ascii_serialization()))
         .unwrap_or_default();
     let listeners: Vec<String> = CLI_LISTENER_PORTS.map(|port| format!("http://localhost:{port}")).collect();
-    format!("{authority} {}", listeners.join(" "))
+    let phones = PHONE_REDIRECT.split_once(':').map(|(scheme, _)| scheme).unwrap_or_default();
+    format!("{authority} {} http://127.0.0.1:* {phones}:", listeners.join(" "))
 }
 
-/// For the command-line tool: remembers its request, and answers with the
+/// For the native apps: remembers the app's request, and answers with the
 /// page that asks, with a cookie only this server's own pages make a browser
 /// send.
-async fn ask_cli(
+async fn ask_app(
     a: Authorize,
     config: &SsoConfig,
     cookies: &CookieJar<'_>,
@@ -1351,18 +1431,18 @@ async fn ask_cli(
 ) -> ApiResult<RawHtml<String>> {
     let organization = Organization::find_by_uuid(&config.org_uuid, conn).await.map(|o| o.name).unwrap_or_default();
     let (token, cookie) = (sso_random(), sso_random());
-    let listener = a.redirect_uri.clone();
-    let confirmation = CliConfirmation {
+    let (client_id, listener) = (a.client_id.clone(), a.redirect_uri.clone());
+    let confirmation = AppConfirmation {
         authorize: a,
         org_uuid: config.org_uuid.clone(),
         cookie_hash: sso_hash(&cookie),
-        expires: Instant::now() + CLI_CONFIRM_TTL,
+        expires: Instant::now() + APP_CONFIRM_TTL,
     };
-    if !CLI_CONFIRMATIONS.remember(sso_hash(&token), confirmation, Instant::now()) {
+    if !APP_CONFIRMATIONS.remember(sso_hash(&token), confirmation, Instant::now()) {
         err!("Too many sign-ins are waiting. Try again in a few minutes.")
     }
     cookies.add(
-        Cookie::build((CLI_CONFIRM_COOKIE, cookie))
+        Cookie::build((APP_CONFIRM_COOKIE, cookie))
             .path(binding_cookie_path())
             .max_age(time::Duration::minutes(10))
             // Strict: a page of another site can't make the browser send it.
@@ -1371,7 +1451,7 @@ async fn ask_cli(
             .secure(CONFIG.domain().starts_with("https://"))
             .build(),
     );
-    Ok(RawHtml(cli_confirm_page(&organization, &listener, &token)))
+    Ok(RawHtml(confirm_page(&client_id, &organization, &listener, &token)))
 }
 
 /// Where a request came from, as the browser says: its `Origin`, and its
@@ -1404,7 +1484,7 @@ impl RequestOrigin {
 
 /// The page's Continue: the question's token, from the page itself, in the
 /// browser it was asked in, once. Then on to the tenant, as for any app.
-pub async fn confirm_cli(
+pub async fn confirm_app(
     token: &str,
     from: RequestOrigin,
     cookies: &CookieJar<'_>,
@@ -1412,14 +1492,14 @@ pub async fn confirm_cli(
     conn: &DbConn,
 ) -> ApiResult<Redirect> {
     crate::ratelimit::check_limit_prelogin(ip)?;
-    let cookie = cookies.get(CLI_CONFIRM_COOKIE).map(|c| c.value().to_owned());
-    cookies.remove(Cookie::build(CLI_CONFIRM_COOKIE).path(binding_cookie_path()).build());
+    let cookie = cookies.get(APP_CONFIRM_COOKIE).map(|c| c.value().to_owned());
+    cookies.remove(Cookie::build(APP_CONFIRM_COOKIE).path(binding_cookie_path()).build());
     if !from.same_origin() {
         err!("Continue from the sign-in page itself.")
     }
-    let Some(confirmation) = CLI_CONFIRMATIONS.take(&sso_hash(token), cookie.as_deref(), Instant::now()) else {
+    let Some(confirmation) = APP_CONFIRMATIONS.take(&sso_hash(token), cookie.as_deref(), Instant::now()) else {
         err!(
-            "This sign-in expired, was already used, or was started in another browser. Run passbundle login --sso again."
+            "This sign-in expired, was already used, or was started in another browser. Start it again from PassBundle (for the command-line tool, run passbundle login --sso again)."
         )
     };
     let Some(config) = SsoConfig::find(&confirmation.org_uuid, conn).await.filter(SsoConfig::ready) else {
@@ -1911,13 +1991,95 @@ mod tests {
         ] {
             assert_eq!(redirect_allowed(client, uri), Err("Unsupported redirect URI"), "{client} {uri}");
         }
-        for client in ["desktop", "mobile", "connector", ""] {
+        for client in ["connector", "", "Desktop"] {
             assert!(redirect_allowed(client, &connector).is_err(), "{client}");
         }
     }
 
-    fn waiting(cookie: &str, expires: Instant) -> CliConfirmation {
-        CliConfirmation {
+    #[test]
+    fn passbundles_apps_get_the_answer_only_at_their_own_listener_or_scheme() {
+        for port in [1024, 8065, 49152, 51004, 65535] {
+            assert_eq!(redirect_allowed("desktop", &format!("http://127.0.0.1:{port}/sso")), Ok(()), "{port}");
+        }
+        assert_eq!(redirect_allowed("mobile", PHONE_REDIRECT), Ok(()));
+        let connector = connector_uri();
+        for (client, uri) in [
+            // The desktop app: 127.0.0.1, a port the OS hands out, /sso, nothing else.
+            ("desktop", "http://127.0.0.1:1023/sso"),
+            ("desktop", "http://127.0.0.1:0/sso"),
+            ("desktop", "http://127.0.0.1:65536/sso"),
+            ("desktop", "http://127.0.0.1:99999/sso"),
+            ("desktop", "http://127.0.0.1:051004/sso"),
+            ("desktop", "http://127.0.0.1:+5100/sso"),
+            ("desktop", "http://127.0.0.1:/sso"),
+            ("desktop", "http://127.0.0.1/sso"),
+            ("desktop", "http://127.0.0.1:51004"),
+            ("desktop", "http://127.0.0.1:51004/"),
+            ("desktop", "http://127.0.0.1:51004/sso/"),
+            ("desktop", "http://127.0.0.1:51004/ssox"),
+            ("desktop", "http://127.0.0.1:51004/sso?x=1"),
+            ("desktop", "http://127.0.0.1:51004/sso#x"),
+            ("desktop", "http://127.0.0.1:51004/callback"),
+            ("desktop", "http://127.0.0.1:51004/SSO"),
+            ("desktop", "https://127.0.0.1:51004/sso"),
+            ("desktop", "http://localhost:51004/sso"),
+            ("desktop", "http://[::1]:51004/sso"),
+            ("desktop", "http://127.0.0.2:51004/sso"),
+            ("desktop", "http://127.0.0.1.example.com:51004/sso"),
+            ("desktop", "http://user@127.0.0.1:51004/sso"),
+            ("desktop", "http://127.0.0.1:51004@evil.example/sso"),
+            ("desktop", "http://127.0.0.1:51004/sso@evil.example"),
+            ("desktop", "http://localhost:8065"),
+            ("desktop", PHONE_REDIRECT),
+            ("desktop", connector.as_str()),
+            // The phones: exactly their scheme's address.
+            ("mobile", "com.passbundle.app:/sso/"),
+            ("mobile", "com.passbundle.app:/sso?x=1"),
+            ("mobile", "com.passbundle.app://sso"),
+            ("mobile", "com.passbundle.app:sso"),
+            ("mobile", "com.passbundle.app:/callback"),
+            ("mobile", "COM.PASSBUNDLE.APP:/sso"),
+            ("mobile", "com.passbundle.app.evil:/sso"),
+            ("mobile", "passbundle://sso-callback"),
+            ("mobile", "passbundle://duo-callback"),
+            ("mobile", "bitwarden://sso-callback"),
+            ("mobile", "http://127.0.0.1:51004/sso"),
+            ("mobile", connector.as_str()),
+            // And neither app's address for another app.
+            ("cli", "http://127.0.0.1:51004/sso"),
+            ("cli", PHONE_REDIRECT),
+            ("web", "http://127.0.0.1:51004/sso"),
+            ("web", PHONE_REDIRECT),
+            ("browser", "http://127.0.0.1:51004/sso"),
+            ("browser", PHONE_REDIRECT),
+        ] {
+            assert_eq!(redirect_allowed(client, uri), Err("Unsupported redirect URI"), "{client} {uri}");
+        }
+    }
+
+    #[test]
+    fn the_native_apps_ask_first_and_the_web_vaults_dont() {
+        for client in ["cli", "desktop", "mobile"] {
+            assert!(native_app(client), "{client}");
+        }
+        for client in ["web", "browser", "connector", ""] {
+            assert!(!native_app(client), "{client}");
+        }
+    }
+
+    #[test]
+    fn the_phones_redirect_is_one_the_server_can_send_the_browser_to() {
+        let mut url = url::Url::parse(PHONE_REDIRECT).unwrap();
+        url.query_pairs_mut().append_pair("code", "a-b_c").append_pair("state", "s=1&2");
+        assert_eq!(url.as_str(), "com.passbundle.app:/sso?code=a-b_c&state=s%3D1%262");
+        assert!(rocket::http::uri::Reference::parse_owned(String::from(url)).is_ok());
+        let mut url = url::Url::parse("http://127.0.0.1:51004/sso").unwrap();
+        url.query_pairs_mut().append_pair("code", "c");
+        assert_eq!(url.as_str(), "http://127.0.0.1:51004/sso?code=c");
+    }
+
+    fn waiting(cookie: &str, expires: Instant) -> AppConfirmation {
+        AppConfirmation {
             authorize: Authorize {
                 client_id: "cli".to_owned(),
                 redirect_uri: "http://localhost:8065".to_owned(),
@@ -1934,10 +2096,10 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_question_goes_on_once_only_with_its_browsers_cookie_in_time() {
+    fn the_apps_question_goes_on_once_only_with_its_browsers_cookie_in_time() {
         let now = Instant::now();
-        let later = now + CLI_CONFIRM_TTL;
-        let asked = CliConfirmations::default();
+        let later = now + APP_CONFIRM_TTL;
+        let asked = AppConfirmations::default();
 
         assert!(asked.remember(sso_hash("token"), waiting("cookie", later), now));
         assert!(asked.take(&sso_hash("token"), Some("cookie"), now).is_some());
@@ -1960,26 +2122,26 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_questions_are_capped_and_expired_ones_make_room() {
+    fn the_apps_questions_are_capped_and_expired_ones_make_room() {
         let now = Instant::now();
-        let asked = CliConfirmations::default();
-        for i in 0..CLI_CONFIRM_MAX {
-            assert!(asked.remember(sso_hash(&i.to_string()), waiting("c", now + CLI_CONFIRM_TTL), now));
+        let asked = AppConfirmations::default();
+        for i in 0..APP_CONFIRM_MAX {
+            assert!(asked.remember(sso_hash(&i.to_string()), waiting("c", now + APP_CONFIRM_TTL), now));
         }
-        assert!(!asked.remember(sso_hash("one more"), waiting("c", now + CLI_CONFIRM_TTL), now));
+        assert!(!asked.remember(sso_hash("one more"), waiting("c", now + APP_CONFIRM_TTL), now));
         // Once they've expired, they make room.
-        let later = now + CLI_CONFIRM_TTL + Duration::from_secs(1);
-        assert!(asked.remember(sso_hash("one more"), waiting("c", later + CLI_CONFIRM_TTL), later));
+        let later = now + APP_CONFIRM_TTL + Duration::from_secs(1);
+        assert!(asked.remember(sso_hash("one more"), waiting("c", later + APP_CONFIRM_TTL), later));
         assert_eq!(asked.entries.len(), 1);
     }
 
     #[test]
-    fn only_the_tools_page_may_post_on_to_the_tenant() {
+    fn only_the_native_apps_page_may_post_on_to_the_tenant_and_the_apps() {
         let authority = url::Url::parse(CONFIG.sso_entra_authority().trim_end_matches('/')).unwrap();
         assert_eq!(
             form_action_sources("/identity/connect/authorize"),
             format!(
-                " {} http://localhost:8065 http://localhost:8066 http://localhost:8067 http://localhost:8068 http://localhost:8069 http://localhost:8070",
+                " {} http://localhost:8065 http://localhost:8066 http://localhost:8067 http://localhost:8068 http://localhost:8069 http://localhost:8070 http://127.0.0.1:* com.passbundle.app:",
                 authority.origin().ascii_serialization()
             )
         );
@@ -1989,12 +2151,37 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_page_escapes_what_it_shows() {
-        let page = cli_confirm_page("<b>Acme</b> & \"Co\"", "http://localhost:8065", "tok'en");
-        assert!(page.contains("&lt;b&gt;Acme&lt;/b&gt; &amp; &quot;Co&quot;"));
-        assert!(page.contains("value=\"tok&#39;en\""));
-        assert!(page.contains("<form method=\"post\""));
-        assert!(!page.contains("<script"));
+    fn the_apps_page_escapes_what_it_shows() {
+        for client in ["cli", "desktop", "mobile"] {
+            let page = confirm_page(client, "<b>Acme</b> & \"Co\"", "http://127.0.0.1:1/<i>", "tok'en");
+            assert!(page.contains("&lt;b&gt;Acme&lt;/b&gt; &amp; &quot;Co&quot;"), "{client}");
+            assert!(!page.contains("<b>") && !page.contains("<i>"), "{client}");
+            assert!(page.contains("value=\"tok&#39;en\""), "{client}");
+            assert!(page.contains("<form method=\"post\""), "{client}");
+            assert!(page.contains("Continue to Microsoft"), "{client}");
+            assert!(!page.contains("<script"), "{client}");
+        }
+    }
+
+    #[test]
+    fn the_apps_page_says_which_app_it_signs_in() {
+        let tool = confirm_page("cli", "Acme", "http://localhost:8065", "t");
+        assert!(tool.contains("<h1>Sign in to the PassBundle command-line tool?</h1>"));
+        assert!(tool.contains("<code>http://localhost:8065</code>"));
+        assert!(tool.contains("passbundle login --sso"));
+        let desktop = confirm_page("desktop", "Acme", "http://127.0.0.1:51004/sso", "t");
+        assert!(desktop.contains("<h1>Sign in to the PassBundle app?</h1>"));
+        assert!(desktop.contains("on the computer this browser runs on, with Acme's single sign-on"));
+        assert!(desktop.contains("<code>http://127.0.0.1:51004/sso</code>"));
+        assert!(desktop.contains("Use single sign-on in the PassBundle app yourself"));
+        let phone = confirm_page("mobile", "Acme", PHONE_REDIRECT, "t");
+        assert!(phone.contains("<h1>Sign in to the PassBundle app?</h1>"));
+        assert!(phone.contains("on this phone or tablet, with Acme's single sign-on"));
+        assert!(phone.contains("Use single sign-on in the PassBundle app yourself"));
+        assert!(!phone.contains("listening"));
+        for page in [&tool, &desktop, &phone] {
+            assert!(page.contains("If a link someone sent you opened this page, close it."));
+        }
     }
 
     #[test]

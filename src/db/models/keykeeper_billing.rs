@@ -18,7 +18,8 @@ use crate::{
 };
 
 use super::{
-    Billed, MspId, OrganizationId, Plan, PlanName, PlanOwner, SetBy, Standing, UserId, keykeeper_plans::find_row,
+    Billed, MspId, OrganizationId, Plan, PlanName, PlanOwner, SetBy, Standing, UserId,
+    keykeeper_plans::{find_row, writing_plan},
 };
 
 type Query<T> = Result<T, diesel::result::Error>;
@@ -272,7 +273,9 @@ impl BillingCustomer {
 ///   operator set by hand, stands, and a person or an organization with no
 ///   plan still has none.
 ///
-/// Either way `checked_at` says when the provider last answered.
+/// Either way `checked_at` says when the provider last answered. The row is
+/// read and written with the plan's lock held (`writing_plan`), so an
+/// operator's save or the plans' clock at the same moment waits its turn.
 fn write_answer(
     conn: &mut DbConnInner,
     whose: &PlanOwner,
@@ -281,7 +284,7 @@ fn write_answer(
     answer: Option<&ProviderAnswer>,
     at: NaiveDateTime,
 ) -> Query<bool> {
-    conn.transaction(|conn| {
+    writing_plan(conn, whose, |conn| {
         let old = find_row(conn, whose)?;
         let paid = answer.filter(|answer| answer.standing != Standing::None);
         let provider_set = |row: &Plan| row.set_by == SetBy::Provider.as_str();
@@ -503,6 +506,25 @@ mod tests {
             ("premium", Standing::None, None, false)
         );
         assert_eq!(row.provider_subscription, None);
+    }
+
+    /// A provider's answer waits for a write in progress elsewhere (the
+    /// plans' clock's, or a request's), as the operator's save does, instead
+    /// of failing with "database is locked".
+    #[rocket::async_test]
+    async fn an_answer_waits_for_a_write_in_progress() {
+        let pool = DbPool::for_test_pool_of(2);
+        let conn = pool.get().await.unwrap();
+        let ana = person(&conn).await;
+        let year = noon() + TimeDelta::days(365);
+        for answer in [paid(PlanName::Premium, year, true), paid(PlanName::Premium, year, false)] {
+            let released = pool.hold_write_lock(std::time::Duration::from_millis(300)).await;
+            let written = write_provider_answer(&ana, "standin", "cus_1", Some(&answer), noon(), &conn).await;
+            released.await.unwrap();
+            assert!(written.map_err(|e| e.message().to_owned()).expect("the answer waits, and is written"));
+        }
+        let row = Plan::find(&ana, &conn).await.unwrap().unwrap();
+        assert_eq!((row.set_by.as_str(), row.until, row.renews), ("provider", Some(year), false));
     }
 
     #[rocket::async_test]

@@ -13,7 +13,7 @@ use crate::{
     auth::Headers,
     db::{
         DbConn,
-        models::{Collection, CollectionId, EventType, OrganizationId, keykeeper_folder_permissions},
+        models::{Collection, CollectionId, EventType, OrganizationId, keykeeper_folder_permissions, keykeeper_roles},
     },
 };
 
@@ -55,8 +55,9 @@ struct LookData {
 /// rename it with upstream's `PUT /organizations/<org>/collections/<id>`: a
 /// confirmed member who manages the folder (owners, admins, managers with
 /// access to all items, and anyone whose grid there has manage, through a
-/// group or directly; keykeeper_folder_permissions::manages), the same rule
-/// that route's guard applies. Answers with the folder as a save does
+/// group or directly; keykeeper_folder_permissions::manages), or a custom role
+/// that manages shared folders, in one it reaches (keykeeper_roles), the same
+/// rule that route's guard applies. Answers with the folder as a save does
 /// (Collection::to_json_saved), the look in it.
 #[put("/keykeeper/organizations/<org_id>/collections/<col_id>/look", data = "<data>")]
 async fn put_look(
@@ -74,7 +75,9 @@ async fn put_look(
         err!(REFUSED)
     };
     // A database error is an error (500), not a refusal.
-    if !keykeeper_folder_permissions::manages(&headers.user.uuid, &org_id, &col_id, &conn).await? {
+    if !keykeeper_folder_permissions::manages(&headers.user.uuid, &org_id, &col_id, &conn).await?
+        && !keykeeper_roles::renames_folder(&headers.user.uuid, &org_id, &col_id, &conn).await?
+    {
         err!(REFUSED)
     }
 
