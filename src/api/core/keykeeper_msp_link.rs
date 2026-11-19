@@ -885,6 +885,7 @@ mod tests {
                 vault_items: false,
             }),
             install_commands: false,
+            script_access: false,
             client_roles: Vec::new(),
         };
         technician(&msp_id, &helpdesk, Some(custom), &conn).await;
@@ -898,6 +899,7 @@ mod tests {
                 clients: vec![other_client.uuid.clone()],
                 custom: None,
                 install_commands: true,
+                script_access: false,
                 client_roles: Vec::new(),
             }),
             &conn,

@@ -1,7 +1,8 @@
 // Keykeeper: script access (docs/script-access.md in the meta repo). Admin
-// endpoints for an organization's owners and admins, and for its MSP's admins
-// (never other MSP staff); refreshing a copy for anyone who can edit the item;
-// and script endpoints authenticated by nothing but a token's auth secret.
+// endpoints for an organization's owners and admins, its MSP's admins, and
+// its MSP's technicians with script access who are admins there (never other
+// MSP staff); refreshing a copy for anyone who can edit the item; and script
+// endpoints authenticated by nothing but a token's auth secret.
 // The server stores copies it can't read: the token key that encrypts them is
 // derived from a seed only the admin's browser and the script ever have.
 
@@ -33,7 +34,7 @@ use crate::{
         DbConn,
         models::{
             Cipher, CipherId, Membership, MembershipStatus, MembershipType, MspClient, MspMembership, MspRole,
-            Organization, OrganizationId, ScriptGrant, ScriptRead, ScriptToken, User, parse_networks,
+            MspStaff, Organization, OrganizationId, ScriptGrant, ScriptRead, ScriptToken, User, parse_networks,
             valid_encrypted_secret,
         },
     },
@@ -138,14 +139,61 @@ fn auth_hash(secret: &[u8]) -> String {
     BASE64.encode(digest::digest(&digest::SHA256, secret).as_ref())
 }
 
-/// The caller may make and manage tokens for the organization: a confirmed
-/// owner or admin, and, when that place comes from an MSP, an admin of the MSP.
-/// Errors never use 403, which upstream's web vault answers by signing out.
+/// The caller may make and manage tokens for the organization
+/// (`manages_script_tokens`). Errors never use 403, which upstream's web
+/// vault answers by signing out.
 async fn require_token_admin(org_id: &OrganizationId, headers: &Headers, conn: &DbConn) -> EmptyResult {
-    if !is_token_admin(org_id, &headers.user.uuid, conn).await {
+    if !manages_script_tokens(org_id, &headers.user.uuid, conn).await {
         err_code!("Organization not found", Status::NotFound.code)
     }
     Ok(())
+}
+
+/// Who makes, sees, and revokes the organization's script tokens: a token
+/// admin (`is_token_admin`), or one of its MSP's technicians with script
+/// access who is a confirmed admin there (`technician_with_script_access`).
+/// Only script tokens: the other settings `is_token_admin` guards stay with
+/// owners, admins, and MSP admins.
+pub(super) async fn manages_script_tokens(
+    org_id: &OrganizationId,
+    user_id: &crate::db::models::UserId,
+    conn: &DbConn,
+) -> bool {
+    is_token_admin(org_id, user_id, conn).await || technician_with_script_access(org_id, user_id, conn).await
+}
+
+/// One of the organization's MSP's technicians whose MSP admins gave them
+/// script access, with a confirmed admin's place there that came from that
+/// MSP (their role in this client is admin, not a custom role), in a client
+/// they reach. Taking away their script access, their admin role in the
+/// client, or their place on the MSP's staff ends it, as does the client
+/// revoking or removing them, or removing its MSP. See DESIGN.md, "Script
+/// access", in the meta repo.
+async fn technician_with_script_access(
+    org_id: &OrganizationId,
+    user_id: &crate::db::models::UserId,
+    conn: &DbConn,
+) -> bool {
+    let Some(member) = Membership::find_by_user_and_org(user_id, org_id, conn)
+        .await
+        .filter(|m| m.status == MembershipStatus::Confirmed as i32 && m.atype == MembershipType::Admin as i32)
+    else {
+        return false;
+    };
+    let (Some(link), Some(client)) =
+        (MspMembership::find_by_membership(&member.uuid, conn).await, MspClient::find_by_org(org_id, conn).await)
+    else {
+        return false;
+    };
+    if link.msp_uuid != client.msp_uuid {
+        return false;
+    }
+    let Some(staff) = MspStaff::find(&client.msp_uuid, user_id, conn).await else {
+        return false;
+    };
+    staff.role() == Some(MspRole::Technician)
+        && staff.script_access
+        && staff.reach(conn).await.is_none_or(|reach| reach.contains(org_id))
 }
 
 pub(super) async fn is_token_admin(
@@ -172,13 +220,22 @@ pub(super) async fn is_token_admin(
 /// enabled and they're still a token admin there (`is_token_admin`). A token
 /// works only while they do, so removing or revoking them, demoting them, or
 /// a client removing its MSP stops what they made. See DESIGN.md,
-/// "Offboarding", in the meta repo.
+/// "Offboarding", in the meta repo. Provisioning tokens and event
+/// destinations go by this too; script tokens by `maker_manages_tokens`.
 pub(super) async fn creator_has_access(
     org_id: &OrganizationId,
     creator: &crate::db::models::UserId,
     conn: &DbConn,
 ) -> bool {
     User::find_by_uuid(creator, conn).await.is_some_and(|u| u.enabled) && is_token_admin(org_id, creator, conn).await
+}
+
+/// Whoever made a script token still manages the organization's tokens:
+/// their account is enabled and `manages_script_tokens` still holds for
+/// them. A token works only while it does: for one of the MSP's technicians,
+/// while they're still a technician with script access and an admin there.
+async fn maker_manages_tokens(org_id: &OrganizationId, maker: &crate::db::models::UserId, conn: &DbConn) -> bool {
+    User::find_by_uuid(maker, conn).await.is_some_and(|u| u.enabled) && manages_script_tokens(org_id, maker, conn).await
 }
 
 /// Records an event in the MSP's activity log when the organization is an MSP's client.
@@ -254,7 +311,7 @@ async fn token_view(token: &ScriptToken, conn: &DbConn) -> Value {
     let networks: Vec<String> = serde_json::from_str(&token.networks).unwrap_or_default();
     let created_by = User::find_by_uuid(&token.created_by, conn).await.map(|u| u.email);
     // Keykeeper: a token stops when whoever made it no longer manages the organization.
-    let stopped = token.revoked_at.is_none() && !creator_has_access(&token.org_uuid, &token.created_by, conn).await;
+    let stopped = token.revoked_at.is_none() && !maker_manages_tokens(&token.org_uuid, &token.created_by, conn).await;
     json!({
         "creatorLostAccess": stopped,
         "id": token.uuid,
@@ -456,11 +513,11 @@ async fn set_grant(
     if !token.is_live(Utc::now().naive_utc()) {
         err!("That token was revoked or expired")
     }
-    if !creator_has_access(&org_id, &token.created_by, &conn).await {
+    if !maker_manages_tokens(&org_id, &token.created_by, &conn).await {
         err!("That token stopped working: whoever made it no longer manages this organization")
     }
     let existing = ScriptGrant::find(&token.uuid, &item_id, &conn).await;
-    let admin = is_token_admin(&org_id, &headers.user.uuid, &conn).await;
+    let admin = manages_script_tokens(&org_id, &headers.user.uuid, &conn).await;
     let grant = GrantData {
         item_id: item_id.clone(),
         copy: data.copy,
@@ -547,7 +604,7 @@ async fn stale_grants(headers: Headers, conn: DbConn) -> JsonResult {
         for token in ScriptToken::find_by_org(&member.org_uuid, &conn).await {
             // Keykeeper: never a token whose maker no longer manages the
             // organization: refreshing it would hand them the new password.
-            if !token.is_live(now) || !creator_has_access(&token.org_uuid, &token.created_by, &conn).await {
+            if !token.is_live(now) || !maker_manages_tokens(&token.org_uuid, &token.created_by, &conn).await {
                 continue;
             }
             for grant in ScriptGrant::find_for_token(&token.uuid, &conn).await {
@@ -621,7 +678,7 @@ impl<'r> FromRequest<'r> for ScriptCaller {
             Some("outside its networks")
         } else if Organization::find_by_uuid(&token.org_uuid, &conn).await.is_none() {
             Some("organization gone")
-        } else if !creator_has_access(&token.org_uuid, &token.created_by, &conn).await {
+        } else if !maker_manages_tokens(&token.org_uuid, &token.created_by, &conn).await {
             // Keykeeper: checked on every use (DESIGN.md, "Offboarding").
             Some("its maker no longer manages the organization")
         } else if SCRIPT_READS.check(&token.uuid).is_err() {
@@ -720,6 +777,184 @@ fn powershell_literal_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{
+        DbPool,
+        models::{Msp, TechnicianAccess},
+    };
+
+    async fn person(name: &str, conn: &DbConn) -> User {
+        let mut user = User::new(&format!("{name}@example.test"), None);
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    /// A client of the MSP, as keykeeper_offboarding's tests make one:
+    /// MspClient::new seals an install token with the server's keys, which
+    /// tests don't load.
+    async fn msp_client(name: &str, msp: &Msp, conn: &DbConn) -> Organization {
+        let org = Organization::new(name.to_owned(), "billing@example.test", None, None);
+        org.save(conn).await.unwrap();
+        MspClient {
+            org_uuid: org.uuid.clone(),
+            msp_uuid: msp.uuid.clone(),
+            created_at: Utc::now().naive_utc(),
+            preset: None,
+            enrollment_token: None,
+            enrollment_token_created_at: None,
+            everyone_collection: None,
+            templates_collection: None,
+            enrollment_secret: None,
+            enrollment_token_hash: None,
+            client_seal: None,
+            joined_with_code: false,
+        }
+        .insert(conn)
+        .await
+        .unwrap();
+        org
+    }
+
+    /// A place in a client, made by the MSP (`from_msp`) or by the client itself.
+    async fn place(
+        user: &User,
+        org: &Organization,
+        atype: MembershipType,
+        status: MembershipStatus,
+        from_msp: Option<&Msp>,
+        conn: &DbConn,
+    ) -> Membership {
+        let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), None);
+        member.atype = atype as i32;
+        member.status = status as i32;
+        member.save(conn).await.unwrap();
+        if let Some(msp) = from_msp {
+            MspMembership::new(member.uuid.clone(), msp.uuid.clone()).insert(conn).await.unwrap();
+        }
+        member
+    }
+
+    async fn give(msp: &Msp, user: &User, access: TechnicianAccess, conn: &DbConn) {
+        let mut staff = MspStaff::find(&msp.uuid, &user.uuid, conn).await.unwrap();
+        staff.set_access(&access, conn).await.unwrap();
+    }
+
+    fn with_script_access() -> TechnicianAccess {
+        TechnicianAccess {
+            script_access: true,
+            ..TechnicianAccess::default()
+        }
+    }
+
+    /// DESIGN.md, "Script access": a technician manages a client's script
+    /// tokens only with script access, as an admin there through the MSP, in
+    /// a client they reach; and the token they made stops when any of that
+    /// ends. Nothing else `is_token_admin` guards comes with it.
+    #[rocket::async_test]
+    async fn a_technician_manages_script_tokens_only_with_script_access_as_an_admin_there() {
+        let conn = DbPool::for_test().await;
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(&conn).await.unwrap();
+        let acme = msp_client("Acme Dental", &msp, &conn).await;
+        let baker = msp_client("Baker Law", &msp, &conn).await;
+        let tech = person("tech", &conn).await;
+        MspStaff::new(msp.uuid.clone(), tech.uuid.clone(), MspRole::Technician).insert(&conn).await.unwrap();
+        // Admin at Acme, a custom role (helpdesk) at Baker.
+        place(&tech, &acme, MembershipType::Admin, MembershipStatus::Confirmed, Some(&msp), &conn).await;
+        place(&tech, &baker, MembershipType::Manager, MembershipStatus::Confirmed, Some(&msp), &conn).await;
+
+        // Without script access: neither, as before it existed.
+        assert!(!manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await);
+        assert!(!maker_manages_tokens(&acme.uuid, &tech.uuid, &conn).await);
+
+        // With it: Acme, where they're an admin; not Baker.
+        give(&msp, &tech, with_script_access(), &conn).await;
+        assert!(manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await);
+        assert!(!manages_script_tokens(&baker.uuid, &tech.uuid, &conn).await);
+        assert!(maker_manages_tokens(&acme.uuid, &tech.uuid, &conn).await);
+        // Only script tokens: the other settings stay with owners, admins, and MSP admins.
+        assert!(!is_token_admin(&acme.uuid, &tech.uuid, &conn).await);
+        assert!(!creator_has_access(&acme.uuid, &tech.uuid, &conn).await);
+
+        // Their account turned off: what they made stops; on again, it works.
+        let mut account = User::find_by_uuid(&tech.uuid, &conn).await.unwrap();
+        account.enabled = false;
+        account.save(&conn).await.unwrap();
+        assert!(!maker_manages_tokens(&acme.uuid, &tech.uuid, &conn).await);
+        account.enabled = true;
+        account.save(&conn).await.unwrap();
+        assert!(maker_manages_tokens(&acme.uuid, &tech.uuid, &conn).await);
+
+        // Script access taken away: it stops at once.
+        give(&msp, &tech, TechnicianAccess::default(), &conn).await;
+        assert!(!manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await);
+        assert!(!maker_manages_tokens(&acme.uuid, &tech.uuid, &conn).await);
+
+        // A client they no longer reach, even before their place there goes.
+        give(
+            &msp,
+            &tech,
+            TechnicianAccess {
+                all_clients: false,
+                clients: vec![baker.uuid.clone()],
+                ..with_script_access()
+            },
+            &conn,
+        )
+        .await;
+        assert!(!manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await);
+        give(&msp, &tech, with_script_access(), &conn).await;
+        assert!(manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await);
+
+        // Made an MSP admin and back to a technician: still theirs while
+        // they're a technician with script access.
+        let mut staff = MspStaff::find(&msp.uuid, &tech.uuid, &conn).await.unwrap();
+        staff.set_role(MspRole::Admin, &conn).await.unwrap();
+        assert!(
+            manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await,
+            "an MSP admin manages tokens as they always did"
+        );
+        staff.set_role(MspRole::Technician, &conn).await.unwrap();
+        assert!(manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await);
+
+        // Off the MSP's staff: it stops, even if their place in the client stayed.
+        MspStaff::find(&msp.uuid, &tech.uuid, &conn).await.unwrap().delete(&conn).await.unwrap();
+        assert!(!manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await);
+        assert!(!maker_manages_tokens(&acme.uuid, &tech.uuid, &conn).await);
+    }
+
+    /// The place has to be a confirmed admin's, and it has to come from the
+    /// client's own MSP.
+    #[rocket::async_test]
+    async fn a_technicians_script_access_needs_a_confirmed_admin_place_from_the_clients_msp() {
+        let conn = DbPool::for_test().await;
+        let msp = Msp::new("Northwind IT".to_owned());
+        msp.insert(&conn).await.unwrap();
+        let other = Msp::new("Contoso Partners".to_owned());
+        other.insert(&conn).await.unwrap();
+        let acme = msp_client("Acme Dental", &msp, &conn).await;
+
+        for (name, atype, status, from) in [
+            ("waiting", MembershipType::Admin, MembershipStatus::Accepted, Some(&msp)),
+            ("revoked", MembershipType::Admin, MembershipStatus::Revoked, Some(&msp)),
+            ("member", MembershipType::User, MembershipStatus::Confirmed, Some(&msp)),
+            ("custom", MembershipType::Manager, MembershipStatus::Confirmed, Some(&msp)),
+            ("elsewhere", MembershipType::Admin, MembershipStatus::Confirmed, Some(&other)),
+        ] {
+            let tech = person(name, &conn).await;
+            let staff_of = from.unwrap();
+            MspStaff::new(staff_of.uuid.clone(), tech.uuid.clone(), MspRole::Technician).insert(&conn).await.unwrap();
+            give(staff_of, &tech, with_script_access(), &conn).await;
+            place(&tech, &acme, atype, status, from, &conn).await;
+            assert!(!manages_script_tokens(&acme.uuid, &tech.uuid, &conn).await, "{name}");
+        }
+
+        // The client's own admin who is also one of the MSP's technicians
+        // manages tokens there as the client's admin, script access or not.
+        let own = person("own-admin", &conn).await;
+        MspStaff::new(msp.uuid.clone(), own.uuid.clone(), MspRole::Technician).insert(&conn).await.unwrap();
+        place(&own, &acme, MembershipType::Admin, MembershipStatus::Confirmed, None, &conn).await;
+        assert!(manages_script_tokens(&acme.uuid, &own.uuid, &conn).await);
+    }
 
     #[test]
     fn the_server_address_never_ends_the_modules_string() {
