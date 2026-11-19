@@ -14,7 +14,7 @@ Someone asked to sign in on a new device with a code by email
    </tr>
    <tr style="margin: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; box-sizing: border-box; font-size: 16px; color: #333; line-height: 25px; -webkit-font-smoothing: antialiased; -webkit-text-size-adjust: none;">
       <td class="content-block" style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; box-sizing: border-box; font-size: 16px; color: #333; line-height: 25px; margin: 0; -webkit-font-smoothing: antialiased; padding: 0 0 10px; -webkit-text-size-adjust: none;" valign="top">
-         <b>Where:</b> {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}
+         {{#if location_database}}<b>Where:</b> {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}{{else}}<b>Address:</b> {{ip}}{{/if}}
       </td>
    </tr>
    <tr style="margin: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; box-sizing: border-box; font-size: 16px; color: #333; line-height: 25px; -webkit-font-smoothing: antialiased; -webkit-text-size-adjust: none;">

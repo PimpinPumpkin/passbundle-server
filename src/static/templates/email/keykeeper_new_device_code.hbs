@@ -5,7 +5,7 @@ Someone is signing in to your PassBundle account on a new device, and asked for 
 {{code}}
 
 * Device: {{device}}
-* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}
+{{#if location_database}}* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}{{else}}* Address: {{ip}}{{/if}}
 * When: {{datetime}}
 {{#if location_source}}
 

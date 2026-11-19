@@ -3,7 +3,7 @@ Someone asked to sign in on a new device with a code by email
 Someone is signing in to your PassBundle account on a new device. Instead of approving it from one of your devices, they asked for a code by email. It can be sent after {{email_after}}.
 
 * Device: {{device}}
-* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}
+{{#if location_database}}* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}{{else}}* Address: {{ip}}{{/if}}
 * When: {{datetime}}
 {{#if location_source}}
 

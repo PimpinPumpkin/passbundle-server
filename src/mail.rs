@@ -661,7 +661,7 @@ pub async fn send_new_device_logged_in(address: &str, ip: &str, dt: &NaiveDateTi
     let fmt = "%A, %B %_d, %Y at %r %Z";
     // Keykeeper: roughly where it came from, from this server's own database
     // file, and who to credit for it (DESIGN.md, "New-device check").
-    let (location, location_source, location_source_url) = location_fields(ip);
+    let place = location_fields(ip);
     let (subject, body_html, body_text) = get_text(
         "email/new_device_logged_in",
         json!({
@@ -671,29 +671,52 @@ pub async fn send_new_device_logged_in(address: &str, ip: &str, dt: &NaiveDateTi
             "device_name": upcase_first(&device.name),
             "device_type": DeviceType::from_i32(device.atype).to_string(),
             "datetime": crate::util::format_naive_datetime_local(dt, fmt),
-            "location": location,
-            "location_source": location_source,
-            "location_source_url": location_source_url,
+            "location": place.location,
+            "location_source": place.source,
+            "location_source_url": place.source_url,
         }),
     )?;
 
     send_email(address, &subject, body_html, body_text).await
 }
 
-/// Keykeeper: where an address is, in words, and who to credit for it, for
-/// the new-device emails (crate::keykeeper_location).
-fn location_fields(ip: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let location = crate::keykeeper_location::describe(ip);
-    let source = location.as_ref().and(crate::keykeeper_location::attribution());
-    let name = source.as_ref().and_then(|s| s["name"].as_str().map(str::to_owned));
-    let url = source.as_ref().and_then(|s| s["url"].as_str().map(str::to_owned));
-    (location, name, url)
+/// Keykeeper: where an address is, for the new-device emails, from the
+/// server's own location database (crate::keykeeper_location; DESIGN.md,
+/// "Where a sign-in comes from").
+#[derive(Debug, PartialEq, Eq)]
+struct MailLocation {
+    /// "Berlin, Germany", or None for an address the database can't place.
+    location: Option<String>,
+    /// Whether the server has a location database. Without one, an email
+    /// shows the address alone, with no "Where" line and no credit.
+    database: bool,
+    /// Who to credit, and their address: only beside a place.
+    source: Option<String>,
+    source_url: Option<String>,
+}
+
+fn location_fields(ip: &str) -> MailLocation {
+    mail_location(crate::keykeeper_location::shown(ip))
+}
+
+/// What `keykeeper_location::shown` said (the place, and the credit, which
+/// is there whenever the server has a database), for an email.
+fn mail_location((location, source): (Option<String>, Option<serde_json::Value>)) -> MailLocation {
+    let database = location.is_some() || source.is_some();
+    let source = location.as_ref().and(source);
+    MailLocation {
+        source: source.as_ref().and_then(|s| s["name"].as_str().map(str::to_owned)),
+        source_url: source.as_ref().and_then(|s| s["url"].as_str().map(str::to_owned)),
+        location,
+        database,
+    }
 }
 
 /// Keykeeper: the new-device check's emails (DESIGN.md, "New-device check"):
 /// a code to sign in with when no device can approve; that a sign-in was
 /// denied; and that someone asked for a code by email instead of approving
 /// it from a device. Each names the device, where it came from, and when.
+#[derive(Clone, Copy)]
 pub enum NewDeviceMail<'a> {
     Code(&'a str),
     Denied {
@@ -711,17 +734,28 @@ pub async fn send_new_device_check(
     ip: &str,
     dt: &NaiveDateTime,
 ) -> EmptyResult {
+    let (subject, body_html, body_text) = new_device_check_text(mail, device, ip, dt, &location_fields(ip))?;
+    send_email(address, &subject, body_html, body_text).await
+}
+
+fn new_device_check_text(
+    mail: NewDeviceMail<'_>,
+    device: &str,
+    ip: &str,
+    dt: &NaiveDateTime,
+    place: &MailLocation,
+) -> Result<(String, String, String), Error> {
     let fmt = "%A, %B %_d, %Y at %r %Z";
-    let (location, location_source, location_source_url) = location_fields(ip);
     let mut data = json!({
         "url": CONFIG.domain(),
         "img_src": CONFIG._smtp_img_src(),
         "ip": ip,
         "device": device,
         "datetime": crate::util::format_naive_datetime_local(dt, fmt),
-        "location": location,
-        "location_source": location_source,
-        "location_source_url": location_source_url,
+        "location": place.location,
+        "location_database": place.database,
+        "location_source": place.source,
+        "location_source_url": place.source_url,
     });
     let template = match mail {
         NewDeviceMail::Code(code) => {
@@ -741,8 +775,7 @@ pub async fn send_new_device_check(
             "email/keykeeper_new_device_waiting"
         }
     };
-    let (subject, body_html, body_text) = get_text(template, data)?;
-    send_email(address, &subject, body_html, body_text).await
+    get_text(template, data)
 }
 
 pub async fn send_recover_twofactor(address: &str, ip: &str, dt: &NaiveDateTime) -> EmptyResult {
@@ -1006,5 +1039,91 @@ mod tests {
         }
         assert!(text.contains("You have been invited to join the *Harbor Dental* organization."), "{text}");
         assert!(text.contains(&format!("Click here to join: {url}")), "{text}");
+    }
+
+    /// Where a new device's sign-in comes from, in its emails: the place
+    /// with the database's credit; "Unknown location" for an address the
+    /// database can't place; and without a location database, the address
+    /// alone (DESIGN.md, "Where a sign-in comes from").
+    #[test]
+    fn a_new_device_email_shows_where_only_with_a_location_database() {
+        use crate::keykeeper_location::{shown_from, tests::TestFile};
+        let file = TestFile::new("mail");
+        let missing = file.path().with_file_name("missing.mmdb");
+
+        let placed = mail_location(shown_from(file.path(), "203.0.113.7"));
+        assert_eq!(
+            placed,
+            MailLocation {
+                location: Some("Berlin, Germany".into()),
+                database: true,
+                source: Some("IP Geolocation by DB-IP".into()),
+                source_url: Some("https://db-ip.com".into()),
+            }
+        );
+        let unplaced = mail_location(shown_from(file.path(), "10.1.2.3"));
+        assert_eq!(
+            unplaced,
+            MailLocation {
+                location: None,
+                database: true,
+                source: None,
+                source_url: None,
+            }
+        );
+        let without = mail_location(shown_from(&missing, "203.0.113.7"));
+        assert_eq!(
+            without,
+            MailLocation {
+                location: None,
+                database: false,
+                source: None,
+                source_url: None,
+            }
+        );
+
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 11, 19).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let mails = || {
+            [
+                NewDeviceMail::Code("12345678"),
+                NewDeviceMail::Denied {
+                    wrong_number: true,
+                },
+                NewDeviceMail::Waiting {
+                    email_after: &dt,
+                },
+            ]
+        };
+        for mail in mails() {
+            let place = mail_location(shown_from(file.path(), "203.0.113.7"));
+            let (_, html, text) =
+                new_device_check_text(mail, "Web vault in Firefox", "203.0.113.7", &dt, &place).unwrap();
+            assert!(text.contains("* Where: Berlin, Germany (address 203.0.113.7)"), "{text}");
+            assert!(text.contains("IP Geolocation by DB-IP (https://db-ip.com)"), "{text}");
+            assert!(html.contains("<b>Where:</b> Berlin, Germany (address 203.0.113.7)"), "{html}");
+            assert!(html.contains(r#"<a href="https://db-ip.com">IP Geolocation by DB-IP</a>"#), "{html}");
+            assert!(!text.contains("* Address:"), "{text}");
+        }
+        for mail in mails() {
+            let place = mail_location(shown_from(file.path(), "10.1.2.3"));
+            let (_, html, text) = new_device_check_text(mail, "Web vault in Firefox", "10.1.2.3", &dt, &place).unwrap();
+            assert!(text.contains("* Where: Unknown location (address 10.1.2.3)"), "{text}");
+            assert!(html.contains("<b>Where:</b> Unknown location (address 10.1.2.3)"), "{html}");
+            for body in [&text, &html] {
+                assert!(!body.contains("DB-IP"), "{body}");
+            }
+        }
+        for mail in mails() {
+            let place = mail_location(shown_from(&missing, "203.0.113.7"));
+            let (_, html, text) =
+                new_device_check_text(mail, "Web vault in Firefox", "203.0.113.7", &dt, &place).unwrap();
+            assert!(text.contains("* Address: 203.0.113.7"), "{text}");
+            assert!(html.contains("<b>Address:</b> 203.0.113.7"), "{html}");
+            for body in [&text, &html] {
+                assert!(!body.contains("Where:"), "{body}");
+                assert!(!body.contains("Unknown location"), "{body}");
+                assert!(!body.contains("DB-IP"), "{body}");
+            }
+        }
     }
 }
