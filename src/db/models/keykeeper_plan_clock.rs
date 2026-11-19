@@ -35,7 +35,9 @@ use crate::{
 
 use super::{
     MembershipStatus, MembershipType, MspId, MspRole, OrganizationId, UserId,
-    keykeeper_plans::{Billed, FreeWhy, Plan, PlanName, PlanOwner, PlanState, SetBy, Standing, find_row, owner_exists},
+    keykeeper_plans::{
+        Billed, FreeWhy, Plan, PlanName, PlanOwner, PlanState, SetBy, Standing, find_row, owner_exists, writing_plan,
+    },
 };
 
 type Query<T> = Result<T, diesel::result::Error>;
@@ -85,6 +87,8 @@ fn trial_row(whose: &PlanOwner, at: NaiveDateTime, days: i64) -> Option<Plan> {
 /// Gives an organization or an MSP with no row a trial from `at`, and
 /// answers the row it has then. A row that's already there is left as it is,
 /// and so is a person, who gets no trial, and an owner that doesn't exist.
+/// The row is looked for again with the plan's lock held (`writing_plan`),
+/// so an operator's save at the same moment is never written over, nor fails.
 pub(super) fn start_trial(
     conn: &mut DbConnInner,
     whose: &PlanOwner,
@@ -97,11 +101,16 @@ pub(super) fn start_trial(
     let Some(trial) = trial_row(whose, at, days) else {
         return Ok(None);
     };
-    if !owner_exists(conn, whose)? {
-        return Ok(None);
-    }
-    insert_once(conn, |conn| diesel::insert_into(plans::table).values(&trial).execute(conn))?;
-    find_row(conn, whose)
+    writing_plan(conn, whose, |conn| {
+        if let Some(row) = find_row(conn, whose)? {
+            return Ok(Some(row));
+        }
+        if !owner_exists(conn, whose)? {
+            return Ok(None);
+        }
+        insert_once(conn, |conn| diesel::insert_into(plans::table).values(&trial).execute(conn))?;
+        find_row(conn, whose)
+    })
 }
 
 /// The organization or the MSP was just created: its trial starts now
@@ -123,7 +132,7 @@ pub(super) fn left_msp(conn: &mut DbConnInner, org: &OrganizationId, at: NaiveDa
     let Some(until) = TimeDelta::try_days(days).and_then(|days| at.checked_add_signed(days)) else {
         return Ok(());
     };
-    conn.transaction(|conn| match find_row(conn, &whose)? {
+    writing_plan(conn, &whose, |conn| match find_row(conn, &whose)? {
         Some(row) if row.free_until.is_some_and(|free_until| free_until >= until) => Ok(()),
         Some(row) => diesel::update(plans::table.filter(plans::uuid.eq(&row.uuid)))
             .set((
@@ -799,6 +808,55 @@ mod database_tests {
         let id = offered.uuid.clone();
         conn.run(move |conn| left_msp(conn, &id, left, 30)).await.unwrap();
         assert_eq!(row_of(&of_org(&offered), &conn).await.unwrap(), written);
+    }
+
+    /// A client leaving its MSP has its 30 days written in a transaction that
+    /// waits for a write in progress elsewhere instead of failing, with a row
+    /// of its own or without one. Inside a transaction the caller holds (a
+    /// move to another MSP is one), it's part of that transaction: undone
+    /// with it, and kept with it.
+    #[rocket::async_test]
+    async fn leaving_waits_for_a_write_in_progress_and_is_part_of_a_move() {
+        let pool = DbPool::for_test_pool_of(2);
+        let conn = pool.get().await.unwrap();
+        let left = noon();
+        let ended = organization("Ended", &conn).await;
+        let old = PlanWrite {
+            plan: PlanName::Business,
+            free_until: None,
+            free_why: None,
+            standing: Standing::Until,
+            until: Some(left - days(400)),
+            renews: false,
+            billed: Billed::ByHand,
+        };
+        Plan::set(&of_org(&ended), old, SetBy::Operator, &conn).await.unwrap();
+        let bare = organization("Bare", &conn).await;
+        for org in [&ended, &bare] {
+            let released = pool.hold_write_lock(std::time::Duration::from_millis(300)).await;
+            let id = org.uuid.clone();
+            let written = conn.run(move |conn| left_msp(conn, &id, left, 30)).await;
+            released.await.unwrap();
+            written.expect("leaving waits for the other write, and is written");
+            let row = row_of(&of_org(org), &conn).await.unwrap();
+            assert_eq!((row.free_until, row.free_why.as_deref()), (Some(left + days(30)), Some("trial")));
+        }
+
+        let moved = organization("Moved", &conn).await;
+        let id = moved.uuid.clone();
+        let undone = conn
+            .run(move |conn| {
+                conn.transaction(|conn| {
+                    left_msp(conn, &id, left, 30)?;
+                    Err::<(), _>(diesel::result::Error::RollbackTransaction)
+                })
+            })
+            .await;
+        assert!(matches!(undone, Err(diesel::result::Error::RollbackTransaction)));
+        assert_eq!(row_of(&of_org(&moved), &conn).await, None);
+        let id = moved.uuid.clone();
+        conn.run(move |conn| conn.transaction(|conn| left_msp(conn, &id, left, 30))).await.unwrap();
+        assert_eq!(row_of(&of_org(&moved), &conn).await.unwrap().free_until, Some(left + days(30)));
     }
 
     #[rocket::async_test]

@@ -962,6 +962,102 @@ impl PlanWrite {
     }
 }
 
+/// Runs `write`, which reads `whose` plan and then writes it, in a
+/// transaction that holds the lock for writing that plan from its start. The
+/// row it read is still the row when it writes, and a write at the same
+/// moment (another request, a provider's answer, or the plans' clock) waits
+/// its turn instead of failing. Every writer that reads a plan before writing
+/// it goes through here.
+///
+/// - SQLite: `BEGIN IMMEDIATE`, which takes the database's write lock first,
+///   waiting for it as long as the busy timeout allows. A transaction begun
+///   the usual way that has read can't wait when it comes to write while
+///   another connection writes: SQLite answers "database is locked" at once.
+/// - PostgreSQL: the owner's own row (the person, the organization, or the
+///   MSP), locked for update until the transaction ends, so writers of one
+///   owner's plan go one at a time, as requests for one organization do
+///   elsewhere in the server.
+///
+/// Inside a transaction the caller holds (a move to another MSP is one), it's
+/// a savepoint in that transaction, which on SQLite holds the write lock
+/// already.
+pub(super) fn writing_plan<T>(
+    conn: &mut DbConnInner,
+    whose: &PlanOwner,
+    write: impl FnOnce(&mut DbConnInner) -> Query<T>,
+) -> Query<T> {
+    use diesel::connection::TransactionManager;
+    type Manager = <DbConnInner as Connection>::TransactionManager;
+    begin_plan_write(conn)?;
+    match lock_owner(conn, whose).and_then(|()| write(conn)) {
+        Ok(written) => {
+            Manager::commit_transaction(conn)?;
+            Ok(written)
+        }
+        // As diesel's own transactions: the error that made it roll back is
+        // the one to answer, unless rolling back failed too.
+        Err(e) => match Manager::rollback_transaction(conn) {
+            Ok(()) | Err(diesel::result::Error::BrokenTransactionManager) => Err(e),
+            Err(rollback) => Err(rollback),
+        },
+    }
+}
+
+/// Begins `writing_plan`'s transaction: immediate on SQLite, unless the
+/// caller holds one already, when it's a savepoint.
+fn begin_plan_write(conn: &mut DbConnInner) -> Query<()> {
+    use diesel::connection::TransactionManager;
+    type Manager = <DbConnInner as Connection>::TransactionManager;
+    if Manager::transaction_manager_status_mut(conn).transaction_depth()?.is_some() {
+        return Manager::begin_transaction(conn);
+    }
+    match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(_) => Manager::begin_transaction(conn),
+        #[cfg(sqlite)]
+        DbConnInner::Sqlite(sqlite) => {
+            diesel::connection::AnsiTransactionManager::begin_transaction_sql(sqlite, "BEGIN IMMEDIATE")
+        }
+    }
+}
+
+/// `writing_plan`'s lock on PostgreSQL: the owner's own row, locked for
+/// update. An owner that doesn't exist has nothing to lock, and its writer
+/// finds that out itself. On SQLite the transaction holds the write lock
+/// already.
+fn lock_owner(conn: &mut DbConnInner, whose: &PlanOwner) -> Query<()> {
+    #[cfg(not(postgresql))]
+    let _ = whose;
+    match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(conn) => match whose {
+            PlanOwner::User(id) => users::table
+                .filter(users::uuid.eq(id))
+                .select(users::uuid)
+                .for_update()
+                .first::<UserId>(conn)
+                .optional()
+                .map(drop),
+            PlanOwner::Organization(id) => organizations::table
+                .filter(organizations::uuid.eq(id))
+                .select(organizations::uuid)
+                .for_update()
+                .first::<OrganizationId>(conn)
+                .optional()
+                .map(drop),
+            PlanOwner::Msp(id) => msps::table
+                .filter(msps::uuid.eq(id))
+                .select(msps::uuid)
+                .for_update()
+                .first::<MspId>(conn)
+                .optional()
+                .map(drop),
+        },
+        #[cfg(sqlite)]
+        DbConnInner::Sqlite(_) => Ok(()),
+    }
+}
+
 pub(super) fn owner_exists(conn: &mut DbConnInner, whose: &PlanOwner) -> Query<bool> {
     let found = match whose {
         PlanOwner::User(id) => users::table.filter(users::uuid.eq(id)).count().get_result::<i64>(conn)?,
@@ -1009,7 +1105,9 @@ impl Plan {
     /// organization, or MSP. What a provider recorded on the row stays.
     ///
     /// Only the server calls this: for the operator, from the admin page. No
-    /// route a signed-in person can reach does.
+    /// route a signed-in person can reach does. A write to the same database
+    /// at the same moment, such as the plans' clock's, waits its turn
+    /// (`writing_plan`).
     pub async fn set(
         whose: &PlanOwner,
         write: PlanWrite,
@@ -1018,7 +1116,7 @@ impl Plan {
     ) -> ApiResult<Option<(Option<Self>, Self)>> {
         let now = Utc::now().naive_utc();
         conn.run(move |conn| {
-            conn.transaction(|conn| {
+            writing_plan(conn, whose, |conn| {
                 if !owner_exists(conn, whose)? {
                     return Ok(None);
                 }
@@ -1062,7 +1160,7 @@ impl Plan {
     /// on Free, and an organization or an MSP has no plan.
     pub async fn remove(whose: &PlanOwner, conn: &DbConn) -> ApiResult<Option<Self>> {
         conn.run(move |conn| {
-            conn.transaction(|conn| {
+            writing_plan(conn, whose, |conn| {
                 let old = find_row(conn, whose)?;
                 if let Some(old) = &old {
                     diesel::delete(plans::table.filter(plans::uuid.eq(&old.uuid))).execute(conn)?;
@@ -2238,6 +2336,104 @@ mod tests {
         assert!(Plan::find(&hers, &conn).await.unwrap().is_some());
         ana.delete(&conn).await.unwrap();
         assert_eq!(Plan::find(&hers, &conn).await.unwrap(), None);
+    }
+
+    /// How long a write elsewhere holds the database's write lock in these
+    /// tests: far longer than the clock's writes take, and far less than
+    /// SQLite's busy timeout (5 seconds).
+    const ANOTHER_WRITE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// A write elsewhere holds the database's write lock for a moment: the
+    /// plans' clock does at each run (every second, where it runs that
+    /// often), and so does any request that writes. The operator's save and
+    /// removal wait for it, as a single write does, instead of failing with
+    /// "database is locked", which is what an operator's save did in a tier 1
+    /// run while the clock ran.
+    #[rocket::async_test]
+    async fn the_operators_save_and_removal_wait_for_a_write_in_progress() {
+        let pool = DbPool::for_test_pool_of(2);
+        let conn = pool.get().await.unwrap();
+        let ana = person("ana", &conn).await;
+        let whose = of(&ana);
+        let first = set(&whose, free(PlanName::Premium, noon(), FreeWhy::Offer), &conn).await;
+
+        let released = pool.hold_write_lock(ANOTHER_WRITE).await;
+        let saved = Plan::set(&whose, paid(PlanName::Premium, noon(), true), SetBy::Operator, &conn).await;
+        released.await.unwrap();
+        let (before, after) = saved
+            .map_err(|e| e.message().to_owned())
+            .expect("the save waits for the other write, and is saved")
+            .expect("she exists");
+        assert_eq!(before, Some(first.clone()));
+        assert_eq!((after.uuid.as_str(), after.standing.as_str()), (first.uuid.as_str(), "until"));
+        assert_eq!(Plan::find(&whose, &conn).await.unwrap(), Some(after.clone()));
+
+        let released = pool.hold_write_lock(ANOTHER_WRITE).await;
+        let removed = Plan::remove(&whose, &conn).await;
+        released.await.unwrap();
+        let removed = removed.map_err(|e| e.message().to_owned()).expect("the removal waits, and is done");
+        assert_eq!(removed, Some(after));
+        assert_eq!(Plan::find(&whose, &conn).await.unwrap(), None);
+    }
+
+    /// Saves at once, each on a connection of its own: several for one
+    /// person, and several for an organization with no row while the plans'
+    /// clock starts its trial. Every save is saved, none fails, and each
+    /// owner ends with one row, the operator's.
+    #[rocket::async_test]
+    async fn saves_at_once_for_one_owner_all_land_while_the_clock_runs() {
+        use std::sync::Arc;
+        const AT_ONCE: usize = 8;
+        const CLOCKS: usize = 2;
+        let tasks = 2 * AT_ONCE + CLOCKS;
+        let pool = Arc::new(DbPool::for_test_pool_of(u32::try_from(tasks).unwrap()));
+        let conn = pool.get().await.unwrap();
+        let ana = person("ana", &conn).await;
+        let acme = organization("Acme", &conn).await;
+        drop(conn);
+        let (hers, its) = (of(&ana), of_org(&acme));
+
+        let start = Arc::new(tokio::sync::Barrier::new(tasks));
+        let mut saves = Vec::new();
+        for n in 0..AT_ONCE {
+            let until = noon() + TimeDelta::days(i64::try_from(n).unwrap());
+            for (whose, plan) in [(hers.clone(), PlanName::Premium), (its.clone(), PlanName::Business)] {
+                let (pool, start) = (Arc::clone(&pool), Arc::clone(&start));
+                saves.push(tokio::spawn(async move {
+                    let conn = pool.get().await.unwrap();
+                    start.wait().await;
+                    Plan::set(&whose, paid(plan, until, true), SetBy::Operator, &conn)
+                        .await
+                        .map(|saved| saved.is_some())
+                        .map_err(|e| e.message().to_owned())
+                }));
+            }
+        }
+        let mut clocks = Vec::new();
+        for _ in 0..CLOCKS {
+            let (pool, start) = (Arc::clone(&pool), Arc::clone(&start));
+            clocks.push(tokio::spawn(async move {
+                let conn = pool.get().await.unwrap();
+                start.wait().await;
+                super::super::keykeeper_plan_clock::run_clock(noon(), &conn)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.message().to_owned())
+            }));
+        }
+        for save in saves {
+            assert_eq!(save.await.unwrap(), Ok(true), "a save failed instead of waiting its turn");
+        }
+        for clock in clocks {
+            assert_eq!(clock.await.unwrap(), Ok(()), "the clock failed instead of waiting its turn");
+        }
+
+        let conn = pool.get().await.unwrap();
+        for whose in [&hers, &its] {
+            let row = Plan::find(whose, &conn).await.unwrap().expect("a row");
+            assert_eq!((row.set_by.as_str(), row.standing.as_str()), ("operator", "until"));
+        }
+        assert_eq!(conn.run(|conn| plans::table.count().get_result::<i64>(conn)).await.unwrap(), 2);
     }
 
     #[rocket::async_test]
