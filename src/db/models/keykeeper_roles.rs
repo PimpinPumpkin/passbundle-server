@@ -199,10 +199,14 @@ const ROUTES: &[(Method, &str, &[Permission])] = &[
     // folder and group dialogs list whom to give access. Read only, and only
     // what the endpoint gives anyone who can call it.
     (Method::Get, "/organizations/<org_id>/users/mini-details", &[AccessEventLogs, ManageCollections, ManageGroups]),
-    // The organization's items: the reports, and the Collections page for a
-    // member with access to all items. Only the items they reach
-    // (get_org_details).
+    // The organization's items: the reports load them. Only the items they
+    // reach (get_org_details). Managing shared folders admits it too, though
+    // the Collections page itself asks for the route below.
     (Method::Get, "/ciphers/organization-details", &[AccessReports, ManageCollections]),
+    // The Collections page's items: upstream's web vault asks here for every
+    // custom role, since none edits every item (to_client_json). Only the
+    // items in the shared folders they reach (get_org_details_assigned).
+    (Method::Get, "/ciphers/organization-details/assigned", &[AccessReports, ManageCollections]),
     // Export
     (Method::Get, "/organizations/<org_id>/export", &[AccessImportExport]),
 ];
@@ -987,6 +991,10 @@ mod tests {
     fn reports_and_the_collections_page_load_the_items() {
         assert_eq!(
             route_permissions(Method::Get, "/ciphers/organization-details"),
+            &[AccessReports, ManageCollections]
+        );
+        assert_eq!(
+            route_permissions(Method::Get, "/ciphers/organization-details/assigned"),
             &[AccessReports, ManageCollections]
         );
         // The export holds every item: import and export only, with access to all items.
