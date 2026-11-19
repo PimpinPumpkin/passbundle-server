@@ -1660,20 +1660,21 @@ async fn authorize(
     Ok(keykeeper_sso::AuthorizeAnswer::Redirect(Box::new(Redirect::temporary(String::from(auth_url)))))
 }
 
-/// Keykeeper: the Continue on the page that the command-line tool's sign-in
-/// asks first (keykeeper_sso::confirm_cli).
+/// Keykeeper: the Continue on the page that the native apps' sign-ins (the
+/// command-line tool's, and PassBundle's desktop and phone apps') ask first
+/// (keykeeper_sso::confirm_app).
 #[derive(FromForm)]
-struct CliConfirmData {
+struct AppConfirmData {
     token: String,
 }
 
 #[post("/connect/authorize/confirm", data = "<data>")]
 async fn authorize_confirm(
-    data: Form<CliConfirmData>,
+    data: Form<AppConfirmData>,
     from: keykeeper_sso::RequestOrigin,
     cookies: &CookieJar<'_>,
     ip: ClientIp,
     conn: DbConn,
 ) -> ApiResult<Redirect> {
-    keykeeper_sso::confirm_cli(&data.token, from, cookies, &ip.ip, &conn).await
+    keykeeper_sso::confirm_app(&data.token, from, cookies, &ip.ip, &conn).await
 }
