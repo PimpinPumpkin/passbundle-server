@@ -172,9 +172,18 @@ fn checked_sealed(sealed: &str) -> EmptyResult {
     Ok(())
 }
 
+/// The family's link, for its owners and admins. An owner or admin of an
+/// organization that isn't a family is told so with null, not "not found":
+/// the Members page asks on every organization it opens, and a 404 there is
+/// an error in the browser's console. Anyone else still gets "not found".
 #[get("/keykeeper/organizations/<org_id>/family-link")]
 async fn get_link(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
-    manager(&org_id, &headers.user.uuid, CONFIG.plans_enforced(), &conn).await?;
+    if owner_or_admin(&org_id, &headers.user.uuid, &conn).await.is_none() {
+        return Err(not_found());
+    }
+    if family_limit(CONFIG.plans_enforced(), &org_id, &conn).await?.is_none() {
+        return Ok(Json(Value::Null));
+    }
     Ok(Json(link_view(&org_id, &conn).await))
 }
 
