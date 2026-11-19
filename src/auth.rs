@@ -946,7 +946,7 @@ impl<'r> FromRequest<'r> for AdminHeaders {
                 custom_permissions: Some(role),
             })
         } else {
-            // Keykeeper: 403 for a custom member, 401 for everyone else.
+            // Keykeeper: 404 for a custom member, 401 for everyone else.
             crate::db::models::keykeeper_roles::refuse(
                 request,
                 &headers.membership,
@@ -985,6 +985,10 @@ pub struct ManagerHeaders {
     pub user: User,
     pub ip: ClientIp,
     pub org_id: OrganizationId,
+    /// Keykeeper: set when a custom role that manages shared folders was
+    /// admitted, not a manager of this folder. Its limits apply
+    /// (keykeeper_roles::check_folder_access).
+    pub custom_permissions: Option<crate::db::models::keykeeper_roles::CustomPermissions>,
 }
 
 #[rocket::async_trait]
@@ -1028,6 +1032,7 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 user: headers.user,
                 ip: headers.ip,
                 org_id: headers.membership.org_uuid,
+                custom_permissions: None,
             })
         } else {
             let admitted = match get_col_id(request) {
@@ -1051,10 +1056,28 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                     user: headers.user,
                     ip: headers.ip,
                     org_id: headers.membership.org_uuid,
+                    custom_permissions: None,
                 }),
-                // Keykeeper: 404 for a confirmed member, custom or not (401 and
-                // 403 sign the web vault out), as refuse for everyone else.
                 Ok(false) => {
+                    // Keykeeper: a custom role that manages shared folders, on
+                    // a folder's routes its permissions cover. The handler
+                    // checks the folder is one they reach (keykeeper_roles::Reach).
+                    if headers.membership_status == MembershipStatus::Confirmed
+                        && get_col_id(request).is_some()
+                        && let Some(role) =
+                            crate::db::models::keykeeper_roles::admitted(request, &headers.membership).await
+                    {
+                        return Outcome::Success(Self {
+                            host: headers.host,
+                            device: headers.device,
+                            user: headers.user,
+                            ip: headers.ip,
+                            org_id: headers.membership.org_uuid,
+                            custom_permissions: Some(role),
+                        });
+                    }
+                    // Keykeeper: 404 for a confirmed member, custom or not (401
+                    // and 403 sign the web vault out), as refuse for everyone else.
                     crate::db::models::keykeeper_roles::refuse_on_manager_route(
                         request,
                         &headers.membership,
@@ -1192,7 +1215,11 @@ impl ManagerHeaders {
             if uuid::Uuid::parse_str(col_id.as_ref()).is_err() {
                 err!("Collection Id is malformed!");
             }
-            if !Collection::is_coll_manageable_by_user(col_id, &h.membership.user_uuid, conn).await? {
+            // Keykeeper: a custom role's folders are checked by what it does
+            // with each (keykeeper_roles::Reach), not as a manager's.
+            if h.custom_permissions.is_none()
+                && !Collection::is_coll_manageable_by_user(col_id, &h.membership.user_uuid, conn).await?
+            {
                 err!("Collection not found", "The current user isn't a manager for this collection")
             }
         }
@@ -1203,6 +1230,7 @@ impl ManagerHeaders {
             user: h.user,
             ip: h.ip,
             org_id: h.membership.org_uuid,
+            custom_permissions: h.custom_permissions,
         })
     }
 }
@@ -1233,7 +1261,7 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
                 org_id: headers.membership.org_uuid,
             })
         } else {
-            // Keykeeper: 403 for a custom member, 401 for everyone else.
+            // Keykeeper: 404 for a custom member, 401 for everyone else.
             crate::db::models::keykeeper_roles::refuse(
                 request,
                 &headers.membership,

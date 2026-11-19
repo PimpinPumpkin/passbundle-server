@@ -143,15 +143,24 @@ impl Requirement {
     }
 }
 
-/// The custom role permissions that make a member one the rule covers.
+/// The custom role permissions that make a member one the rule covers: those
+/// that change who reaches what (members, groups, shared folders), the
+/// organization's policies, or someone's account.
 fn elevated_permissions(p: &keykeeper_roles::CustomPermissions) -> bool {
-    use keykeeper_roles::Permission::{ManagePolicies, ManageResetPassword, ManageUsers};
-    p.has(ManageUsers) || p.has(ManagePolicies) || p.has(ManageResetPassword)
+    use keykeeper_roles::Permission::{
+        ManageCollections, ManageGroups, ManagePolicies, ManageResetPassword, ManageUsers,
+    };
+    p.has(ManageUsers)
+        || p.has(ManagePolicies)
+        || p.has(ManageResetPassword)
+        || p.has(ManageGroups)
+        || p.has(ManageCollections)
 }
 
 /// Whether an organization's setting, at this level, covers this membership:
 /// at the admin level, an owner, an admin, a custom role that manages members,
-/// policies, or account recovery, or anyone an MSP's membership brought in
+/// groups, shared folders, policies, or account recovery, or anyone an MSP's
+/// membership brought in
 /// (its admins and technicians, whatever their role there: a technician with
 /// every vault item and export reaches as much as an admin); at the everyone
 /// level, every role. Only once they've joined (accepted or confirmed):
@@ -1166,7 +1175,8 @@ pub async fn require_accepted_to_restore(member: &Membership, conn: &DbConn) -> 
 }
 
 /// Whether a role is one the rule covers: an owner, an admin, or a custom
-/// role that manages members, policies, or account recovery.
+/// role that manages members, groups, shared folders, policies, or account
+/// recovery.
 pub fn elevated_role(atype: MembershipType, custom: Option<&keykeeper_roles::CustomPermissions>) -> bool {
     atype == MembershipType::Owner || atype == MembershipType::Admin || custom.is_some_and(elevated_permissions)
 }

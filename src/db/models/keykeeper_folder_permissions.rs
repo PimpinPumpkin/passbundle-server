@@ -456,6 +456,16 @@ impl Stored {
     pub fn group(&self, collection: &CollectionId, group: &GroupId) -> Option<Grid> {
         self.groups.get(&(collection.clone(), group.clone())).copied()
     }
+
+    /// Everyone with a grant to this folder, and theirs.
+    pub fn users_of(&self, collection: &CollectionId) -> Vec<(UserId, Grid)> {
+        self.users.iter().filter(|((_, c), _)| c == collection).map(|((u, _), g)| (u.clone(), *g)).collect()
+    }
+
+    /// Every folder this group reaches, and its grant there.
+    pub fn grants_of(&self, group: &GroupId) -> HashMap<CollectionId, Grid> {
+        self.groups.iter().filter(|((_, g), _)| g == group).map(|((c, _), grid)| (c.clone(), *grid)).collect()
+    }
 }
 
 /// Our row for a grant, or None when its preset says it all.
