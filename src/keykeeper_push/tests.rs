@@ -232,7 +232,8 @@ async fn account(pool: &DbPool, standin: &Standin, paths: &[&str]) -> (UserId, V
     let mut user = User::new(&format!("{}@example.test", crate::util::get_uuid()), None);
     user.save(&conn).await.unwrap();
     let mut devices = Vec::new();
-    for path in paths {
+    let now = Utc::now().naive_utc();
+    for (i, path) in paths.iter().enumerate() {
         let mut device = Device::new(DeviceId::from(crate::util::get_uuid()), user.uuid.clone(), "Pixel".into(), 0);
         device.save(true, &conn).await.unwrap();
         let keys = phone();
@@ -242,7 +243,8 @@ async fn account(pool: &DbPool, standin: &Standin, paths: &[&str]) -> (UserId, V
             endpoint: standin.url(path),
             public_key: BASE64URL_NOPAD.encode(&keys.public),
             auth: BASE64URL_NOPAD.encode(&keys.auth),
-            created_at: Utc::now().naive_utc(),
+            // Each registered a second after the one before.
+            created_at: now - chrono::TimeDelta::seconds(i64::try_from(paths.len() - i).unwrap()),
         }
         .save(&conn)
         .await
@@ -407,6 +409,82 @@ async fn a_refused_endpoint_is_never_reached() {
     let deliveries = spawn_notify(pusher, pool.clone(), user, Kind::SignIn, None).await.unwrap();
     assert_eq!(deliveries, [Delivery::Sent]);
     assert_eq!(standin.received().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_keeps_ten_endpoints_and_an_eleventh_replaces_the_oldest() {
+    let standin = Standin::start().await;
+    let pool = DbPool::for_test_pool_of(2);
+    let paths: Vec<String> = (0..10).map(|i| format!("p{i:02}")).collect();
+    let (user, devices) = account(&pool, &standin, &paths.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let (other, _) = account(&pool, &standin, &["other"]).await;
+    assert_eq!(kept(&pool, &user).await, paths);
+    assert_eq!(MAX_PUSH_ENDPOINTS_PER_ACCOUNT, 10);
+
+    let conn = pool.get().await.unwrap();
+    // A device registering again keeps its place, and nobody else's goes.
+    let again = PushEndpoint::find(&user, &devices[5].0, &conn).await.unwrap();
+    PushEndpoint {
+        endpoint: standin.url("p05-again"),
+        created_at: Utc::now().naive_utc(),
+        ..again
+    }
+    .save(&conn)
+    .await
+    .unwrap();
+    assert_eq!(PushEndpoint::find_by_user(&user, &conn).await.len(), 10);
+    assert!(PushEndpoint::find(&user, &devices[0].0, &conn).await.is_some());
+
+    // An eleventh device: the oldest endpoint (p00) goes, and only it.
+    let mut eleventh = Device::new(DeviceId::from(crate::util::get_uuid()), user.clone(), "Pixel".into(), 0);
+    eleventh.save(true, &conn).await.unwrap();
+    let keys = phone();
+    PushEndpoint {
+        user_uuid: user.clone(),
+        device_uuid: eleventh.uuid.clone(),
+        endpoint: standin.url("p10"),
+        public_key: BASE64URL_NOPAD.encode(&keys.public),
+        auth: BASE64URL_NOPAD.encode(&keys.auth),
+        created_at: Utc::now().naive_utc(),
+    }
+    .save(&conn)
+    .await
+    .unwrap();
+    drop(conn);
+    let mut expected: Vec<String> = (1..=10).map(|i| format!("p{i:02}")).collect();
+    expected[4] = "p05-again".to_owned();
+    expected.sort();
+    assert_eq!(kept(&pool, &user).await, expected);
+    // Another account's endpoints are its own.
+    assert_eq!(kept(&pool, &other).await, ["other"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_gets_twenty_a_minute_across_its_devices() {
+    let standin = Standin::start().await;
+    let pool = DbPool::for_test_pool_of(2);
+    let paths: Vec<String> = (0..10).map(|i| format!("d{i}")).collect();
+    let (user, _) = account(&pool, &standin, &paths.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let pusher = pusher(&standin, testing_policy(), Duration::from_secs(10));
+    let (mut sent, mut limited) = (0, 0);
+    // Three sign-in requests, each to all ten devices: no device reaches
+    // its own 10 a minute, but the account reaches its 20.
+    for _ in 0..3 {
+        for d in spawn_notify(Arc::clone(&pusher), pool.clone(), user.clone(), Kind::SignIn, None).await.unwrap() {
+            match d {
+                Delivery::Sent => sent += 1,
+                Delivery::Limited => limited += 1,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(PER_ACCOUNT_PER_MINUTE, 20);
+    assert_eq!(sent, PER_ACCOUNT_PER_MINUTE);
+    assert_eq!(limited, 30 - PER_ACCOUNT_PER_MINUTE);
+    assert_eq!(standin.received().len(), PER_ACCOUNT_PER_MINUTE as usize);
+    // Another account isn't held back by this one's.
+    let (other, _) = account(&pool, &standin, &["other"]).await;
+    assert_eq!(spawn_notify(pusher, pool.clone(), other, Kind::SignIn, None).await.unwrap(), [Delivery::Sent]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

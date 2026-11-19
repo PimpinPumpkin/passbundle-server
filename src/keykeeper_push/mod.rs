@@ -29,7 +29,7 @@ use crate::{
     CONFIG,
     db::{
         DbPool,
-        models::{DeviceId, PushEndpoint, UserId},
+        models::{DeviceId, MAX_PUSH_ENDPOINTS_PER_ACCOUNT, PushEndpoint, UserId},
     },
 };
 
@@ -69,6 +69,10 @@ impl Kind {
 
 /// The most messages a minute to one device; more are dropped.
 pub const PER_DEVICE_PER_MINUTE: u32 = 10;
+/// The most messages a minute to one account's devices, all of them
+/// together; more are dropped: two sign-in requests a minute reach every
+/// one of its endpoints (at most `MAX_PUSH_ENDPOINTS_PER_ACCOUNT`).
+pub const PER_ACCOUNT_PER_MINUTE: u32 = 2 * MAX_PUSH_ENDPOINTS_PER_ACCOUNT;
 /// How long the VAPID JWT is good for (RFC 8292 allows up to 24 hours).
 const JWT_HOURS: i64 = 12;
 
@@ -115,6 +119,7 @@ pub struct Pusher {
     /// The VAPID `sub`: how a push service reaches the server's operator.
     subject: String,
     limiter: RateLimiter<[u8; 32], DashMapStateStore<[u8; 32]>, DefaultClock>,
+    account_limiter: RateLimiter<[u8; 32], DashMapStateStore<[u8; 32]>, DefaultClock>,
 }
 
 /// What came of one message.
@@ -123,7 +128,7 @@ pub enum Delivery {
     Sent,
     /// The push service no longer has the endpoint (404 or 410).
     Gone,
-    /// Over the device's limit: not sent.
+    /// Over the device's or the account's limit: not sent.
     Limited,
     /// Anything else: refused here, unreachable, or another answer.
     Failed(String),
@@ -169,12 +174,14 @@ impl Pusher {
         }
         let client = builder.build().map_err(|e| format!("Couldn't set up HTTPS for push: {e}"))?;
         let per_minute = NonZeroU32::new(PER_DEVICE_PER_MINUTE).expect("non-zero");
+        let per_account = NonZeroU32::new(PER_ACCOUNT_PER_MINUTE).expect("non-zero");
         Ok(Self {
             client,
             policy,
             vapid,
             subject,
             limiter: RateLimiter::keyed(Quota::per_minute(per_minute)),
+            account_limiter: RateLimiter::keyed(Quota::per_minute(per_account)),
         })
     }
 
@@ -209,14 +216,27 @@ impl Pusher {
         CURRENT.clone()
     }
 
+    /// Whether a message to this endpoint is over a limit: the device's, or
+    /// the account's, across all its endpoints.
     fn limited(&self, endpoint: &PushEndpoint) -> bool {
-        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-        ctx.update(endpoint.user_uuid.to_string().as_bytes());
-        ctx.update(&[0]);
-        ctx.update(endpoint.device_uuid.to_string().as_bytes());
-        let mut key = [0u8; 32];
-        key.copy_from_slice(ctx.finish().as_ref());
-        self.limiter.check_key(&key).is_err()
+        let key = |parts: &[&str]| {
+            let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    ctx.update(&[0]);
+                }
+                ctx.update(part.as_bytes());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(ctx.finish().as_ref());
+            key
+        };
+        let user = endpoint.user_uuid.to_string();
+        let device = endpoint.device_uuid.to_string();
+        // The device's first: a device over its own limit doesn't use up
+        // the account's.
+        self.limiter.check_key(&key(&[&user, &device])).is_err()
+            || self.account_limiter.check_key(&key(&[&user])).is_err()
     }
 
     /// Encrypts one message to the endpoint's keys and posts it. The answer

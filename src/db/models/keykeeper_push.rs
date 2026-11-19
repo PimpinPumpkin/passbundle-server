@@ -31,8 +31,16 @@ pub struct PushEndpoint {
     pub created_at: NaiveDateTime,
 }
 
+/// The most endpoints an account keeps. Devices per account aren't capped,
+/// and every endpoint hears of each sign-in request (which anyone who knows
+/// the email can start), so one account can't fan a request out to more.
+pub const MAX_PUSH_ENDPOINTS_PER_ACCOUNT: u32 = 10;
+
 impl PushEndpoint {
-    /// Keeps this device's endpoint, in place of the one it had.
+    /// Keeps this device's endpoint, in place of the one it had. An account
+    /// that would have more than `MAX_PUSH_ENDPOINTS_PER_ACCOUNT` loses its
+    /// oldest (registered longest ago), so someone who replaces phones never
+    /// gets stuck.
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         let row = self.clone();
         conn.run(move |conn| {
@@ -43,6 +51,21 @@ impl PushEndpoint {
                         .filter(push_endpoints::device_uuid.eq(&row.device_uuid)),
                 )
                 .execute(conn)?;
+                let others: Vec<DeviceId> = push_endpoints::table
+                    .filter(push_endpoints::user_uuid.eq(&row.user_uuid))
+                    .order((push_endpoints::created_at.asc(), push_endpoints::device_uuid.asc()))
+                    .select(push_endpoints::device_uuid)
+                    .load(conn)?;
+                let keep = usize::try_from(MAX_PUSH_ENDPOINTS_PER_ACCOUNT - 1).unwrap_or(0);
+                let oldest = &others[..others.len().saturating_sub(keep)];
+                if !oldest.is_empty() {
+                    diesel::delete(
+                        push_endpoints::table
+                            .filter(push_endpoints::user_uuid.eq(&row.user_uuid))
+                            .filter(push_endpoints::device_uuid.eq_any(oldest)),
+                    )
+                    .execute(conn)?;
+                }
                 diesel::insert_into(push_endpoints::table).values(&row).execute(conn)
             })
             .map(|_| ())
