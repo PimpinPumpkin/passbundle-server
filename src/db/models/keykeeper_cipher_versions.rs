@@ -336,11 +336,13 @@ impl CipherVersion {
 
     /// Forgets the past versions of someone's own items: their account's key
     /// changed, so nothing could open them anymore. Organizations' items keep
-    /// theirs.
+    /// theirs. It lists the items before it deletes, so the transaction holds
+    /// the lock for them from its start (`crate::db::write_locked`): a write
+    /// elsewhere at the same moment makes it wait its turn instead of failing.
     pub async fn delete_all_by_owner(user: &UserId, conn: &DbConn) -> EmptyResult {
         let user = user.clone();
         conn.run(move |conn| {
-            conn.transaction(|conn| {
+            crate::db::write_locked(conn, lock_own_items(&user), |conn| {
                 let owned: Vec<CipherId> = ciphers::table
                     .filter(ciphers::user_uuid.eq(&user))
                     .filter(ciphers::organization_uuid.is_null())
@@ -375,6 +377,29 @@ fn lock_item(cipher: &CipherId) -> impl FnOnce(&mut crate::db::DbConnInner) -> R
                 .for_update()
                 .first::<CipherId>(conn)
                 .optional()
+                .map(drop),
+            #[cfg(sqlite)]
+            crate::db::DbConnInner::Sqlite(_) => Ok(()),
+        }
+    }
+}
+
+/// `delete_all_by_owner`'s lock on PostgreSQL: the person's own items' rows,
+/// locked for update, the rows their saves lock (`lock_item`), so a save of
+/// one of them comes before the listing or after the delete, never between.
+/// On SQLite the transaction holds the write lock already.
+fn lock_own_items(user: &UserId) -> impl FnOnce(&mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> + '_ {
+    move |conn| {
+        #[cfg(not(postgresql))]
+        let _ = user;
+        match conn {
+            #[cfg(postgresql)]
+            crate::db::DbConnInner::Postgresql(conn) => ciphers::table
+                .filter(ciphers::user_uuid.eq(user))
+                .filter(ciphers::organization_uuid.is_null())
+                .select(ciphers::uuid)
+                .for_update()
+                .load::<CipherId>(conn)
                 .map(drop),
             #[cfg(sqlite)]
             crate::db::DbConnInner::Sqlite(_) => Ok(()),
@@ -683,6 +708,31 @@ mod save_tests {
         // The version it replaced is kept, and she saved the item as it is now.
         assert_eq!(CipherVersion::find_by_cipher(&item, &conn).await.unwrap().len(), 1);
         assert_eq!(CipherVersion::saved_by(&item, &conn).await, Some(ana.uuid.clone()));
+    }
+
+    /// After a key rotation, the past versions of someone's own items are
+    /// forgotten while a write elsewhere holds the database's write lock: it
+    /// waits for that write instead of failing, and they're gone. Its own
+    /// items' versions only: an organization's item keeps its own.
+    #[rocket::async_test]
+    async fn forgetting_own_versions_waits_for_a_write_in_progress() {
+        let pool = DbPool::for_test_pool_of(2);
+        let conn = pool.get().await.unwrap();
+        let ana = person("ana", &conn).await;
+        let acme = Organization::new("Acme".to_owned(), "billing@example.test", None, None);
+        acme.save(&conn).await.unwrap();
+        let own = new_item(Some(&ana.uuid), None, &ana.uuid, &conn).await;
+        let shared = new_item(None, Some(&acme.uuid), &ana.uuid, &conn).await;
+        for item in [&own, &shared] {
+            edit(item, "ZWRpdGVk", &ana.uuid, &conn).await.unwrap();
+        }
+
+        let released = pool.hold_write_lock(ANOTHER_WRITE).await;
+        let forgotten = CipherVersion::delete_all_by_owner(&ana.uuid, &conn).await;
+        released.await.unwrap();
+        assert_eq!(forgotten.map_err(|e| e.message().to_owned()), Ok(()), "it waits for the other write, and forgets");
+        assert_eq!(CipherVersion::find_by_cipher(&own, &conn).await.unwrap().len(), 0);
+        assert_eq!(CipherVersion::find_by_cipher(&shared, &conn).await.unwrap().len(), 1);
     }
 
     /// Edits of one item at once, each on a connection of its own, as when
