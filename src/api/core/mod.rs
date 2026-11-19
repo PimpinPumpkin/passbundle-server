@@ -30,6 +30,7 @@ mod keykeeper_plan_clock;
 mod keykeeper_plan_limits;
 pub mod keykeeper_plans;
 mod keykeeper_provisioning;
+mod keykeeper_push;
 mod keykeeper_reload_keys;
 pub mod keykeeper_scim;
 mod keykeeper_script_access;
@@ -108,6 +109,7 @@ pub fn routes() -> Vec<Route> {
     // Keykeeper: only where plans are enforced and a payment provider is set.
     routes.append(&mut keykeeper_billing::routes());
     routes.append(&mut keykeeper_provisioning::routes());
+    routes.append(&mut keykeeper_push::routes());
     routes.append(&mut keykeeper_reload_keys::routes());
     routes.append(&mut keykeeper_seals::routes());
     routes.append(&mut keykeeper_script_access::routes());

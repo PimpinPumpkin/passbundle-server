@@ -59,6 +59,7 @@ mod http_client;
 mod keykeeper_billing;
 mod keykeeper_location;
 mod keykeeper_origins;
+mod keykeeper_push;
 mod keykeeper_streaming;
 mod mail;
 mod ratelimit;
@@ -101,6 +102,8 @@ async fn main() -> Result<(), Error> {
     schedule_jobs(pool.clone());
     // Keykeeper: sends queued events to organizations' security tools.
     keykeeper_streaming::start(pool.clone());
+    // Keykeeper: push to phones reaches the database from its own tasks.
+    keykeeper_push::start(pool.clone());
     // Keykeeper: install command tokens kept the old way get sealed and hashed.
     if let Err(e) = db::models::upgrade_install_tokens(&pool.get().await.unwrap()).await {
         error!("Couldn't seal install command tokens: {e:?}");

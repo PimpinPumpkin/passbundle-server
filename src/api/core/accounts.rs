@@ -1852,6 +1852,10 @@ async fn post_auth_request(
     auth_request.save(&conn).await?;
 
     nt.send_auth_request(&user.uuid, &auth_request.uuid, &device, &conn).await;
+    // Keykeeper: and the account's phones with a UnifiedPush endpoint, from
+    // a task of its own, so a push service never holds up the request
+    // (DESIGN.md, "Push to phones").
+    crate::keykeeper_push::notify(&user.uuid, crate::keykeeper_push::Kind::SignIn, Some(&device.uuid));
 
     log_user_event(
         EventType::UserRequestedDeviceApproval,
