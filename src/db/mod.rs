@@ -268,6 +268,20 @@ impl DbPool {
         }
     }
 
+    /// Keykeeper: holds the test database's write lock on a connection of
+    /// its own, as a write elsewhere (another request, or a scheduled job)
+    /// holds it for a moment, and lets it go after `for_how_long`. Await
+    /// the answer to know it's been let go.
+    #[cfg(all(test, sqlite))]
+    pub async fn hold_write_lock(&self, for_how_long: Duration) -> tokio::task::JoinHandle<()> {
+        let busy = self.get().await.expect("a connection to hold the write lock on");
+        busy.run(|conn| conn.batch_execute("BEGIN IMMEDIATE")).await.expect("the write lock");
+        tokio::spawn(async move {
+            tokio::time::sleep(for_how_long).await;
+            busy.run(|conn| conn.batch_execute("COMMIT")).await.expect("the write lock let go");
+        })
+    }
+
     // Get a connection from the pool
     pub async fn get(&self) -> Result<DbConn, Error> {
         let duration = Duration::from_secs(u64::from(CONFIG.database_timeout()));
