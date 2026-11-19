@@ -184,13 +184,18 @@ impl CipherVersion {
     /// Saves an item and its history together, in one transaction: the
     /// version an edit replaces (then trims the item's history), or forgets
     /// the versions of an item moving into an organization, and records who
-    /// saved the item. Upstream's `Cipher::save`, with history.
+    /// saved the item. Upstream's `Cipher::save`, with history. An edit reads
+    /// who saved the version it replaces before it writes, so the transaction
+    /// holds the lock for the item from its start (`crate::db::write_locked`):
+    /// a write elsewhere at the same moment makes the save wait its turn
+    /// instead of failing.
     pub async fn save_item(cipher: &mut Cipher, history: History, by: &UserId, conn: &DbConn) -> EmptyResult {
         cipher.update_users_revision(conn).await;
         cipher.updated_at = Utc::now().naive_utc();
         let by = by.clone();
+        let id = cipher.uuid.clone();
         conn.run(move |conn| {
-            conn.transaction(|conn| {
+            crate::db::write_locked(conn, lock_item(&id), |conn| {
                 let mut record_saver = true;
                 match history {
                     History::Replaced(mut version) if !version.same_as(cipher) => {
@@ -352,6 +357,28 @@ impl CipherVersion {
             .map_res("Error forgetting earlier versions of the account's items")
         })
         .await
+    }
+}
+
+/// `save_item`'s lock on PostgreSQL: the item's own row, locked for update,
+/// so saves of one item go one at a time. A new item has no row yet, and
+/// nothing to lock. On SQLite the transaction holds the write lock already.
+fn lock_item(cipher: &CipherId) -> impl FnOnce(&mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> + '_ {
+    move |conn| {
+        #[cfg(not(postgresql))]
+        let _ = cipher;
+        match conn {
+            #[cfg(postgresql)]
+            crate::db::DbConnInner::Postgresql(conn) => ciphers::table
+                .filter(ciphers::uuid.eq(cipher))
+                .select(ciphers::uuid)
+                .for_update()
+                .first::<CipherId>(conn)
+                .optional()
+                .map(drop),
+            #[cfg(sqlite)]
+            crate::db::DbConnInner::Sqlite(_) => Ok(()),
+        }
     }
 }
 
@@ -589,5 +616,102 @@ mod tests {
         assert_eq!(forget, ["big-8", "big-9", "big-10"]);
 
         assert!(to_forget(&[]).is_empty());
+    }
+}
+
+/// Saving items while other connections write to the database.
+#[cfg(all(test, sqlite))]
+mod save_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::*;
+    use crate::db::{
+        DbPool,
+        models::{Organization, OrganizationId, User},
+    };
+
+    /// How long a write elsewhere holds the database's write lock in these
+    /// tests: far longer than a write takes, and far less than SQLite's busy
+    /// timeout (5 seconds).
+    const ANOTHER_WRITE: Duration = Duration::from_millis(300);
+
+    async fn person(name: &str, conn: &DbConn) -> User {
+        let mut user = User::new(&format!("{name}@example.test"), None);
+        user.save(conn).await.unwrap();
+        user
+    }
+
+    /// A new item, saved as an app saves one: someone's own, or an
+    /// organization's.
+    async fn new_item(own: Option<&UserId>, org: Option<&OrganizationId>, by: &UserId, conn: &DbConn) -> CipherId {
+        let mut item = Cipher::new(2, "2.bmFtZQ==|bmFtZQ==|bWFj".to_owned());
+        item.user_uuid = own.cloned();
+        item.organization_uuid = org.cloned();
+        CipherVersion::save_item(&mut item, History::Saved, by, conn).await.unwrap();
+        item.uuid
+    }
+
+    /// An edit of the item as it's stored: new notes, as an app saves them.
+    async fn edit(id: &CipherId, notes: &str, by: &UserId, conn: &DbConn) -> Result<(), String> {
+        let mut item = Cipher::find_by_uuid(id, conn).await.expect("the item");
+        let history = History::of(&ItemSave::Edit, &item, false);
+        item.notes = Some(format!("2.{notes}|{notes}|bWFj"));
+        CipherVersion::save_item(&mut item, history, by, conn).await.map_err(|e| e.message().to_owned())
+    }
+
+    /// A write elsewhere holds the database's write lock for a moment, as the
+    /// event streaming worker does while it sends an organization's events,
+    /// and as any request that writes does. An edit waits for it, as a single
+    /// write does, instead of failing with "Error saving cipher" (SQLite's
+    /// "database is locked"), which an edit did in a tier 1 run. No one is in
+    /// this item's organization yet, so the edit writes nothing before its
+    /// transaction: for an item someone can reach, it first marks their vault
+    /// changed, a write of its own, which waits for the lock by itself.
+    #[rocket::async_test]
+    async fn an_edit_waits_for_a_write_in_progress() {
+        let pool = DbPool::for_test_pool_of(2);
+        let conn = pool.get().await.unwrap();
+        let ana = person("ana", &conn).await;
+        let acme = Organization::new("Acme".to_owned(), "billing@example.test", None, None);
+        acme.save(&conn).await.unwrap();
+        let item = new_item(None, Some(&acme.uuid), &ana.uuid, &conn).await;
+
+        let released = pool.hold_write_lock(ANOTHER_WRITE).await;
+        let edited = edit(&item, "ZWRpdGVk", &ana.uuid, &conn).await;
+        released.await.unwrap();
+        assert_eq!(edited, Ok(()), "the edit waits for the other write, and is saved");
+        // The version it replaced is kept, and she saved the item as it is now.
+        assert_eq!(CipherVersion::find_by_cipher(&item, &conn).await.unwrap().len(), 1);
+        assert_eq!(CipherVersion::saved_by(&item, &conn).await, Some(ana.uuid.clone()));
+    }
+
+    /// Edits of one item at once, each on a connection of its own, as when
+    /// several people save a shared item, or someone's apps save theirs, at
+    /// the same moment: every edit is saved, none fails, and each keeps the
+    /// version it replaced.
+    #[rocket::async_test]
+    async fn edits_at_once_all_land() {
+        const AT_ONCE: usize = 8;
+        let pool = Arc::new(DbPool::for_test_pool_of(u32::try_from(AT_ONCE).unwrap()));
+        let conn = pool.get().await.unwrap();
+        let ana = person("ana", &conn).await;
+        let item = new_item(Some(&ana.uuid), None, &ana.uuid, &conn).await;
+        drop(conn);
+
+        let start = Arc::new(tokio::sync::Barrier::new(AT_ONCE));
+        let mut edits = Vec::new();
+        for n in 0..AT_ONCE {
+            let (pool, start, item, by) = (Arc::clone(&pool), Arc::clone(&start), item.clone(), ana.uuid.clone());
+            edits.push(tokio::spawn(async move {
+                let conn = pool.get().await.unwrap();
+                start.wait().await;
+                edit(&item, &format!("ZWRpdC0{n}"), &by, &conn).await
+            }));
+        }
+        for edited in edits {
+            assert_eq!(edited.await.unwrap(), Ok(()), "an edit failed instead of waiting its turn");
+        }
+        let conn = pool.get().await.unwrap();
+        assert_eq!(CipherVersion::find_by_cipher(&item, &conn).await.unwrap().len(), AT_ONCE);
     }
 }
