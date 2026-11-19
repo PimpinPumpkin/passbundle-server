@@ -276,7 +276,7 @@ pub async fn refuse_if_pool_ended(msp: &MspId, conn: &DbConn) -> EmptyResult {
 /// The design's sentence for a family with no room: "A Families plan covers 6
 /// people, and this one has 6. Remove someone first.", with the plan's figure
 /// and the people it has now.
-fn family_full(limit: i64, has: i64) -> String {
+pub(super) fn family_full(limit: i64, has: i64) -> String {
     let people = if limit == 1 {
         "1 person".to_owned()
     } else {

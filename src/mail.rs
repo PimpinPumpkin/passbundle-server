@@ -399,17 +399,30 @@ pub async fn send_msp_invite(address: &str, msp_name: &str, role: &str, invited_
     send_email(address, &subject, body_html, body_text).await
 }
 
-/// Keykeeper: someone joined an organization, by accepting an invitation or
-/// with an MSP's install command (`install`). Where joining is automatic
-/// nobody confirms them, so this is how the inviter or the client's owners
-/// hear of it; where an admin approves joiners (`approve`), it says to.
+/// Keykeeper: how someone joined an organization, for the email about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinedWith {
+    /// They accepted an emailed invitation.
+    Invitation,
+    /// With an install command: an MSP's (`provider`), or the company's own.
+    InstallCommand {
+        provider: bool,
+    },
+    /// With a family's invite link.
+    InviteLink,
+}
+
+/// Keykeeper: someone joined an organization, by accepting an invitation,
+/// with an install command, or with a family's invite link. Where joining is
+/// automatic nobody confirms them, so this is how the inviter or the
+/// organization's owners hear of it; where an owner or admin approves joiners
+/// (`approve`), it says to.
 pub async fn send_member_joined(
     address: &str,
     new_user_email: &str,
     org_name: &str,
     org_id: &OrganizationId,
-    install: bool,
-    provider: bool,
+    how: JoinedWith,
     approve: bool,
 ) -> EmptyResult {
     let (subject, body_html, body_text) = get_text(
@@ -419,8 +432,9 @@ pub async fn send_member_joined(
             "img_src": CONFIG._smtp_img_src(),
             "email": new_user_email,
             "org_name": org_name,
-            "install": install,
-            "provider": provider,
+            "install": matches!(how, JoinedWith::InstallCommand { .. }),
+            "provider": matches!(how, JoinedWith::InstallCommand { provider: true }),
+            "link": how == JoinedWith::InviteLink,
             "approve": approve,
         }),
     )?;
