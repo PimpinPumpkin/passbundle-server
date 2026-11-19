@@ -124,6 +124,9 @@ pub struct MspStaff {
     pub client_access: Option<String>,
     /// Technicians: whether they see clients' install commands.
     pub install_commands: bool,
+    /// Technicians: whether they make, see, and revoke script tokens in the
+    /// clients they reach where they're an admin (keykeeper_script_access).
+    pub script_access: bool,
 }
 
 /// A technician's role in one client, when it differs from their role in the
@@ -161,6 +164,10 @@ pub struct TechnicianAccess {
     #[serde(default)]
     pub custom: Option<CustomRole>,
     pub install_commands: bool,
+    /// Script access: they make, see, and revoke script tokens in each client
+    /// they reach where they're an admin. Off unless chosen.
+    #[serde(default)]
+    pub script_access: bool,
     /// Clients where their role differs from `custom`: each only once, and
     /// only clients they reach.
     #[serde(default)]
@@ -196,6 +203,7 @@ impl Default for TechnicianAccess {
             clients: Vec::new(),
             custom: None,
             install_commands: true,
+            script_access: false,
             client_roles: Vec::new(),
         }
     }
@@ -306,6 +314,7 @@ impl MspStaff {
             all_clients: true,
             client_access: None,
             install_commands: true,
+            script_access: false,
         }
     }
 
@@ -394,6 +403,7 @@ impl MspStaff {
             clients,
             custom: self.custom_role(),
             install_commands: self.install_commands,
+            script_access: self.script_access,
             client_roles,
         })
     }
@@ -403,9 +413,10 @@ impl MspStaff {
         self.all_clients = access.all_clients;
         self.client_access = access.custom.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default());
         self.install_commands = access.install_commands;
+        self.script_access = access.script_access;
         let (msp, user) = (self.msp_uuid.clone(), self.user_uuid.clone());
-        let (all_clients, client_access, install_commands) =
-            (self.all_clients, self.client_access.clone(), self.install_commands);
+        let (all_clients, client_access, install_commands, script_access) =
+            (self.all_clients, self.client_access.clone(), self.install_commands, self.script_access);
         let chosen: Vec<MspStaffClient> = if access.all_clients {
             Vec::new()
         } else {
@@ -440,6 +451,7 @@ impl MspStaff {
                     msp_staff::all_clients.eq(all_clients),
                     msp_staff::client_access.eq(client_access),
                     msp_staff::install_commands.eq(install_commands),
+                    msp_staff::script_access.eq(script_access),
                 ))
                 .execute(conn)?;
                 diesel::delete(
@@ -1225,6 +1237,7 @@ impl MspInvite {
             clients: Vec::new(),
             custom: None,
             install_commands: false,
+            script_access: false,
             client_roles: Vec::new(),
         }))
     }

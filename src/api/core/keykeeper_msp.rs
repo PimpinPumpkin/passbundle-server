@@ -888,6 +888,10 @@ async fn describe_access(access: &TechnicianAccess, conn: &DbConn) -> String {
         "no install commands"
     };
     let mut words = format!("{clients}, {role}, {install}");
+    // Keykeeper: named only when on, so the log reads as it did before it existed.
+    if access.script_access {
+        words.push_str(", script access");
+    }
     let mut differing = Vec::new();
     for role in &access.client_roles {
         if let Some(org) = Organization::find_by_uuid(&role.client, conn).await {
@@ -1400,6 +1404,9 @@ async fn get_organization_msp(org_id: OrganizationId, headers: Headers, conn: Db
                 "role": role,
                 "permissions": permissions,
                 "vaultItems": vault_items,
+                // Keykeeper: whether they make, see, and revoke the
+                // organization's script tokens (keykeeper_script_access).
+                "scriptAccess": super::keykeeper_script_access::manages_script_tokens(&org_id, &user.uuid, &conn).await,
             }));
         }
     }
