@@ -221,7 +221,7 @@ impl Policy {
 
 /// Whether HTTP_REQUEST_BLOCK_REGEX, the server's list of places it never
 /// makes requests to, matches a host name or address.
-fn blocked_by_regex(text: &str) -> bool {
+pub(crate) fn blocked_by_regex(text: &str) -> bool {
     /// The pattern last seen, and what it compiled to.
     type Compiled = Option<(String, Option<Regex>)>;
     static COMPILED: LazyLock<Mutex<Compiled>> = LazyLock::new(Mutex::default);
@@ -255,7 +255,7 @@ pub fn check_ip(ip: IpAddr, host: Option<&str>, port: u16, policy: &Policy) -> R
     }
 }
 
-fn valid_name(host: &str) -> bool {
+pub(crate) fn valid_name(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
         && host.split('.').all(|label| {
