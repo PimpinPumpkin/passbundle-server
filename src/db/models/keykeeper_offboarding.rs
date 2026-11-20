@@ -70,7 +70,10 @@ impl RemovedMember {
     /// Records that removing their MSP took this person out of the
     /// organization, unless it already has a record of them: a removal or
     /// revocation the organization made itself is never replaced by one that
-    /// came with the MSP.
+    /// came with the MSP. It looks before it writes, so the transaction holds
+    /// the organization's lock from its start (`crate::db::write_locked`): a
+    /// write elsewhere at the same moment makes it wait its turn instead of
+    /// failing.
     pub async fn record_with_msp(
         org_uuid: &OrganizationId,
         user_uuid: &UserId,
@@ -86,7 +89,7 @@ impl RemovedMember {
             with_msp: true,
         };
         conn.run(move |conn| {
-            conn.transaction(|conn| {
+            crate::db::write_locked(conn, lock_organization(&row.org_uuid), |conn| {
                 let known = removed_members::table
                     .filter(removed_members::org_uuid.eq(&row.org_uuid))
                     .filter(removed_members::user_uuid.eq(&row.user_uuid))
@@ -167,5 +170,88 @@ impl RemovedMember {
             query.count().get_result::<i64>(conn).unwrap_or(0)
         })
         .await
+    }
+}
+
+/// `record_with_msp`'s lock on PostgreSQL: the organization's row, locked for
+/// update, as a move to another MSP locks it (`begin_write`), so two writers
+/// of its records go one at a time. On SQLite the transaction holds the write
+/// lock already.
+fn lock_organization(
+    org: &OrganizationId,
+) -> impl FnOnce(&mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> + '_ {
+    move |conn| {
+        #[cfg(not(postgresql))]
+        let _ = org;
+        match conn {
+            #[cfg(postgresql)]
+            crate::db::DbConnInner::Postgresql(conn) => {
+                use crate::db::schema::organizations;
+                organizations::table
+                    .filter(organizations::uuid.eq(org))
+                    .select(organizations::uuid)
+                    .for_update()
+                    .first::<OrganizationId>(conn)
+                    .optional()
+                    .map(drop)
+            }
+            #[cfg(sqlite)]
+            crate::db::DbConnInner::Sqlite(_) => Ok(()),
+        }
+    }
+}
+
+#[cfg(all(test, sqlite))]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::db::{
+        DbPool,
+        models::{Msp, Organization, User, begin_write, commit_write, rollback_write},
+    };
+
+    /// An organization, someone in its MSP's staff, and the MSP.
+    async fn client_and_staff(conn: &DbConn) -> (OrganizationId, UserId, MspId) {
+        let org = Organization::new("Acme Dental".to_owned(), "billing@example.test", None, None);
+        org.save(conn).await.unwrap();
+        let mut tech = User::new("tech@example.test", None);
+        tech.save(conn).await.unwrap();
+        let msp = Msp::new("Acme Dental IT".to_owned());
+        msp.insert(conn).await.unwrap();
+        (org.uuid, tech.uuid, msp.uuid)
+    }
+
+    /// A client removing its MSP records each of the MSP's people as taken
+    /// out with it while another write holds the database's write lock (the
+    /// seats job runs every second where a tier 1 test removes an MSP, and the
+    /// event streaming worker writes while it sends the client's events): it
+    /// waits for that write instead of failing with "Error recording a
+    /// removal". Inside a transaction the caller holds (a move to another MSP
+    /// is one), it's part of that transaction: undone with it, and kept with
+    /// it.
+    #[rocket::async_test]
+    async fn taken_out_with_the_msp_waits_for_a_write_in_progress_and_is_part_of_a_move() {
+        let pool = DbPool::for_test_pool_of(2);
+        let conn = pool.get().await.unwrap();
+        let (org, tech, msp) = client_and_staff(&conn).await;
+
+        let released = pool.hold_write_lock(Duration::from_millis(300)).await;
+        let recorded = RemovedMember::record_with_msp(&org, &tech, &msp, &conn).await;
+        released.await.unwrap();
+        recorded.map_err(|e| e.message().to_owned()).expect("the record waits for the other write, and is written");
+        let row = RemovedMember::try_find(&org, &tech, &conn).await.unwrap().expect("the record");
+        assert!(row.with_msp);
+        assert_eq!(row.msp_uuid, Some(msp.clone()));
+
+        RemovedMember::clear(&org, &tech, &conn).await.unwrap();
+        begin_write(&org, &conn).await.unwrap();
+        RemovedMember::record_with_msp(&org, &tech, &msp, &conn).await.unwrap();
+        rollback_write(&conn).await;
+        assert!(RemovedMember::try_find(&org, &tech, &conn).await.unwrap().is_none());
+        begin_write(&org, &conn).await.unwrap();
+        RemovedMember::record_with_msp(&org, &tech, &msp, &conn).await.unwrap();
+        commit_write(&conn).await.unwrap();
+        assert!(RemovedMember::try_find(&org, &tech, &conn).await.unwrap().is_some_and(|r| r.with_msp));
     }
 }
