@@ -101,6 +101,8 @@ async fn main() -> Result<(), Error> {
     schedule_jobs(pool.clone());
     // Keykeeper: sends queued events to organizations' security tools.
     keykeeper_streaming::start(pool.clone());
+    // Keykeeper: mirrors the signed site rules feed for the extension, every 6 hours.
+    api::core::keykeeper_site_rules::start();
     // Keykeeper: install command tokens kept the old way get sealed and hashed.
     if let Err(e) = db::models::upgrade_install_tokens(&pool.get().await.unwrap()).await {
         error!("Couldn't seal install command tokens: {e:?}");
