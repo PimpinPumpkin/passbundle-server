@@ -764,3 +764,8 @@ table! {
         sent_at -> Nullable<Timestamp>,
     }
 }
+
+// The plans' clock forgets what it noted about plans that are gone in one
+// statement, with the plans in a subquery (keykeeper_plan_clock.rs,
+// forget_gone).
+allow_tables_to_appear_in_same_query!(plans, plan_notices);
