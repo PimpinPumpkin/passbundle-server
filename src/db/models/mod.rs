@@ -29,6 +29,7 @@ mod keykeeper_password_change;
 mod keykeeper_plan_clock;
 mod keykeeper_plan_invoices;
 mod keykeeper_plans;
+mod keykeeper_push;
 pub mod keykeeper_roles;
 mod keykeeper_scim;
 mod keykeeper_script_access;
@@ -112,6 +113,7 @@ pub use self::keykeeper_plan_clock::{
 pub use self::keykeeper_plan_invoices::{OrgSeats, PlanInvoice, business_orgs_of_their_own, plans_billed_by_the_day};
 // Keykeeper: what the plan limits ask (`src/api/core/keykeeper_plan_limits.rs`).
 pub use self::keykeeper_plans::{PersonGets, what_a_person_gets};
+pub use self::keykeeper_push::{MAX_PUSH_ENDPOINTS_PER_ACCOUNT, PushEndpoint};
 pub use self::keykeeper_scim::{
     ScimGroup, ScimPerson, ScimToken, ScimUser, looks_like_scim_token, managed_by_directory, remove_group_member,
 };
