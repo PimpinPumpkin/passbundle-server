@@ -390,6 +390,65 @@ impl DbConn {
     }
 }
 
+/// Keykeeper: runs `write`, which reads and then writes, in a transaction
+/// that holds the lock for its writes from its start. What it read is still
+/// so when it writes, and a write at the same moment (another request, or a
+/// job such as the plans' clock or event streaming's worker) waits its turn
+/// instead of failing. Use it for any transaction that reads before it
+/// writes.
+///
+/// - SQLite: `BEGIN IMMEDIATE`, which takes the database's write lock first,
+///   waiting for it as long as the busy timeout allows. A transaction begun
+///   the usual way that has read can't wait when it comes to write while
+///   another connection writes: SQLite answers "database is locked" at once.
+/// - PostgreSQL: `lock` runs first, and locks for update the row that writers
+///   of the same thing all lock (the item, the organization, or the plan's
+///   owner), so they go one at a time. On SQLite the transaction holds the
+///   write lock already, and `lock` does nothing.
+///
+/// Inside a transaction the caller holds (a move to another MSP is one), it's
+/// a savepoint in that transaction, which on SQLite holds the write lock
+/// already.
+pub fn write_locked<T>(
+    conn: &mut DbConnInner,
+    lock: impl FnOnce(&mut DbConnInner) -> diesel::QueryResult<()>,
+    write: impl FnOnce(&mut DbConnInner) -> diesel::QueryResult<T>,
+) -> diesel::QueryResult<T> {
+    use diesel::connection::TransactionManager;
+    type Manager = <DbConnInner as Connection>::TransactionManager;
+    begin_write_locked(conn)?;
+    match lock(conn).and_then(|()| write(conn)) {
+        Ok(written) => {
+            Manager::commit_transaction(conn)?;
+            Ok(written)
+        }
+        // As diesel's own transactions: the error that made it roll back is
+        // the one to answer, unless rolling back failed too.
+        Err(e) => match Manager::rollback_transaction(conn) {
+            Ok(()) | Err(diesel::result::Error::BrokenTransactionManager) => Err(e),
+            Err(rollback) => Err(rollback),
+        },
+    }
+}
+
+/// Begins `write_locked`'s transaction: immediate on SQLite, unless the
+/// caller holds one already, when it's a savepoint.
+fn begin_write_locked(conn: &mut DbConnInner) -> diesel::QueryResult<()> {
+    use diesel::connection::TransactionManager;
+    type Manager = <DbConnInner as Connection>::TransactionManager;
+    if Manager::transaction_manager_status_mut(conn).transaction_depth()?.is_some() {
+        return Manager::begin_transaction(conn);
+    }
+    match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(_) => Manager::begin_transaction(conn),
+        #[cfg(sqlite)]
+        DbConnInner::Sqlite(sqlite) => {
+            diesel::connection::AnsiTransactionManager::begin_transaction_sql(sqlite, "BEGIN IMMEDIATE")
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! db_run {
     ( $conn:ident: $body:block ) => {

@@ -104,6 +104,8 @@ async fn main() -> Result<(), Error> {
     keykeeper_streaming::start(pool.clone());
     // Keykeeper: push to phones reaches the database from its own tasks.
     keykeeper_push::start(pool.clone());
+    // Keykeeper: mirrors the signed site rules feed for the extension, every 6 hours.
+    api::core::keykeeper_site_rules::start();
     // Keykeeper: install command tokens kept the old way get sealed and hashed.
     if let Err(e) = db::models::upgrade_install_tokens(&pool.get().await.unwrap()).await {
         error!("Couldn't seal install command tokens: {e:?}");
