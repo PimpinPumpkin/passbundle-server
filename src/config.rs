@@ -558,6 +558,16 @@ make_config! {
         /// Installation key |> The installation key from https://bitwarden.com/host
         push_installation_key:  Pass,   false,  def,    String::new();
     },
+    unified_push {
+        /// Push to phones |> PassBundle: whether the server tells phones with a UnifiedPush distributor (ntfy, for example) that a sign-in is waiting, so they prompt while PassBundle is closed (DESIGN.md, "Push to phones"). A message says only that, encrypted to the phone's keys. Set only in the environment.
+        unified_push_enabled:   bool,   false,  def,    true;
+        /// Push hosts |> PassBundle: the host names the server may send push to, separated by commas (ntfy.sh, push.example.com). Empty, the default, is any public host. Private and loopback addresses are never reached. Set only in the environment.
+        unified_push_allowed_hosts: String, false, def, String::new();
+        /// Push to private addresses (tests only) |> PassBundle: for tests only. Lets push reach loopback and private addresses (never link-local or cloud metadata ones). The server won't start with it on a public DOMAIN. Leave it off.
+        unified_push_test_only_allow_private_addresses: bool, false, def, false;
+        /// Certificate authority for push (tests only) |> PassBundle: for tests only, with UNIFIED_PUSH_TEST_ONLY_ALLOW_PRIVATE_ADDRESSES: a PEM file whose certificate authorities push trusts instead of the system's. Leave it unset.
+        unified_push_test_only_ca_file: String, false, option;
+    },
     jobs {
         /// Job scheduler poll interval |> How often the job scheduler thread checks for jobs to run.
         /// Set to 0 to globally disable scheduled jobs.
@@ -1117,6 +1127,23 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     // Keykeeper: event streaming's private networks.
     if let Err(e) = crate::keykeeper_streaming::guard::Policy::parse(&cfg.event_streaming_allowed_networks) {
         err!(format!("`EVENT_STREAMING_ALLOWED_NETWORKS` is invalid: {e}"))
+    }
+    // Keykeeper: push to phones' hosts, and its settings for tests, which
+    // never go with a public DOMAIN (DESIGN.md, "Push to phones").
+    if let Err(e) = crate::keykeeper_push::guard::parse_hosts(&cfg.unified_push_allowed_hosts) {
+        err!(format!("`UNIFIED_PUSH_ALLOWED_HOSTS` is invalid: {e}"))
+    }
+    if cfg.unified_push_test_only_ca_file.is_some() && !cfg.unified_push_test_only_allow_private_addresses {
+        err!(
+            "`UNIFIED_PUSH_TEST_ONLY_CA_FILE` is only for tests: set `UNIFIED_PUSH_TEST_ONLY_ALLOW_PRIVATE_ADDRESSES` too, or unset it"
+        )
+    }
+    if (cfg.unified_push_test_only_allow_private_addresses || cfg.unified_push_test_only_ca_file.is_some())
+        && domain_is_public(&cfg.domain)
+    {
+        err!(
+            "`UNIFIED_PUSH_TEST_ONLY_ALLOW_PRIVATE_ADDRESSES` and `UNIFIED_PUSH_TEST_ONLY_CA_FILE` are for test servers only, never on a public `DOMAIN`"
+        )
     }
     // Keykeeper: Sentinel's sign-in, scope, and ingestion domain are
     // Microsoft's (a public or national cloud), over https, unless a test
@@ -2561,6 +2588,45 @@ mod keykeeper_tests {
             b.database_url = Some(format!("sqlite://{}/db.sqlite3", env!("CARGO_MANIFEST_DIR")));
             more(b);
         })
+    }
+
+    #[test]
+    fn push_settings_for_tests_never_go_with_a_public_domain() {
+        // DESIGN.md, "Push to phones": on by default, any public host.
+        let default = startable(|_| {});
+        assert!(default.unified_push_enabled);
+        assert_eq!(default.unified_push_allowed_hosts, "");
+        assert!(!default.unified_push_test_only_allow_private_addresses);
+        assert!(validate_config(&default, false).is_ok());
+
+        let testing = startable(|b| {
+            b.unified_push_test_only_allow_private_addresses = Some(true);
+            b.unified_push_test_only_ca_file = Some("/tmp/push-ca.pem".to_owned());
+        });
+        assert!(validate_config(&testing, false).is_ok());
+        // The certificate authority only with the setting it's for.
+        let ca_alone = startable(|b| b.unified_push_test_only_ca_file = Some("/tmp/push-ca.pem".to_owned()));
+        assert!(
+            format!("{:?}", validate_config(&ca_alone, false).unwrap_err()).contains("UNIFIED_PUSH_TEST_ONLY_CA_FILE")
+        );
+        // Never on a public DOMAIN.
+        for with_ca in [false, true] {
+            let public = built("https://vault.example.com", |b| {
+                b.database_url = Some(format!("sqlite://{}/db.sqlite3", env!("CARGO_MANIFEST_DIR")));
+                b.ip_header = Some("none".to_owned());
+                b.unified_push_test_only_allow_private_addresses = Some(true);
+                if with_ca {
+                    b.unified_push_test_only_ca_file = Some("/tmp/push-ca.pem".to_owned());
+                }
+            });
+            let refused = format!("{:?}", validate_config(&public, false).unwrap_err());
+            assert!(refused.contains("never on a public `DOMAIN`"), "{refused}");
+        }
+
+        let hosts = startable(|b| b.unified_push_allowed_hosts = Some("ntfy.sh, push.example.com".to_owned()));
+        assert!(validate_config(&hosts, false).is_ok());
+        let bad = startable(|b| b.unified_push_allowed_hosts = Some("ntfy.sh, 10.0.0.1".to_owned()));
+        assert!(format!("{:?}", validate_config(&bad, false).unwrap_err()).contains("UNIFIED_PUSH_ALLOWED_HOSTS"));
     }
 
     #[test]

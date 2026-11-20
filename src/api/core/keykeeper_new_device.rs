@@ -260,6 +260,9 @@ async fn start(
         used_at: None,
     };
     check.insert(conn).await?;
+    // The account's phones with a UnifiedPush endpoint hear of it, from a
+    // task of its own (DESIGN.md, "Push to phones").
+    crate::keykeeper_push::notify(&user.uuid, crate::keykeeper_push::Kind::SignIn, Some(&device.uuid));
     log_user_event_detail(
         EventType::KeykeeperNewDeviceCheckStarted,
         &user.uuid,
