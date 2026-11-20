@@ -268,6 +268,37 @@ impl DbPool {
         }
     }
 
+    /// Keykeeper: a PostgreSQL database of its own for one unit test, made
+    /// on the server that KK_TEST_POSTGRESQL_URL names (with a database there
+    /// to connect to first, such as
+    /// `postgresql://keykeeper:keykeeper@localhost:5432/keykeeper`), with
+    /// every migration run, and `size` connections. Only the tests made with
+    /// `on_each_database!` use it, and tier 1's server job runs them against
+    /// its PostgreSQL service.
+    #[cfg(all(test, postgresql))]
+    pub fn for_test_postgresql_pool_of(size: u32) -> DbPool {
+        let server = std::env::var("KK_TEST_POSTGRESQL_URL")
+            .expect("KK_TEST_POSTGRESQL_URL names the PostgreSQL server for these tests");
+        let name = format!("keykeeper_test_{}", crate::util::get_uuid().replace('-', ""));
+        let mut first = diesel::pg::PgConnection::establish(&server).expect("a connection to the tests' PostgreSQL");
+        diesel::sql_query(format!("CREATE DATABASE {name}")).execute(&mut first).expect("the test's database");
+        let mut url = url::Url::parse(&server).expect("KK_TEST_POSTGRESQL_URL is a URL");
+        url.set_path(&format!("/{name}"));
+        let url = url.to_string();
+        postgresql_migrations::run_migrations(&url).expect("the migrations run");
+        let pool = Pool::builder()
+            .max_size(size)
+            .connection_customizer(Box::new(DbConnOptions {
+                init_stmts: DbConnType::Postgresql.default_init_stmts(),
+            }))
+            .build(DbConnManager::new(&url))
+            .expect("a pool for the test's database");
+        DbPool {
+            pool: Some(pool),
+            semaphore: Arc::new(Semaphore::new(usize::try_from(size).expect("a pool size fits"))),
+        }
+    }
+
     /// Keykeeper: holds the test database's write lock on a connection of
     /// its own, as a write elsewhere (another request, or a scheduled job)
     /// holds it for a moment, and lets it go after `for_how_long`. Await
@@ -280,6 +311,21 @@ impl DbPool {
             tokio::time::sleep(for_how_long).await;
             busy.run(|conn| conn.batch_execute("COMMIT")).await.expect("the write lock let go");
         })
+    }
+
+    /// Keykeeper: a connection of its own with a transaction begun on it, as
+    /// another request's is while it saves. What a test writes with it is
+    /// that request's save in progress: the test's other connections don't
+    /// see it, and it holds its locks (on PostgreSQL the rows and keys it
+    /// wrote, on SQLite the database's write lock) until `commit_after`
+    /// commits it. A server function given it runs inside that transaction.
+    #[cfg(test)]
+    pub async fn another_request(&self) -> DbConn {
+        use diesel::connection::TransactionManager;
+        type Manager = <DbConnInner as Connection>::TransactionManager;
+        let other = self.get().await.expect("a connection for the other request");
+        other.run(Manager::begin_transaction).await.expect("the other request's transaction");
+        other
     }
 
     // Get a connection from the pool
@@ -388,6 +434,19 @@ impl DbConn {
         // Run blocking can't be used due to the 'static limitation, use block_in_place instead
         tokio::task::block_in_place(move || f(conn))
     }
+
+    /// Keykeeper: commits the transaction `DbPool::another_request` began,
+    /// after `for_how_long`, as that request finishes its save. Await the
+    /// answer to know it's committed.
+    #[cfg(test)]
+    pub fn commit_after(self, for_how_long: Duration) -> tokio::task::JoinHandle<()> {
+        use diesel::connection::TransactionManager;
+        type Manager = <DbConnInner as Connection>::TransactionManager;
+        tokio::spawn(async move {
+            tokio::time::sleep(for_how_long).await;
+            self.run(Manager::commit_transaction).await.expect("the other request's transaction committed");
+        })
+    }
 }
 
 /// Keykeeper: runs `write`, which reads and then writes, in a transaction
@@ -465,6 +524,53 @@ macro_rules! db_run {
                 },
             )+)+}
         }).await
+    };
+}
+
+/// Keykeeper: `$body` with `$conn`, a `&mut DbConnInner`, as its own
+/// database's connection, for a query the multi-connection can't build, such
+/// as an upsert (`ON CONFLICT`), where `db_run!` can't go: inside a
+/// transaction, or a function handed the connection. PostgreSQL and SQLite,
+/// the databases PassBundle builds.
+#[macro_export]
+macro_rules! on_its_database {
+    ($conn:ident, $body:expr) => {
+        match $conn {
+            #[cfg(postgresql)]
+            $crate::db::DbConnInner::Postgresql($conn) => $body,
+            #[cfg(sqlite)]
+            $crate::db::DbConnInner::Sqlite($conn) => $body,
+        }
+    };
+}
+
+/// Keykeeper: a unit test of what the database does when requests write at
+/// the same moment, on each database PassBundle builds: `$name::on_sqlite`
+/// against a SQLite file of its own, and `$name::on_postgresql` against a
+/// PostgreSQL database of its own (`DbPool::for_test_postgresql_pool_of`).
+/// The PostgreSQL one needs a PostgreSQL server, so it's ignored unless
+/// asked for: tier 1's server job runs those with
+/// `cargo test --features sqlite,postgresql -- --ignored on_postgresql`.
+/// `$test` is an async function of the module the macro is in, handed a pool
+/// of `$size` connections.
+#[cfg(test)]
+#[macro_export]
+macro_rules! on_each_database {
+    ($name:ident, $size:expr, $test:ident) => {
+        mod $name {
+            #[cfg(sqlite)]
+            #[rocket::async_test]
+            async fn on_sqlite() {
+                super::$test($crate::db::DbPool::for_test_pool_of($size)).await;
+            }
+
+            #[cfg(postgresql)]
+            #[rocket::async_test]
+            #[ignore = "needs a PostgreSQL server, named by KK_TEST_POSTGRESQL_URL"]
+            async fn on_postgresql() {
+                super::$test($crate::db::DbPool::for_test_postgresql_pool_of($size)).await;
+            }
+        }
     };
 }
 
