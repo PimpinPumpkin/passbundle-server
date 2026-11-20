@@ -795,3 +795,14 @@ table! {
         dismissed_at -> Timestamp,
     }
 }
+
+table! {
+    push_endpoints (user_uuid, device_uuid) {
+        user_uuid -> Text,
+        device_uuid -> Text,
+        endpoint -> Text,
+        public_key -> Text,
+        auth -> Text,
+        created_at -> Timestamp,
+    }
+}

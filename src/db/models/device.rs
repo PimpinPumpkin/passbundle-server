@@ -267,6 +267,9 @@ impl Device {
     }
 
     pub async fn rotate_refresh_tokens_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+        // Keykeeper: every session ends, so no phone of the account's hears
+        // of its sign-ins any more (DESIGN.md, "Push to phones").
+        super::PushEndpoint::delete_all_by_user(user_uuid, conn).await?;
         // Generate a new token per device.
         // We cannot do a single UPDATE with one value because each device needs a unique token.
         let devices = Self::find_by_user(user_uuid, conn).await;
