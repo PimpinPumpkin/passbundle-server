@@ -623,6 +623,10 @@ make_config! {
 
         /// Fill Assist Rules URL |> HTTPS URL for the server-wide Fill Assist rules feed base directory. PassBundle: empty by default, which keeps Fill Assist off; set only in the environment
         fill_assist_rules_url: String, false, def, String::new();
+        /// Site rules feed |> PassBundle: whose signed site rules the server mirrors for the extension's autofill (DESIGN.md, "Fill rules for everyone"). `passbundle`, the default, is PassBundle's own feed (https://rules.passbundle.com/); your own feed's address, https (or http to this machine only), with its key in SITE_RULES_FEED_KEY; or `none`. Checked every 6 hours. Set only in the environment
+        site_rules_feed: String, false, def, "passbundle".to_owned();
+        /// Site rules feed key |> PassBundle: the Ed25519 public key, as 64 lowercase hex digits, that the extension checks your own SITE_RULES_FEED with. Set only in the environment
+        site_rules_feed_key: String, false, def, String::new();
 
         /// HIBP Api Key |> HaveIBeenPwned API Key, request it here: https://haveibeenpwned.com/API/Key
         hibp_api_key:           Pass,   true,   option;
@@ -1227,6 +1231,13 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
             "[WARNING] `EXPERIMENTAL_CLIENT_FEATURE_FLAGS` lists {FILL_ASSIST_FLAG}, but `FILL_ASSIST_RULES_URL` is empty, \
              so Fill Assist stays off. Set `FILL_ASSIST_RULES_URL` to a rules feed to turn it on.\n"
         );
+    }
+
+    // Keykeeper: whose site rules feed the server mirrors (api/core/keykeeper_site_rules.rs).
+    if let Err(e) =
+        crate::api::core::keykeeper_site_rules::parse_setting(&cfg.site_rules_feed, &cfg.site_rules_feed_key)
+    {
+        err!(e);
     }
 
     let connect_src = cfg.allowed_connect_src.to_lowercase();
@@ -2550,6 +2561,31 @@ mod keykeeper_tests {
             b.database_url = Some(format!("sqlite://{}/db.sqlite3", env!("CARGO_MANIFEST_DIR")));
             more(b);
         })
+    }
+
+    #[test]
+    fn site_rules_come_from_passbundles_feed_by_default_and_a_bad_setting_doesnt_start() {
+        let config = startable(|_| {});
+        assert_eq!(config.site_rules_feed, "passbundle");
+        assert_eq!(config.site_rules_feed_key, "");
+        if let Err(e) = validate_config(&config, false) {
+            panic!("the default config should start: {e:?}");
+        }
+        let key = "8bb04e1c1b83dddf311f5bcddf7c50ede3c0802f47ec796e2a131cf41298d9f3";
+        for (feed, feed_key, starts) in [
+            ("none", "", true),
+            ("https://rules.example.com/", key, true),
+            ("https://rules.example.com/", "", false),
+            ("http://rules.example.com/", key, false),
+            ("passbundle", key, false),
+            ("rules.example.com", key, false),
+        ] {
+            let config = startable(|b| {
+                b.site_rules_feed = Some(feed.to_owned());
+                b.site_rules_feed_key = Some(feed_key.to_owned());
+            });
+            assert_eq!(validate_config(&config, false).is_ok(), starts, "{feed} {feed_key}");
+        }
     }
 
     #[test]
