@@ -216,6 +216,20 @@ pub fn route_permissions(method: Method, path: &str) -> &'static [Permission] {
     ROUTES.iter().find(|(m, p, _)| *m == method && *p == path).map_or(&[], |(_, _, perms)| *perms)
 }
 
+/// Admin routes a member's own app can ask without knowing whether they may:
+/// the organization's export, from a client that doesn't check the member's
+/// role first. The admin guard answers any confirmed member "not found" on
+/// these, not 401, which signs a client out (refuse_on_manager_route).
+const MEMBER_REACHABLE: &[(Method, &str)] = &[(Method::Get, "/organizations/<org_id>/export")];
+
+/// Whether this request's route is one a member's own app may ask on its own.
+pub fn member_reachable(request: &Request<'_>) -> bool {
+    request.route().is_some_and(|route| {
+        let path = route.uri.unmounted_origin.path();
+        MEMBER_REACHABLE.iter().any(|(m, p)| *m == route.method && *p == path.as_str())
+    })
+}
+
 /// A custom role's permissions.
 #[expect(clippy::struct_excessive_bools, reason = "One flag per upstream permission, as clients send them")]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
