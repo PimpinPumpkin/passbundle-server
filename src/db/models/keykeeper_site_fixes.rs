@@ -178,13 +178,16 @@ impl SiteFix {
     }
 
     /// Records that someone sent a fix, counting each person once. Returns
-    /// whether it applies to everyone now.
+    /// whether it applies to everyone now. It looks for the fix and its
+    /// reporter before it writes, so the transaction holds the lock from its
+    /// start (`crate::db::write_locked`): a write elsewhere at the same moment
+    /// makes it wait its turn instead of failing.
     pub async fn record(fix: &Fix, user: &UserId, conn: &DbConn) -> Result<bool, crate::error::Error> {
         let key = reporter_key()?;
         let fix = fix.clone();
         let user = user.clone();
         conn.run(move |conn| {
-            conn.transaction(|conn| {
+            crate::db::write_locked(conn, lock_reporter(&user), |conn| {
                 let now = Utc::now().naive_utc();
                 let found = site_fixes::table
                     .filter(site_fixes::host.eq(&fix.host))
@@ -287,6 +290,35 @@ impl SiteFix {
             json
         })
         .collect()
+    }
+}
+
+/// `SiteFix::record`'s lock on PostgreSQL: the reporter's own account row,
+/// locked for update, so one person's reports go one at a time and count
+/// them once, even when their apps send the same fix at the same moment. A
+/// fix nobody has sent yet has no row to lock: two people sending the same
+/// new fix at the same moment can still meet its unique key there, and the
+/// second is answered with an error. On SQLite the transaction holds the
+/// write lock already.
+fn lock_reporter(user: &UserId) -> impl FnOnce(&mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> + '_ {
+    move |conn| {
+        #[cfg(not(postgresql))]
+        let _ = user;
+        match conn {
+            #[cfg(postgresql)]
+            crate::db::DbConnInner::Postgresql(conn) => {
+                use crate::db::schema::users;
+                users::table
+                    .filter(users::uuid.eq(user))
+                    .select(users::uuid)
+                    .for_update()
+                    .first::<UserId>(conn)
+                    .optional()
+                    .map(drop)
+            }
+            #[cfg(sqlite)]
+            crate::db::DbConnInner::Sqlite(_) => Ok(()),
+        }
     }
 }
 
@@ -681,5 +713,40 @@ mod tests {
         assert!(report.fields.contains("\"type\":\"password\""));
         assert!(SiteProblem::checked("bank.example.com", &vec![field; 51], None).is_err());
         assert!(SiteProblem::checked("bank.example.com", &[], Some(&"n".repeat(1001))).is_err());
+    }
+}
+
+/// Recording fixes while other connections write to the database.
+#[cfg(all(test, sqlite))]
+mod record_tests {
+    use super::*;
+    use crate::db::{DbPool, models::User};
+
+    /// Someone sends a fix while a write elsewhere holds the database's write
+    /// lock for a moment, as event streaming's worker and any request that
+    /// writes do: the fix waits for that write instead of failing with "Error
+    /// recording a site fix", and they're counted once however often they
+    /// send it.
+    #[rocket::async_test]
+    async fn a_fix_waits_for_a_write_in_progress() {
+        let v: Value = serde_json::from_str(include_str!("vectors/server-derived-keys-v1.json")).unwrap();
+        init_reporter_key(&data_encoding::BASE64.decode(v["rsaPkcs1Der"].as_str().unwrap().as_bytes()).unwrap());
+        let pool = DbPool::for_test_pool_of(2);
+        let conn = pool.get().await.unwrap();
+        let mut ana = User::new("ana@example.test", None);
+        ana.save(&conn).await.unwrap();
+        let field = FixField {
+            id: "custno".into(),
+            ..FixField::default()
+        };
+        let fix = Fix::checked("bank.example.com", &field, "username").unwrap();
+
+        let released = pool.hold_write_lock(std::time::Duration::from_millis(300)).await;
+        let recorded = SiteFix::record(&fix, &ana.uuid, &conn).await;
+        released.await.unwrap();
+        recorded.map_err(|e| e.message().to_owned()).expect("the fix waits for the other write, and is recorded");
+        SiteFix::record(&fix, &ana.uuid, &conn).await.unwrap();
+        let reporters = conn.run(|conn| site_fixes::table.select(site_fixes::reporters).load::<i32>(conn)).await;
+        assert_eq!(reporters.unwrap(), [1]);
     }
 }
