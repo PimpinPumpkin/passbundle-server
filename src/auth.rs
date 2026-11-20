@@ -945,6 +945,16 @@ impl<'r> FromRequest<'r> for AdminHeaders {
                 org_id: headers.membership.org_uuid,
                 custom_permissions: Some(role),
             })
+        } else if crate::db::models::keykeeper_roles::member_reachable(request) {
+            // Keykeeper: a route a member's own app asks on its own (the
+            // organization's export): 404 for any confirmed member, so
+            // asking doesn't sign them out.
+            crate::db::models::keykeeper_roles::refuse_on_manager_route(
+                request,
+                &headers.membership,
+                "You need to be Admin or Owner to call this endpoint",
+            )
+            .await
         } else {
             // Keykeeper: 404 for a custom member, 401 for everyone else.
             crate::db::models::keykeeper_roles::refuse(

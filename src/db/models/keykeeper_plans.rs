@@ -962,63 +962,21 @@ impl PlanWrite {
     }
 }
 
-/// Runs `write`, which reads `whose` plan and then writes it, in a
-/// transaction that holds the lock for writing that plan from its start. The
-/// row it read is still the row when it writes, and a write at the same
-/// moment (another request, a provider's answer, or the plans' clock) waits
-/// its turn instead of failing. Every writer that reads a plan before writing
-/// it goes through here.
-///
-/// - SQLite: `BEGIN IMMEDIATE`, which takes the database's write lock first,
-///   waiting for it as long as the busy timeout allows. A transaction begun
-///   the usual way that has read can't wait when it comes to write while
-///   another connection writes: SQLite answers "database is locked" at once.
-/// - PostgreSQL: the owner's own row (the person, the organization, or the
-///   MSP), locked for update until the transaction ends, so writers of one
-///   owner's plan go one at a time, as requests for one organization do
-///   elsewhere in the server.
-///
-/// Inside a transaction the caller holds (a move to another MSP is one), it's
-/// a savepoint in that transaction, which on SQLite holds the write lock
-/// already.
+/// Runs `write`, which reads `whose` plan and then writes it, with the lock
+/// for writing that plan held from the start (`crate::db::write_locked`):
+/// SQLite's write lock, or on PostgreSQL the owner's own row (the person, the
+/// organization, or the MSP), so writers of one owner's plan go one at a
+/// time, as requests for one organization do elsewhere in the server. The row
+/// it read is still the row when it writes, and a write at the same moment
+/// (another request, a provider's answer, or the plans' clock) waits its turn
+/// instead of failing. Every writer that reads a plan before writing it goes
+/// through here.
 pub(super) fn writing_plan<T>(
     conn: &mut DbConnInner,
     whose: &PlanOwner,
     write: impl FnOnce(&mut DbConnInner) -> Query<T>,
 ) -> Query<T> {
-    use diesel::connection::TransactionManager;
-    type Manager = <DbConnInner as Connection>::TransactionManager;
-    begin_plan_write(conn)?;
-    match lock_owner(conn, whose).and_then(|()| write(conn)) {
-        Ok(written) => {
-            Manager::commit_transaction(conn)?;
-            Ok(written)
-        }
-        // As diesel's own transactions: the error that made it roll back is
-        // the one to answer, unless rolling back failed too.
-        Err(e) => match Manager::rollback_transaction(conn) {
-            Ok(()) | Err(diesel::result::Error::BrokenTransactionManager) => Err(e),
-            Err(rollback) => Err(rollback),
-        },
-    }
-}
-
-/// Begins `writing_plan`'s transaction: immediate on SQLite, unless the
-/// caller holds one already, when it's a savepoint.
-fn begin_plan_write(conn: &mut DbConnInner) -> Query<()> {
-    use diesel::connection::TransactionManager;
-    type Manager = <DbConnInner as Connection>::TransactionManager;
-    if Manager::transaction_manager_status_mut(conn).transaction_depth()?.is_some() {
-        return Manager::begin_transaction(conn);
-    }
-    match conn {
-        #[cfg(postgresql)]
-        DbConnInner::Postgresql(_) => Manager::begin_transaction(conn),
-        #[cfg(sqlite)]
-        DbConnInner::Sqlite(sqlite) => {
-            diesel::connection::AnsiTransactionManager::begin_transaction_sql(sqlite, "BEGIN IMMEDIATE")
-        }
-    }
+    crate::db::write_locked(conn, |conn| lock_owner(conn, whose), write)
 }
 
 /// `writing_plan`'s lock on PostgreSQL: the owner's own row, locked for
