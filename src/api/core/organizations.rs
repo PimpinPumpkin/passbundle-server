@@ -52,6 +52,7 @@ pub fn routes() -> Vec<Route> {
         bulk_delete_organization_collections,
         post_bulk_collections,
         get_org_details,
+        get_org_details_assigned,
         get_org_domain_sso_verified,
         get_members,
         send_invite,
@@ -1046,6 +1047,63 @@ async fn get_org_details(data: OrgIdData, headers: ManagerHeadersLoose, conn: Db
     })))
 }
 
+// Keykeeper: the items on the admin console's Collections page for anyone
+// upstream's web vault doesn't let edit every item: managers without access
+// to all items, and every custom role (DESIGN.md, "Roles and permissions").
+// Which items: assigned_items.
+//
+// Who: owners, admins, and managers (the guard), and custom roles with
+// reports or that manage shared folders (the guard, by ROUTES in
+// keykeeper_roles.rs). Everyone else gets 404: a regular member, a member
+// admitted only because they manage a folder, and a custom role without
+// either permission ("You can't do that here.").
+#[get("/ciphers/organization-details/assigned?<data..>")]
+async fn get_org_details_assigned(data: OrgIdData, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
+    if data.organization_id != headers.membership.org_uuid {
+        err_code!("Resource not found.", "Organization id's do not match", Status::NotFound.code);
+    }
+    if headers.folder_manager {
+        err_code!("Resource not found.", "Not for a folder's manager", Status::NotFound.code);
+    }
+
+    let (items, cipher_sync_data) = assigned_items(&headers.membership, &conn).await?;
+    Ok(Json(json!({
+        "data": org_items_json(items, &cipher_sync_data, &headers.host, &headers.user.uuid, &conn).await?,
+        "object": "list",
+        "continuationToken": null,
+    })))
+}
+
+/// Keykeeper: of the organization's items this member already sees, those in
+/// at least one shared folder they reach: never an item in a folder they
+/// don't reach, or in no folder. Returned with their sync data, whose
+/// cipher_collections (each item's folders they reach, as sync lists them)
+/// decided it and are the answer's collectionIds.
+async fn assigned_items(member: &Membership, conn: &DbConn) -> ApiResult<(Vec<Cipher>, CipherSyncData)> {
+    let (user_id, org_id) = (&member.user_uuid, &member.org_uuid);
+
+    // What they already see of the organization: every item with full access
+    // (owners, admins, and access to all items), as get_org_details lists
+    // them, and otherwise what their own vault shows of it, as get_org_details
+    // lists them for a custom role.
+    let seen: Vec<Cipher> = if member.has_full_access() {
+        Cipher::find_by_org(org_id, conn).await
+    } else {
+        Cipher::find_by_user_visible(user_id, conn)
+            .await
+            .into_iter()
+            .filter(|c| c.organization_uuid.as_ref() == Some(org_id))
+            .collect()
+    };
+
+    // Of those, the ones in a shared folder they reach.
+    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await?;
+    let in_a_folder_they_reach =
+        |c: &Cipher| cipher_sync_data.cipher_collections.get(&c.uuid).is_some_and(|folders| !folders.is_empty());
+    let assigned: Vec<Cipher> = seen.into_iter().filter(in_a_folder_they_reach).collect();
+    Ok((assigned, cipher_sync_data))
+}
+
 async fn get_org_details_impl(
     org_id: &OrganizationId,
     host: &str,
@@ -1063,10 +1121,20 @@ async fn org_details_json(
     conn: &DbConn,
 ) -> Result<Value, crate::error::Error> {
     let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await?;
+    org_items_json(ciphers, &cipher_sync_data, host, user_id, conn).await
+}
 
+/// Keykeeper: as org_details_json, with the caller's sync data already read.
+async fn org_items_json(
+    ciphers: Vec<Cipher>,
+    cipher_sync_data: &CipherSyncData,
+    host: &str,
+    user_id: &UserId,
+    conn: &DbConn,
+) -> Result<Value, crate::error::Error> {
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
     for c in ciphers {
-        ciphers_json.push(c.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::Organization, conn).await?);
+        ciphers_json.push(c.to_json(host, user_id, Some(cipher_sync_data), CipherSyncType::Organization, conn).await?);
     }
     Ok(json!(ciphers_json))
 }
@@ -4192,5 +4260,108 @@ mod keykeeper_tests {
         let (authentication, unlock) = request(600_000);
         assert!(authentication.check(&member, &unlock).is_ok());
         assert!(authentication.kdf.matches_user(&member));
+    }
+
+    async fn folder(org: &Organization, conn: &DbConn) -> CollectionId {
+        let collection = Collection::new(org.uuid.clone(), "2.aXY=|Y3Q=|bWFj".to_owned(), None);
+        collection.save(conn).await.unwrap();
+        collection.uuid
+    }
+
+    /// An item of the organization's in these shared folders (none: in no folder).
+    async fn item(org: &Organization, folders: &[&CollectionId], conn: &DbConn) -> CipherId {
+        let mut cipher = Cipher::new(1, "2.aXY=|Y3Q=|bWFj".to_owned());
+        cipher.organization_uuid = Some(org.uuid.clone());
+        cipher.save(conn).await.unwrap();
+        for folder in folders {
+            CollectionCipher::save(&cipher.uuid, folder, conn).await.unwrap();
+        }
+        cipher.uuid
+    }
+
+    async fn assigned_ids(member: &Membership, conn: &DbConn) -> HashSet<CipherId> {
+        let (items, _) = assigned_items(member, conn).await.unwrap();
+        items.into_iter().map(|c| c.uuid).collect()
+    }
+
+    /// The Collections page's items (get_org_details_assigned): each role gets
+    /// the organization's items in the shared folders it reaches, and never an
+    /// item in a folder it doesn't reach, in no folder, of its own, or of
+    /// another organization. An item's folders are only those it reaches.
+    #[rocket::async_test]
+    async fn the_collections_page_lists_the_items_in_the_folders_each_role_reaches() {
+        let conn = DbPool::for_test().await;
+        let org = Organization::new("Contoso".to_owned(), "billing@example.test", None, None);
+        org.save(&conn).await.unwrap();
+        let elsewhere = Organization::new("Fabrikam".to_owned(), "billing@example.test", None, None);
+        elsewhere.save(&conn).await.unwrap();
+        let reached = folder(&org, &conn).await;
+        let hidden = folder(&org, &conn).await;
+        let in_reached = item(&org, &[&reached], &conn).await;
+        let in_hidden = item(&org, &[&hidden], &conn).await;
+        let in_both = item(&org, &[&reached, &hidden], &conn).await;
+        item(&org, &[], &conn).await;
+        let theirs = folder(&elsewhere, &conn).await;
+        item(&elsewhere, &[&theirs], &conn).await;
+        let view = Grid::preset(true, false, false);
+
+        let owner = join(&person("owner", &conn).await, &org, MembershipType::Owner, &conn).await;
+        // An admin and a manager without access to all items; the manager
+        // reaches one folder.
+        let mut admin = join(&person("admin", &conn).await, &org, MembershipType::Admin, &conn).await;
+        admin.access_all = false;
+        admin.save(&conn).await.unwrap();
+        let mut manager = join(&person("manager", &conn).await, &org, MembershipType::Manager, &conn).await;
+        manager.access_all = false;
+        manager.save(&conn).await.unwrap();
+        folder_permissions::save_user(&manager.user_uuid, &reached, &view, &conn).await.unwrap();
+        // A custom role that manages shared folders reaches one folder here and
+        // one in the other organization, and has an item of its own.
+        let poc_user = person("poc", &conn).await;
+        let poc = join(&poc_user, &org, MembershipType::User, &conn).await;
+        let manages_folders = keykeeper_roles::CustomPermissions {
+            manage_collections: true,
+            ..Default::default()
+        };
+        keykeeper_roles::set(&poc.uuid, Some(&manages_folders), &conn).await.unwrap();
+        folder_permissions::save_user(&poc_user.uuid, &reached, &view, &conn).await.unwrap();
+        join(&poc_user, &elsewhere, MembershipType::User, &conn).await;
+        folder_permissions::save_user(&poc_user.uuid, &theirs, &view, &conn).await.unwrap();
+        let mut own = Cipher::new(1, "2.aXY=|Y3Q=|bWFj".to_owned());
+        own.user_uuid = Some(poc_user.uuid.clone());
+        own.save(&conn).await.unwrap();
+        // One with reports reaches the folder through a group.
+        let reports = keykeeper_roles::CustomPermissions {
+            access_reports: true,
+            ..Default::default()
+        };
+        let reporter = join(&person("reporter", &conn).await, &org, MembershipType::User, &conn).await;
+        keykeeper_roles::set(&reporter.uuid, Some(&reports), &conn).await.unwrap();
+        let mut group = Group::new(org.uuid.clone(), "Front desk".to_owned(), false, None);
+        group.save(&conn).await.unwrap();
+        GroupUser::new(group.uuid.clone(), reporter.uuid.clone()).save(&conn).await.unwrap();
+        folder_permissions::save_group(&reached, &group.uuid, &org.uuid, &view, &conn).await.unwrap();
+        // And one with reports and access to all items.
+        let mut auditor = join(&person("auditor", &conn).await, &org, MembershipType::User, &conn).await;
+        auditor.access_all = true;
+        auditor.save(&conn).await.unwrap();
+        keykeeper_roles::set(&auditor.uuid, Some(&reports), &conn).await.unwrap();
+
+        let every_folder: HashSet<CipherId> = [&in_reached, &in_hidden, &in_both].into_iter().cloned().collect();
+        let one_folder: HashSet<CipherId> = [&in_reached, &in_both].into_iter().cloned().collect();
+        for (who, member) in [("owner", &owner), ("admin", &admin), ("access to all items", &auditor)] {
+            assert_eq!(assigned_ids(member, &conn).await, every_folder, "{who}");
+        }
+        for (who, member) in [("manager", &manager), ("shared folders", &poc), ("reports by a group", &reporter)] {
+            assert_eq!(assigned_ids(member, &conn).await, one_folder, "{who}");
+        }
+
+        // The item in both folders shows only the folder they reach.
+        let (_, sync) = assigned_items(&poc, &conn).await.unwrap();
+        assert_eq!(sync.cipher_collections.get(&in_both), Some(&vec![reached.clone()]));
+        let (_, sync) = assigned_items(&owner, &conn).await.unwrap();
+        let both: HashSet<CollectionId> =
+            sync.cipher_collections.get(&in_both).into_iter().flatten().cloned().collect();
+        assert_eq!(both, HashSet::from([reached, hidden]));
     }
 }

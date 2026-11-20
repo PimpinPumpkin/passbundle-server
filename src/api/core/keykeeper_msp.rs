@@ -429,6 +429,14 @@ async fn ensure_owners_remain(memberships: &[Membership], conn: &DbConn) -> Empt
     Ok(())
 }
 
+/// What someone reads where they'd set up an MSP on a server that doesn't
+/// allow it (`MSP_SIGNUPS_ALLOWED` off, the default when someone runs their
+/// own server).
+const SET_UP_REFUSED: &str = "This server doesn't allow setting up an MSP. Ask the person who runs it.";
+
+/// The MSPs the person is staff of, with their role in each, and whether this
+/// server lets them set one up, so the console can say so before anyone types
+/// a name (DESIGN.md, "MSP console", "Getting there").
 #[get("/keykeeper/msp")]
 async fn list_msps(headers: Headers, conn: DbConn) -> Json<Value> {
     let msps: Vec<Value> = Msp::find_by_staff_user(&headers.user.uuid, &conn)
@@ -444,7 +452,7 @@ async fn list_msps(headers: Headers, conn: DbConn) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "data": msps }))
+    Json(json!({ "data": msps, "setUpAllowed": CONFIG.msp_signups_allowed() }))
 }
 
 #[derive(Deserialize)]
@@ -455,8 +463,9 @@ struct CreateMspData {
 
 #[post("/keykeeper/msp", data = "<data>")]
 async fn create_msp(headers: Headers, data: Json<CreateMspData>, conn: DbConn) -> JsonResult {
+    // A 400 with the sentence, never a 403, which signs the web vault out.
     if !CONFIG.msp_signups_allowed() {
-        err_code!("This server doesn't allow creating MSPs", rocket::http::Status::Forbidden.code)
+        err!(SET_UP_REFUSED)
     }
     // Its staff come under two-step login for admins, on by default.
     let watch = keykeeper_two_step::Watch::user(&headers.user.uuid, &conn).await?;
