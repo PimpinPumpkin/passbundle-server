@@ -382,6 +382,39 @@ pub async fn check_approved_sign_in(user: &User, conn: &DbConn) -> EmptyResult {
     ))
 }
 
+/// The rule for an approval, when it's given (accounts.rs, put_auth_request,
+/// through keykeeper_device_approval::approval_can_sign_in), before any key
+/// is taken: the people check_approved_sign_in refuses at the sign-in the
+/// approval is for. That sign-in proves no password and no single sign-on,
+/// so no organization's single sign-on counts for it, and an account without
+/// a master password isn't held up, as there. Without this, an approval for
+/// someone the rule covers who has no method that counts would never be
+/// used: the person approving would see it approved and the device that
+/// asked would read the user key, then be refused. The person approving is
+/// signed in (with single sign-on that counts for its own organization, say),
+/// so they're told who requires it, where to set it up, and to approve again.
+/// The sign-in's own check stays, for a rule that starts after the approval.
+pub async fn check_approval(user: &User, conn: &DbConn) -> EmptyResult {
+    if user.password_hash.is_empty() {
+        return Ok(());
+    }
+    let unmet = unmet(&user.uuid, &[], conn).await?;
+    if unmet.is_empty() {
+        return Ok(());
+    }
+    err!(approval_refused(&requirer_names(&unmet)))
+}
+
+/// What check_approval tells the person approving: who requires it, as the
+/// sign-in names them, and what to do.
+fn approval_refused(names: &[String]) -> String {
+    format!(
+        "{} Until you set it up, an approval can't sign that device in. Set up an authenticator app, a security key or passkey, or Duo in the web vault at {} (Settings, Security, Two-step login), then approve again.",
+        required_sentence(names),
+        CONFIG.domain()
+    )
+}
+
 /// The organization whose single sign-on started a session, as the rule counts
 /// it: only while that single sign-on still signs this account in.
 async fn counted_sso_orgs(user_id: &UserId, sso_org: Option<&OrganizationId>, conn: &DbConn) -> Vec<OrganizationId> {
@@ -1537,6 +1570,21 @@ mod tests {
         assert_eq!(
             required_sentence(&["A".to_owned(), "B".to_owned(), "C".to_owned()]),
             "A, B, and C require two-step login for your role."
+        );
+    }
+
+    #[test]
+    fn the_person_approving_is_told_who_requires_it_and_what_to_do() {
+        let domain = CONFIG.domain();
+        assert_eq!(
+            approval_refused(&["Acme Dental".to_owned()]),
+            format!(
+                "Acme Dental requires two-step login for your role. Until you set it up, an approval can't sign that device in. Set up an authenticator app, a security key or passkey, or Duo in the web vault at {domain} (Settings, Security, Two-step login), then approve again."
+            )
+        );
+        assert!(
+            approval_refused(&["Acme Dental".to_owned(), "Contoso IT".to_owned()])
+                .starts_with("Acme Dental and Contoso IT require two-step login for your role. Until you set it up,")
         );
     }
 

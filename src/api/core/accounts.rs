@@ -1966,7 +1966,8 @@ async fn put_auth_request(
     // that signed in with the master password or single sign-on approves one:
     // not a session that itself came from an approval, or an API key's. Nor
     // is an approval taken for someone an organization requires to sign in
-    // with its single sign-on: the device that asked would be sent there
+    // with its single sign-on, or whom two-step login for admins covers
+    // without a method that counts: the device that asked would be refused
     // anyway, so it says what to do instead (approval_can_sign_in).
     // Denying is open to any of the account's sessions: it hands nothing
     // out. The key must be an encrypted string. See DESIGN.md, "Approving a
