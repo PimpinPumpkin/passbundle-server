@@ -1961,16 +1961,19 @@ async fn put_auth_request(
     }
 
     // Keykeeper: a device never answers its own request, and only a device
-    // that signed in with the master password approves one: not a session
-    // that itself came from an approval, an API key, or SSO. The key must
-    // be an encrypted string. See DESIGN.md, "Approving a sign-in from
-    // another device".
+    // that signed in with the master password or single sign-on approves one:
+    // not a session that itself came from an approval, or an API key's.
+    // Denying is open to any of the account's sessions: it hands nothing
+    // out. The key must be an encrypted string. See DESIGN.md, "Approving a
+    // sign-in from another device".
     if auth_request.request_device_identifier == headers.device.uuid {
         err!("A device can't answer its own sign-in request")
     }
     if data.request_approved {
-        if !signed_in.is_master_password() {
-            err!("Approve sign-ins from a device where you signed in with your master password")
+        if !signed_in.may_approve_sign_in() {
+            err!(
+                "Approve sign-ins from a device where you signed in with your master password or single sign-on, not one another device approved"
+            )
         }
         if !data.key.as_deref().is_some_and(valid_approval_key) {
             err!("That approval doesn't carry a key PassBundle can use")
