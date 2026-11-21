@@ -14,6 +14,7 @@ mod keykeeper_billing;
 mod keykeeper_browser_autofill;
 mod keykeeper_cipher_versions;
 mod keykeeper_event_streaming;
+mod keykeeper_family_link;
 mod keykeeper_family_people;
 pub mod keykeeper_folder_permissions;
 mod keykeeper_install_tokens;
@@ -72,6 +73,11 @@ pub use self::keykeeper_event_streaming::{
     MAX_SCOPES_PER_PERSON, Secrets as EventSecrets, Settings as EventSettings, WAKE, describe as describe_event,
     destination_target, save_with_extras,
 };
+// Keykeeper: a family's invite link (`src/api/core/keykeeper_family_link.rs`).
+pub use self::keykeeper_family_link::{
+    FAMILY_LINK_DAYS, FamilyLink, FamilyLinkJoin, LegacyContactSuggestion, valid_family_link_token,
+    valid_sealed_settings,
+};
 // Keykeeper: a family's people limit, counted (`src/api/core/keykeeper_plan_limits.rs`).
 pub use self::keykeeper_family_people::Within as FamilyWithin;
 pub use self::keykeeper_install_tokens::{
@@ -119,7 +125,7 @@ pub use self::keykeeper_scim::{
 };
 pub use self::keykeeper_script_access::{ScriptGrant, ScriptRead, ScriptToken, parse_networks};
 pub use self::keykeeper_seals::{
-    JoinSeal, JoiningSeal, JoiningSealSource, SealKind, joining_seal_source, valid_encrypted_secret,
+    JoinSeal, JoiningSeal, JoiningSealSource, SealKind, joining_seal_source, valid_enc_string, valid_encrypted_secret,
     valid_expiring_seal, valid_seal,
 };
 pub use self::keykeeper_site_fixes::{

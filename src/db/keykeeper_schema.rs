@@ -765,6 +765,37 @@ table! {
     }
 }
 
+// A family's invite link (DESIGN.md, "A family's invite link").
+table! {
+    family_links (org_uuid) {
+        org_uuid -> Text,
+        token_hash -> Nullable<Text>,
+        sealed -> Text,
+        automatic -> Bool,
+        expires_at -> Nullable<Timestamp>,
+        made_by -> Nullable<Text>,
+        made_at -> Timestamp,
+        collection_uuid -> Nullable<Text>,
+    }
+}
+
+table! {
+    family_link_joins (membership_uuid) {
+        membership_uuid -> Text,
+        org_uuid -> Text,
+        proof -> Nullable<Text>,
+        automatic -> Bool,
+        joined_at -> Timestamp,
+    }
+}
+
+table! {
+    legacy_contact_suggestions (user_uuid) {
+        user_uuid -> Text,
+        dismissed_at -> Timestamp,
+    }
+}
+
 // The plans' clock forgets what it noted about plans that are gone in one
 // statement, with the plans in a subquery (keykeeper_plan_clock.rs,
 // forget_gone).

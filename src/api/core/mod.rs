@@ -13,6 +13,7 @@ pub mod keykeeper_device_approval;
 mod keykeeper_enrollment;
 mod keykeeper_event_streaming;
 mod keykeeper_everyone;
+mod keykeeper_family_link;
 mod keykeeper_folder_looks;
 mod keykeeper_joining;
 mod keykeeper_member_health;
@@ -103,6 +104,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut keykeeper_msp_templates::routes());
     routes.append(&mut keykeeper_new_device::routes());
     routes.append(&mut keykeeper_enrollment::routes());
+    routes.append(&mut keykeeper_family_link::routes());
     routes.append(&mut keykeeper_orgs::routes());
     routes.append(&mut keykeeper_password_change::routes());
     routes.append(&mut keykeeper_plans::routes());
@@ -423,7 +425,8 @@ async fn accept_org_invite(
         // ("Provisioning from Entra ID").
         let auto = crate::db::models::effective_joining(&org.uuid, conn).await.0.auto_confirm;
         if crate::db::models::confirms_automatically(auto, &member, conn).await {
-            mail::send_member_joined(&inviter, &user.email, &org.name, &org.uuid, false, false, false).await?;
+            mail::send_member_joined(&inviter, &user.email, &org.name, &org.uuid, mail::JoinedWith::Invitation, false)
+                .await?;
         } else {
             // User was invited to an organization, so they must be confirmed manually after acceptance
             mail::send_invite_accepted(&user.email, &inviter, &org.name).await?;
