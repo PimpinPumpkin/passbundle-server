@@ -53,7 +53,10 @@ impl UserSettings {
         .await
     }
 
-    /// Replaces someone's settings with these, already checked.
+    /// Replaces someone's settings with these, already checked: inserted, or
+    /// written over the ones saved, in one statement. Two first saves at once
+    /// (from two of their devices) can't both insert: the second waits for
+    /// the first, and is written over it, as one after the other would be.
     pub async fn save(user: &UserId, data: &str, conn: &DbConn) -> Result<Self, crate::error::Error> {
         let row = Self {
             user_uuid: user.clone(),
@@ -61,22 +64,19 @@ impl UserSettings {
             revision_date: Utc::now().naive_utc(),
         };
         conn.run(move |conn| {
-            conn.transaction(|conn| {
-                let updated = diesel::update(
-                    keykeeper_user_settings::table.filter(keykeeper_user_settings::user_uuid.eq(&row.user_uuid)),
-                )
-                .set((
-                    keykeeper_user_settings::data.eq(&row.data),
-                    keykeeper_user_settings::revision_date.eq(row.revision_date),
-                ))
-                .execute(conn)?;
-                if updated == 0 {
-                    diesel::insert_into(keykeeper_user_settings::table).values(&row).execute(conn)?;
-                }
-                Ok::<_, diesel::result::Error>(())
-            })
-            .map_res("Error saving settings")?;
-            Ok(row)
+            let saved = crate::on_its_database!(
+                conn,
+                diesel::insert_into(keykeeper_user_settings::table)
+                    .values(&row)
+                    .on_conflict(keykeeper_user_settings::user_uuid)
+                    .do_update()
+                    .set((
+                        keykeeper_user_settings::data.eq(&row.data),
+                        keykeeper_user_settings::revision_date.eq(row.revision_date),
+                    ))
+                    .execute(conn)
+            );
+            saved.map_res("Error saving settings").map(|()| row)
         })
         .await
     }
@@ -107,4 +107,45 @@ mod tests {
         assert!(!valid_settings("2.not base64!|YQ==|YQ=="));
         assert!(!valid_settings(&format!("2.YQ==|{}|YQ==", "A".repeat(MAX_SETTINGS))));
     }
+}
+
+/// Saving settings while another request saves them.
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use crate::db::{DbPool, models::User};
+
+    /// How long the other request takes to commit its save: far longer than
+    /// a save takes, and far less than SQLite's busy timeout (5 seconds).
+    const ANOTHER_SAVE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    const FIRST: &str = "2.Zmlyc3Q=|Zmlyc3Q=|bWFj";
+    const SECOND: &str = "2.c2Vjb25k|c2Vjb25k|bWFj";
+
+    /// Someone's settings saved for the first time from two of their devices
+    /// at once: one save has written them and hasn't committed yet when the
+    /// other comes. The second waits for the first and is saved over it, as
+    /// saves one after the other are, instead of failing with "Error saving
+    /// settings": on PostgreSQL, both found nothing to update, both inserted,
+    /// and the second met the first's key.
+    async fn two_first_saves_at_once(pool: DbPool) {
+        let conn = pool.get().await.unwrap();
+        let mut ana = User::new("ana@example.test", None);
+        ana.save(&conn).await.unwrap();
+
+        let other = pool.another_request().await;
+        UserSettings::save(&ana.uuid, FIRST, &other).await.unwrap();
+        let committed = other.commit_after(ANOTHER_SAVE);
+        let saved = UserSettings::save(&ana.uuid, SECOND, &conn).await;
+        committed.await.unwrap();
+        assert_eq!(
+            saved.map(|row| row.data).map_err(|e| e.message().to_owned()),
+            Ok(SECOND.to_owned()),
+            "the second save waits for the first, and is saved"
+        );
+        let kept = UserSettings::find(&ana.uuid, &conn).await.unwrap().expect("her settings");
+        assert_eq!(kept.data, SECOND);
+    }
+
+    crate::on_each_database!(two_first_saves, 2, two_first_saves_at_once);
 }
