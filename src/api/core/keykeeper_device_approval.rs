@@ -177,11 +177,17 @@ pub const SSO_REQUIRED_APPROVAL: &str = "Your organization requires single sign-
 /// requirement that starts after the approval. It's the same account on both
 /// devices (a request is the account's own), so it says nothing the person
 /// approving doesn't know.
+///
+/// The same goes for two-step login for admins: someone it covers who has no
+/// method that counts is refused at the sign-in (check_approved_sign_in), so
+/// their approval is refused here too, saying who requires it and to set it
+/// up, then approve again (keykeeper_two_step::check_approval). Single
+/// sign-on first, as at the sign-in.
 pub async fn approval_can_sign_in(user: &User, conn: &DbConn) -> EmptyResult {
     if keykeeper_sso::required_identifier(&user.uuid, conn).await.is_some() {
         err!(SSO_REQUIRED_APPROVAL)
     }
-    Ok(())
+    keykeeper_two_step::check_approval(user, conn).await
 }
 
 /// For the server's request log: a request's answer is read with its access
@@ -397,6 +403,90 @@ mod tests {
         for user in everyone {
             assert!(approval_can_sign_in(user, &conn).await.is_ok(), "{}", user.email);
         }
+    }
+
+    #[rocket::async_test]
+    async fn an_approval_for_someone_two_step_login_for_admins_refuses_is_refused_with_what_to_do_instead() {
+        use crate::{
+            CONFIG,
+            db::{
+                DbPool,
+                models::{
+                    MembershipStatus, MembershipType, OrgAdminTwoStep, Organization, TwoFactor, TwoFactorType,
+                    TwoStepScope,
+                },
+            },
+        };
+        let conn = DbPool::for_test().await;
+        let org = Organization::new("Contoso".to_owned(), "billing@contoso.example.test", None, None);
+        org.save(&conn).await.unwrap();
+        // People with a master password (a hash stands in for it).
+        let with_password = async |name: &str, atype: MembershipType| {
+            let mut user = joined(name, atype, MembershipStatus::Confirmed, &org.uuid, &conn).await;
+            user.password_hash = b"hash".to_vec();
+            user.save(&conn).await.unwrap();
+            user
+        };
+        let admin = with_password("ana", MembershipType::Admin).await;
+        let owner = with_password("owner", MembershipType::Owner).await;
+        let set_up = with_password("ben", MembershipType::Admin).await;
+        TwoFactor::new(set_up.uuid.clone(), TwoFactorType::Authenticator, String::new()).save(&conn).await.unwrap();
+        // Email codes don't count.
+        let by_email = with_password("cy", MembershipType::Admin).await;
+        TwoFactor::new(by_email.uuid.clone(), TwoFactorType::Email, String::new()).save(&conn).await.unwrap();
+        let member = with_password("gus", MembershipType::User).await;
+        // An admin without a master password yet (an invitation's first
+        // single sign-on, which goes on to set one).
+        let no_password = joined("dee", MembershipType::Admin, MembershipStatus::Confirmed, &org.uuid, &conn).await;
+        let everyone = [&admin, &owner, &set_up, &by_email, &member, &no_password];
+
+        // The approval is refused exactly where the sign-in it's for would be.
+        let agrees = async |user: &User| {
+            assert_eq!(
+                approval_can_sign_in(user, &conn).await.is_ok(),
+                keykeeper_two_step::check_approved_sign_in(user, &conn).await.is_ok(),
+                "{}",
+                user.email
+            );
+        };
+
+        // Not required: every approval is taken.
+        for user in everyone {
+            assert!(approval_can_sign_in(user, &conn).await.is_ok(), "{}", user.email);
+            agrees(user).await;
+        }
+
+        // Required for admins: those it covers without a method that counts
+        // are refused, with who requires it and what to do, as a plain 400.
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Admins, &conn).await.unwrap();
+        let said = format!(
+            "Contoso requires two-step login for your role. Until you set it up, an approval can't sign that device in. Set up an authenticator app, a security key or passkey, or Duo in the web vault at {} (Settings, Security, Two-step login), then approve again.",
+            CONFIG.domain()
+        );
+        for user in [&admin, &owner, &by_email] {
+            let refused = approval_can_sign_in(user, &conn).await.unwrap_err();
+            assert_eq!(refused.message(), said, "{}", user.email);
+            assert_eq!(refused.status_code(), 400);
+        }
+        // Someone it covers with a method that counts, someone it doesn't
+        // cover, and an account without a master password, whose sign-in
+        // isn't held up: taken.
+        for user in [&set_up, &member, &no_password] {
+            assert!(approval_can_sign_in(user, &conn).await.is_ok(), "{}", user.email);
+        }
+        for user in everyone {
+            agrees(user).await;
+        }
+
+        // Required of everyone: the member too.
+        OrgAdminTwoStep::set(&org.uuid, TwoStepScope::Everyone, &conn).await.unwrap();
+        assert_eq!(approval_can_sign_in(&member, &conn).await.unwrap_err().message(), said);
+        agrees(&member).await;
+
+        // Once the admin sets up a method that counts, theirs is taken.
+        TwoFactor::new(admin.uuid.clone(), TwoFactorType::Authenticator, String::new()).save(&conn).await.unwrap();
+        assert!(approval_can_sign_in(&admin, &conn).await.is_ok());
+        agrees(&admin).await;
     }
 
     #[test]
