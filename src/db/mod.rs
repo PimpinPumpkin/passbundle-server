@@ -178,6 +178,79 @@ impl Drop for DbPool {
     }
 }
 
+/// Keykeeper: how a unit test's SQLite file is named in the temporary folder
+/// (`DbPool::for_test_pool_of`).
+#[cfg(all(test, sqlite))]
+const TEST_DATABASE_PREFIX: &str = "keykeeper-test-";
+
+/// Keykeeper: removes the unit tests' SQLite files (and their journals) that
+/// are more than an hour old, once per test run. A test's file is only used
+/// while that test runs, and nothing removes it after, so without this every
+/// run left a few hundred files, gigabytes after a few days. A file from a
+/// run still going on is minutes old at most, so it's never touched.
+#[cfg(all(test, sqlite))]
+fn sweep_old_test_databases() {
+    static SWEPT: OnceLock<()> = OnceLock::new();
+    SWEPT.get_or_init(|| {
+        if let Some(hour_ago) = std::time::SystemTime::now().checked_sub(Duration::from_secs(60 * 60)) {
+            remove_test_databases(&std::env::temp_dir(), hour_ago);
+        }
+    });
+}
+
+/// Keykeeper: removes the unit tests' SQLite files in `dir` last changed
+/// before `before`, and nothing else.
+#[cfg(all(test, sqlite))]
+fn remove_test_databases(dir: &std::path::Path, before: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let ours = name.to_str().is_some_and(|n| n.starts_with(TEST_DATABASE_PREFIX) && n.contains(".sqlite3"));
+        let old = entry.metadata().and_then(|m| m.modified()).is_ok_and(|modified| modified < before);
+        if ours && old && entry.file_type().is_ok_and(|t| t.is_file()) {
+            // One that can't be removed now goes at a later run.
+            drop(std::fs::remove_file(entry.path()));
+        }
+    }
+}
+
+#[cfg(all(test, sqlite))]
+mod test_database_tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::{TEST_DATABASE_PREFIX, remove_test_databases};
+
+    /// Only a test's own files, and only old ones, go.
+    #[test]
+    fn old_test_databases_go_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("keykeeper-sweep-{}", crate::util::get_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        let make = |name: &str, old: bool| {
+            let path = dir.join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            if old {
+                file.set_modified(two_hours_ago).unwrap();
+            }
+            path
+        };
+        let old_db = make(&format!("{TEST_DATABASE_PREFIX}a.sqlite3"), true);
+        let old_journal = make(&format!("{TEST_DATABASE_PREFIX}a.sqlite3-wal"), true);
+        let new_db = make(&format!("{TEST_DATABASE_PREFIX}b.sqlite3"), false);
+        let someone_elses = make("other.sqlite3", true);
+        let not_a_database = make(&format!("{TEST_DATABASE_PREFIX}notes.txt"), true);
+
+        remove_test_databases(&dir, SystemTime::now() - Duration::from_secs(60 * 60));
+
+        assert!(!old_db.exists() && !old_journal.exists(), "an old test database and its journal go");
+        assert!(new_db.exists(), "a test database from a run going on stays");
+        assert!(someone_elses.exists() && not_a_database.exists(), "nothing else is touched");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 impl DbPool {
     // For the given database URL, guess its type, run migrations, create pool, and return it
     pub fn from_config() -> Result<Self, Error> {
@@ -251,7 +324,8 @@ impl DbPool {
     /// that arrive at once.
     #[cfg(all(test, sqlite))]
     pub fn for_test_pool_of(size: u32) -> DbPool {
-        let path = std::env::temp_dir().join(format!("keykeeper-test-{}.sqlite3", crate::util::get_uuid()));
+        sweep_old_test_databases();
+        let path = std::env::temp_dir().join(format!("{TEST_DATABASE_PREFIX}{}.sqlite3", crate::util::get_uuid()));
         let url = path.to_string_lossy().into_owned();
         sqlite_migrations::run_migrations(&url).expect("the migrations run");
         drop(ACTIVE_DB_TYPE.set(DbConnType::Sqlite));
