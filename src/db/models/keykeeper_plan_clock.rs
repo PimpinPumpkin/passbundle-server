@@ -433,10 +433,13 @@ fn due_reminders_at(conn: &mut DbConnInner, at: NaiveDateTime, grace_days: i64) 
 }
 
 /// Removes what the clock noted about rows that are gone (their owner was
-/// deleted, or the operator removed the row).
+/// deleted, or the operator removed the row), in one statement: it looks at
+/// the plans as it deletes, so a plan written and noted by another run of the
+/// clock at the same moment keeps its notes, where looking first and
+/// deleting after forgot them as a gone plan's.
 fn forget_gone(conn: &mut DbConnInner) -> Query<usize> {
-    let rows: Vec<String> = plans::table.select(plans::uuid).load::<String>(conn)?;
-    diesel::delete(plan_notices::table.filter(plan_notices::plan_uuid.ne_all(rows))).execute(conn)
+    diesel::delete(plan_notices::table.filter(plan_notices::plan_uuid.ne_all(plans::table.select(plans::uuid))))
+        .execute(conn)
 }
 
 /// One run of the plans' clock, handed a time: trials for whatever has no
@@ -1010,4 +1013,55 @@ mod database_tests {
             .unwrap();
         assert_eq!(left, 0);
     }
+}
+
+/// The clock forgetting what it noted while another run of it writes.
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use crate::db::{DbPool, models::Organization};
+
+    /// How long the other run takes to commit: far longer than forgetting
+    /// takes, and far less than SQLite's busy timeout (5 seconds).
+    const ANOTHER_RUN: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Two runs of the clock at once (a run that outlasts the schedule, or
+    /// two servers on one database): one writes an organization's trial and
+    /// notes its reminder, and hasn't committed yet when the other forgets
+    /// what was noted about plans that are gone. That plan isn't gone, and
+    /// its note stays, so the reminder doesn't go twice. On SQLite the
+    /// forgetting waits for the other run's write: it looked at the plans
+    /// first, and then forgot the new plan's note as a gone plan's. On
+    /// PostgreSQL it doesn't wait, and can't see what isn't committed yet.
+    async fn forgetting_keeps_what_another_run_just_noted(pool: DbPool) {
+        let conn = pool.get().await.unwrap();
+        let acme = Organization::new("Acme".to_owned(), "billing@example.test", None, None);
+        acme.save(&conn).await.unwrap();
+        let whose = PlanOwner::Organization(acme.uuid.clone());
+        let at = Utc::now().naive_utc();
+
+        let other = pool.another_request().await;
+        let plan = other
+            .run(move |conn| {
+                let trial = start_trial(conn, &whose, at, 7)?.expect("Acme's trial");
+                let ends = trial.free_until.expect("its end");
+                note(conn, &trial.uuid, Reminder::TrialSevenDays.as_str(), ends, at)?;
+                Ok::<_, diesel::result::Error>(trial.uuid)
+            })
+            .await
+            .unwrap();
+        let committed = other.commit_after(ANOTHER_RUN);
+        let forgot = conn.run(forget_gone).await;
+        committed.await.unwrap();
+        assert_eq!(forgot.unwrap(), 0, "no plan is gone");
+        let notes = conn
+            .run(move |conn| {
+                plan_notices::table.filter(plan_notices::plan_uuid.eq(plan)).count().get_result::<i64>(conn)
+            })
+            .await
+            .unwrap();
+        assert_eq!(notes, 1, "the reminder's note stays");
+    }
+
+    crate::on_each_database!(forgetting_during_another_run, 2, forgetting_keeps_what_another_run_just_noted);
 }
