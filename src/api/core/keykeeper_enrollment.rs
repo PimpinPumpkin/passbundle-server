@@ -659,8 +659,17 @@ async fn tell_owners(user: &User, org: &Organization, invited_by: Option<String>
         }
     }
     for address in to {
-        if let Err(e) =
-            mail::send_member_joined(&address, &user.email, &org.name, &org.uuid, true, provider, approve).await
+        if let Err(e) = mail::send_member_joined(
+            &address,
+            &user.email,
+            &org.name,
+            &org.uuid,
+            mail::JoinedWith::InstallCommand {
+                provider,
+            },
+            approve,
+        )
+        .await
         {
             error!("Error sending the join email for {}: {e:#?}", org.name);
         }

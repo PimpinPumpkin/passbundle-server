@@ -93,13 +93,18 @@ pub fn joining_seal_source(seal: &str) -> Option<JoiningSealSource> {
 /// The install command's join secret, encrypted with the organization's key
 /// as upstream encrypts with symmetric keys: `2.<iv>|<data>|<mac>`.
 pub fn valid_encrypted_secret(secret: &str) -> bool {
-    let Some(parts) = secret.strip_prefix("2.") else {
+    secret.len() <= 512 && valid_enc_string(secret)
+}
+
+/// Something encrypted with a symmetric key as upstream encrypts it,
+/// `2.<iv>|<data>|<mac>`, each part base64. Only the form: the server can't
+/// read it.
+pub fn valid_enc_string(value: &str) -> bool {
+    let Some(parts) = value.strip_prefix("2.") else {
         return false;
     };
     let parts: Vec<&str> = parts.split('|').collect();
-    secret.len() <= 512
-        && parts.len() == 3
-        && parts.iter().all(|p| !p.is_empty() && data_encoding::BASE64.decode(p.as_bytes()).is_ok())
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && data_encoding::BASE64.decode(p.as_bytes()).is_ok())
 }
 
 /// What a seal vouches for: an email invitation, or an MSP staff member's

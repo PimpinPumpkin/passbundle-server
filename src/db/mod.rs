@@ -831,3 +831,32 @@ mod postgresql_migrations {
         Ok(())
     }
 }
+
+// Keykeeper: diesel runs one migration per version (a folder's name up to its
+// first underscore), so a folder whose version another already has never runs,
+// and its tables are missing from every new database. Two branches made the
+// same day can each take the day's first version.
+#[cfg(test)]
+mod migration_version_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[test]
+    fn every_migration_has_a_version_of_its_own() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        for backend in ["sqlite", "mysql", "postgresql"] {
+            let mut seen: BTreeMap<String, String> = BTreeMap::new();
+            for entry in std::fs::read_dir(root.join(backend)).unwrap() {
+                let entry = entry.unwrap();
+                if !entry.file_type().unwrap().is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().into_string().unwrap();
+                let version = name.split('_').next().unwrap().replace('-', "");
+                if let Some(other) = seen.insert(version, name.clone()) {
+                    panic!("{backend}: {other} and {name} have the same version, so only one of them runs");
+                }
+            }
+        }
+    }
+}

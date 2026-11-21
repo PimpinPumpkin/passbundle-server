@@ -340,6 +340,11 @@ async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
         }
         let mut sealed = sealed_joining(&caller.org_uuid, &conn).await;
         extend(&mut sealed, json!({ "organizationId": caller.org_uuid }));
+        // Keykeeper: a family's invite link's sealed settings too, so its
+        // owners' and admins' apps remember the newest (keykeeper_family_link.rs).
+        if let Some(link) = super::keykeeper_family_link::sealed_settings(&caller.org_uuid, &conn).await {
+            extend(&mut sealed, json!({ "familyLink": link }));
+        }
         organizations.push(sealed);
         let (joining, _) = effective_joining(&caller.org_uuid, &conn).await;
         for member in Membership::find_by_org(&caller.org_uuid, &conn).await {
@@ -367,6 +372,13 @@ async fn pending_for_caller(headers: Headers, conn: DbConn) -> JsonResult {
                 "needsTwoStep": OrgPolicy::waits_for_two_step(&member, &conn).await,
             });
             extend(&mut entry, vouching(&caller.org_uuid, &member, &user.email, from_msp, &conn).await);
+            // Keykeeper: someone who joined a family with its invite link is
+            // let in on the link's terms, never the organization's joining
+            // setting (DESIGN.md, "A family's invite link").
+            if let Some((link, automatic)) = super::keykeeper_family_link::link_join_entry(&member, &conn).await {
+                let automatic = automatic && !super::keykeeper_two_step::must_accept_first(&member, &conn).await;
+                extend(&mut entry, json!({ "familyLink": link, "autoConfirm": automatic }));
+            }
             pending.push(entry);
         }
     }
