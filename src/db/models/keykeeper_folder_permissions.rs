@@ -24,7 +24,7 @@ use crate::{
     CONFIG,
     api::{ApiResult, EmptyResult},
     db::{
-        DbConn,
+        DbConn, DbConnInner,
         keykeeper_schema::{keykeeper_collections_groups, keykeeper_users_collections},
         schema::{ciphers_collections, collections_groups, users_collections},
     },
@@ -479,64 +479,67 @@ fn extra_for(grid: &Grid) -> Option<Extra> {
 /// transaction, so the two can't disagree.
 pub async fn save_user(user: &UserId, collection: &CollectionId, grid: &Grid, conn: &DbConn) -> EmptyResult {
     User::update_uuid_revision(user, conn).await;
+    let (user, collection, grid) = (user.clone(), collection.clone(), *grid);
+    conn.run(move |conn| write_user_grant(conn, &user, &collection, &grid))
+        .await
+        .map_res("Error saving a shared folder's permissions")
+}
+
+/// `save_user`'s rows, in one transaction. Upstream's is inserted or replaced
+/// in one statement, so two saves of a grant nobody had yet, at the same
+/// moment, can't both insert it: the second waits for the first and replaces
+/// it, holding the grant's row from then on, so it replaces our row after the
+/// first has written it.
+fn write_user_grant(conn: &mut DbConnInner, user: &UserId, collection: &CollectionId, grid: &Grid) -> QueryResult<()> {
     let (read_only, hide_passwords, manage) = grid.upstream();
     let extra = extra_for(grid);
-    let user = user.clone();
-    let collection = collection.clone();
-    conn.run(move |conn| {
-        conn.transaction(|conn| {
-            // Upstream's row, inserted or replaced (upstream's CollectionUser::save).
-            let values = (
-                users_collections::read_only.eq(read_only),
-                users_collections::hide_passwords.eq(hide_passwords),
-                users_collections::manage.eq(manage),
-            );
-            let updated = diesel::update(
-                users_collections::table
-                    .filter(users_collections::user_uuid.eq(&user))
-                    .filter(users_collections::collection_uuid.eq(&collection)),
-            )
-            .set(values)
-            .execute(conn)?;
-            if updated == 0 {
-                diesel::insert_into(users_collections::table)
-                    .values((
-                        users_collections::user_uuid.eq(&user),
-                        users_collections::collection_uuid.eq(&collection),
-                        values.0,
-                        values.1,
-                        values.2,
-                    ))
-                    .execute(conn)?;
-            }
-            diesel::delete(
-                keykeeper_users_collections::table
-                    .filter(keykeeper_users_collections::user_uuid.eq(&user))
-                    .filter(keykeeper_users_collections::collection_uuid.eq(&collection)),
-            )
-            .execute(conn)?;
-            if let Some(e) = extra {
-                diesel::insert_into(keykeeper_users_collections::table)
-                    .values(UserRow {
-                        user_uuid: user.clone(),
-                        collection_uuid: collection.clone(),
-                        read_only: e.upstream.0,
-                        hide_passwords: e.upstream.1,
-                        manage: e.upstream.2,
-                        can_create: e.create,
-                        can_delete: e.delete,
-                        can_export: e.export,
-                        can_share: e.share,
-                        can_print: e.print,
-                        can_view_history: e.view_history,
-                    })
-                    .execute(conn)?;
-            }
-            Ok::<_, diesel::result::Error>(())
-        })
-        .map_res("Error saving a shared folder's permissions")
+    conn.transaction(|conn| {
+        // Upstream's row, inserted or replaced (upstream's CollectionUser::save).
+        let values = (
+            users_collections::read_only.eq(read_only),
+            users_collections::hide_passwords.eq(hide_passwords),
+            users_collections::manage.eq(manage),
+        );
+        crate::on_its_database!(
+            conn,
+            diesel::insert_into(users_collections::table)
+                .values((
+                    users_collections::user_uuid.eq(user),
+                    users_collections::collection_uuid.eq(collection),
+                    values.0,
+                    values.1,
+                    values.2,
+                ))
+                .on_conflict((users_collections::user_uuid, users_collections::collection_uuid))
+                .do_update()
+                .set(values)
+                .execute(conn)
+        )?;
+        diesel::delete(
+            keykeeper_users_collections::table
+                .filter(keykeeper_users_collections::user_uuid.eq(user))
+                .filter(keykeeper_users_collections::collection_uuid.eq(collection)),
+        )
+        .execute(conn)?;
+        if let Some(e) = extra {
+            diesel::insert_into(keykeeper_users_collections::table)
+                .values(UserRow {
+                    user_uuid: user.clone(),
+                    collection_uuid: collection.clone(),
+                    read_only: e.upstream.0,
+                    hide_passwords: e.upstream.1,
+                    manage: e.upstream.2,
+                    can_create: e.create,
+                    can_delete: e.delete,
+                    can_export: e.export,
+                    can_share: e.share,
+                    can_print: e.print,
+                    can_view_history: e.view_history,
+                })
+                .execute(conn)?;
+        }
+        Ok(())
     })
-    .await
 }
 
 /// Gives a group this grant to a folder, as save_user does for a person.
@@ -550,64 +553,68 @@ pub async fn save_group(
     for group_user in GroupUser::find_by_group(group, org, conn).await {
         group_user.update_user_revision(conn).await;
     }
+    let (collection, group, grid) = (collection.clone(), group.clone(), *grid);
+    conn.run(move |conn| write_group_grant(conn, &collection, &group, &grid))
+        .await
+        .map_res("Error saving a shared folder's permissions")
+}
+
+/// `save_group`'s rows, as `write_user_grant` writes a person's.
+fn write_group_grant(
+    conn: &mut DbConnInner,
+    collection: &CollectionId,
+    group: &GroupId,
+    grid: &Grid,
+) -> QueryResult<()> {
     let (read_only, hide_passwords, manage) = grid.upstream();
     let extra = extra_for(grid);
-    let group = group.clone();
-    let collection = collection.clone();
-    conn.run(move |conn| {
-        conn.transaction(|conn| {
-            // Upstream's row, inserted or replaced (upstream's CollectionGroup::save).
-            let values = (
-                collections_groups::read_only.eq(read_only),
-                collections_groups::hide_passwords.eq(hide_passwords),
-                collections_groups::manage.eq(manage),
-            );
-            let updated = diesel::update(
-                collections_groups::table
-                    .filter(collections_groups::collections_uuid.eq(&collection))
-                    .filter(collections_groups::groups_uuid.eq(&group)),
-            )
-            .set(values)
-            .execute(conn)?;
-            if updated == 0 {
-                diesel::insert_into(collections_groups::table)
-                    .values((
-                        collections_groups::collections_uuid.eq(&collection),
-                        collections_groups::groups_uuid.eq(&group),
-                        values.0,
-                        values.1,
-                        values.2,
-                    ))
-                    .execute(conn)?;
-            }
-            diesel::delete(
-                keykeeper_collections_groups::table
-                    .filter(keykeeper_collections_groups::collections_uuid.eq(&collection))
-                    .filter(keykeeper_collections_groups::groups_uuid.eq(&group)),
-            )
-            .execute(conn)?;
-            if let Some(e) = extra {
-                diesel::insert_into(keykeeper_collections_groups::table)
-                    .values(GroupRow {
-                        collections_uuid: collection.clone(),
-                        groups_uuid: group.clone(),
-                        read_only: e.upstream.0,
-                        hide_passwords: e.upstream.1,
-                        manage: e.upstream.2,
-                        can_create: e.create,
-                        can_delete: e.delete,
-                        can_export: e.export,
-                        can_share: e.share,
-                        can_print: e.print,
-                        can_view_history: e.view_history,
-                    })
-                    .execute(conn)?;
-            }
-            Ok::<_, diesel::result::Error>(())
-        })
-        .map_res("Error saving a shared folder's permissions")
+    conn.transaction(|conn| {
+        // Upstream's row, inserted or replaced (upstream's CollectionGroup::save).
+        let values = (
+            collections_groups::read_only.eq(read_only),
+            collections_groups::hide_passwords.eq(hide_passwords),
+            collections_groups::manage.eq(manage),
+        );
+        crate::on_its_database!(
+            conn,
+            diesel::insert_into(collections_groups::table)
+                .values((
+                    collections_groups::collections_uuid.eq(collection),
+                    collections_groups::groups_uuid.eq(group),
+                    values.0,
+                    values.1,
+                    values.2,
+                ))
+                .on_conflict((collections_groups::collections_uuid, collections_groups::groups_uuid))
+                .do_update()
+                .set(values)
+                .execute(conn)
+        )?;
+        diesel::delete(
+            keykeeper_collections_groups::table
+                .filter(keykeeper_collections_groups::collections_uuid.eq(collection))
+                .filter(keykeeper_collections_groups::groups_uuid.eq(group)),
+        )
+        .execute(conn)?;
+        if let Some(e) = extra {
+            diesel::insert_into(keykeeper_collections_groups::table)
+                .values(GroupRow {
+                    collections_uuid: collection.clone(),
+                    groups_uuid: group.clone(),
+                    read_only: e.upstream.0,
+                    hide_passwords: e.upstream.1,
+                    manage: e.upstream.2,
+                    can_create: e.create,
+                    can_delete: e.delete,
+                    can_export: e.export,
+                    can_share: e.share,
+                    can_print: e.print,
+                    can_view_history: e.view_history,
+                })
+                .execute(conn)?;
+        }
+        Ok(())
     })
-    .await
 }
 
 /// What one person can do in their organizations' shared folders.
@@ -1141,4 +1148,92 @@ mod tests {
         assert!(technician.manages_any(&org, &HashSet::from([a])));
         assert!(!technician.manages_any(&org, &HashSet::from([b])));
     }
+}
+
+/// Saving grants while another request saves the same one.
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use crate::db::{
+        DbPool,
+        models::{Collection, Organization},
+    };
+
+    /// How long the other request takes to commit its save: far longer than
+    /// a save takes, and far less than SQLite's busy timeout (5 seconds).
+    const ANOTHER_SAVE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// A drop folder: add items, nothing else. Not a preset, so its save
+    /// writes our row too.
+    const DROP_FOLDER: Grid = Grid {
+        see_passwords: true,
+        create: true,
+        view_history: true,
+        ..Grid::NONE
+    };
+
+    /// A reference folder: edit what's there, never add or delete. Not a
+    /// preset either, and other upstream fields than the drop folder's.
+    const REFERENCE: Grid = Grid {
+        see_passwords: true,
+        edit: true,
+        print: true,
+        view_history: true,
+        ..Grid::NONE
+    };
+
+    async fn folder(conn: &DbConn) -> (OrganizationId, CollectionId) {
+        let acme = Organization::new("Acme".to_owned(), "billing@example.test", None, None);
+        acme.save(conn).await.unwrap();
+        let folder = Collection::new(acme.uuid.clone(), "2.aXY=|Y3Q=|bWFj".to_owned(), None);
+        folder.save(conn).await.unwrap();
+        (acme.uuid, folder.uuid)
+    }
+
+    /// Someone given a folder they had no grant to, by two requests at once
+    /// (two admins, or one admin's two tabs): one has written the grant and
+    /// hasn't committed yet when the other comes. The second waits for the
+    /// first and replaces it, upstream's row and ours, as saves one after
+    /// the other do, instead of failing with "Error saving a shared folder's
+    /// permissions": on PostgreSQL, both found no grant to update, both
+    /// inserted, and the second met the first's key.
+    async fn a_persons_first_grants_at_once(pool: DbPool) {
+        let conn = pool.get().await.unwrap();
+        let (_, folder) = folder(&conn).await;
+        let mut ana = User::new("ana@example.test", None);
+        ana.save(&conn).await.unwrap();
+
+        let other = pool.another_request().await;
+        let (who, which) = (ana.uuid.clone(), folder.clone());
+        other.run(move |conn| write_user_grant(conn, &who, &which, &DROP_FOLDER)).await.unwrap();
+        let committed = other.commit_after(ANOTHER_SAVE);
+        let saved = save_user(&ana.uuid, &folder, &REFERENCE, &conn).await;
+        committed.await.unwrap();
+        assert_eq!(saved.map_err(|e| e.message().to_owned()), Ok(()), "the second waits for the first, and is saved");
+        let stored = Stored::of_collection(&folder, &conn).await.unwrap();
+        assert_eq!(stored.user(&ana.uuid, &folder), Some(REFERENCE));
+    }
+
+    /// The same for a group's first grant to a folder. Nobody is in the group
+    /// yet, so its save writes nothing before its transaction: with people
+    /// in it, it first marks their vaults changed, writes of their own.
+    async fn a_groups_first_grants_at_once(pool: DbPool) {
+        let conn = pool.get().await.unwrap();
+        let (acme, folder) = folder(&conn).await;
+        let mut staff = Group::new(acme.clone(), "Staff".to_owned(), false, None);
+        staff.save(&conn).await.unwrap();
+
+        let other = pool.another_request().await;
+        let (which, group) = (folder.clone(), staff.uuid.clone());
+        other.run(move |conn| write_group_grant(conn, &which, &group, &DROP_FOLDER)).await.unwrap();
+        let committed = other.commit_after(ANOTHER_SAVE);
+        let saved = save_group(&folder, &staff.uuid, &acme, &REFERENCE, &conn).await;
+        committed.await.unwrap();
+        assert_eq!(saved.map_err(|e| e.message().to_owned()), Ok(()), "the second waits for the first, and is saved");
+        let stored = Stored::of_collection(&folder, &conn).await.unwrap();
+        assert_eq!(stored.group(&folder, &staff.uuid), Some(REFERENCE));
+    }
+
+    crate::on_each_database!(persons_first_grants, 2, a_persons_first_grants_at_once);
+    crate::on_each_database!(groups_first_grants, 2, a_groups_first_grants_at_once);
 }
