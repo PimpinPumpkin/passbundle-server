@@ -1,12 +1,12 @@
 // Keykeeper: approving a sign-in from another device, upstream's "log in with
 // device" (accounts.rs, the auth-request endpoints). A device the account
 // already knows asks to sign in; one of the account's devices that signed in
-// with the master password sends it the user key, wrapped to the request's
-// own public key, which the server stores and never opens. What's ours: the
-// 15 minutes everything stops at, a device's new request replacing its last,
-// at most a few waiting per account, the shapes the server stores, and which
-// sessions may approve. See DESIGN.md, "Approving a sign-in from another
-// device".
+// with the master password or single sign-on sends it the user key, wrapped
+// to the request's own public key, which the server stores and never opens.
+// What's ours: the 15 minutes everything stops at, a device's new request
+// replacing its last, at most a few waiting per account, the shapes the
+// server stores, and which sessions may approve. See DESIGN.md, "Approving a
+// sign-in from another device".
 
 use data_encoding::BASE64;
 use rocket::{
@@ -33,12 +33,16 @@ use crate::{
 pub struct SignInMethod(Option<AuthMethod>);
 
 impl SignInMethod {
-    /// Whether the session signed in with the master password: not with a
-    /// device's approval, an API key, or SSO (which has its own
-    /// trusted-device design to come). Only such a session approves a
-    /// sign-in.
-    pub fn is_master_password(&self) -> bool {
-        self.0 == Some(AuthMethod::Password)
+    /// Whether the session may approve a "Sign in with a device" request,
+    /// sending the user key: one that signed in with the master password, or
+    /// with an organization's single sign-on, which only proves who's signing
+    /// in (the vault still opens with the master password, so such a session
+    /// holds the same user key). Not a session a device's approval began, so
+    /// one mistaken approval doesn't spread; not an API key's; and not one
+    /// that doesn't say. The clients ask the person to confirm it's them
+    /// before they send the key, as for a password session.
+    pub fn may_approve_sign_in(&self) -> bool {
+        matches!(self.0, Some(AuthMethod::Password | AuthMethod::Sso))
     }
 
     /// Whether the person proved who they are to start this session: with
@@ -202,12 +206,36 @@ mod tests {
     }
 
     #[test]
-    fn only_a_master_password_session_approves() {
-        assert!(SignInMethod(Some(AuthMethod::Password)).is_master_password());
-        for method in [AuthMethod::AuthRequest, AuthMethod::Sso, AuthMethod::UserApiKey, AuthMethod::OrgApiKey] {
-            assert!(!SignInMethod(Some(method)).is_master_password());
+    fn a_password_or_sso_session_approves_a_sign_in() {
+        for method in [AuthMethod::Password, AuthMethod::Sso] {
+            assert!(SignInMethod(Some(method)).may_approve_sign_in());
         }
-        assert!(!SignInMethod(None).is_master_password());
+        for method in [AuthMethod::AuthRequest, AuthMethod::UserApiKey, AuthMethod::OrgApiKey] {
+            assert!(!SignInMethod(Some(method)).may_approve_sign_in());
+        }
+        assert!(!SignInMethod(None).may_approve_sign_in());
+    }
+
+    #[test]
+    fn the_session_an_approval_began_never_approves_whatever_else_it_may_do() {
+        // It answers a new device's sign-in (no key moves), but never sends
+        // the user key on, and never uses emergency access.
+        let from_approval = SignInMethod(Some(AuthMethod::AuthRequest));
+        assert!(from_approval.may_approve_new_device());
+        assert!(!from_approval.may_approve_sign_in());
+        assert!(!from_approval.proved_who_they_are());
+    }
+
+    #[test]
+    fn the_access_tokens_words_for_how_a_session_signed_in() {
+        // `keykeeper_signin` as the access token carries it: "sso" is what an
+        // organization's single sign-on puts there (identity.rs).
+        for (said, approves) in
+            [("password", true), ("sso", true), ("authrequest", false), ("userapikey", false), ("orgapikey", false)]
+        {
+            let method: Option<AuthMethod> = serde_json::from_value(json!(said)).unwrap();
+            assert_eq!(SignInMethod(method).may_approve_sign_in(), approves, "{said}");
+        }
     }
 
     #[test]

@@ -249,7 +249,7 @@ pub struct LoginJwtClaims {
 
     // Keykeeper: how this session signed in, as its refresh token keeps it
     // (the master password, a device's approval, SSO, or an API key). Only a
-    // session that signed in with the master password approves another
+    // session that signed in with the master password or SSO approves another
     // device's sign-in (DESIGN.md, "Approving a sign-in from another
     // device"); one that doesn't say (None) can't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
