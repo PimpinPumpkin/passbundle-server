@@ -5,8 +5,9 @@
 // to the request's own public key, which the server stores and never opens.
 // What's ours: the 15 minutes everything stops at, a device's new request
 // replacing its last, at most a few waiting per account, the shapes the
-// server stores, and which sessions may approve. See DESIGN.md, "Approving a
-// sign-in from another device".
+// server stores, which sessions may approve, and no approval taken that its
+// sign-in couldn't use. See DESIGN.md, "Approving a sign-in from another
+// device".
 
 use data_encoding::BASE64;
 use rocket::{
@@ -158,6 +159,31 @@ pub async fn approved_sign_in_rules(user: &User, _device: &Device, conn: &DbConn
     keykeeper_two_step::check_approved_sign_in(user, conn).await
 }
 
+/// What the person approving is told when the account must sign in with an
+/// organization's single sign-on (`approval_can_sign_in`): why, and what to
+/// do on the device that asked instead, whichever it is (a browser, our apps,
+/// or the command-line tool).
+pub const SSO_REQUIRED_APPROVAL: &str = "Your organization requires single sign-on, so an approval can't sign that device in. On that device, sign in with single sign-on instead.";
+
+/// Whether an approval could sign the device that asked in, checked when it's
+/// approved (accounts.rs, put_auth_request), before any key is taken. Someone
+/// an organization requires to sign in with its single sign-on is sent there
+/// at the sign-in, approval or not (`approved_sign_in_rules`), so an approval
+/// for them would never be used: the person approving would see it approved,
+/// the device that asked would be refused, and the user key, wrapped to that
+/// device, would be handed to it for a sign-in the server refuses. So it's
+/// refused here, with what to do instead, and nothing is kept; the request
+/// waits as before, and denying it is open as always. The check at the sign-in stays, for a
+/// requirement that starts after the approval. It's the same account on both
+/// devices (a request is the account's own), so it says nothing the person
+/// approving doesn't know.
+pub async fn approval_can_sign_in(user: &User, conn: &DbConn) -> EmptyResult {
+    if keykeeper_sso::required_identifier(&user.uuid, conn).await.is_some() {
+        err!(SSO_REQUIRED_APPROVAL)
+    }
+    Ok(())
+}
+
 /// For the server's request log: a request's answer is read with its access
 /// code in the address (`?code=`), so that path is logged without it, with or
 /// without a slash at the end.
@@ -299,6 +325,78 @@ mod tests {
         assert!(redacts("/api/auth-requests/6f1c2b0e-0000-4000-8000-000000000001/response"));
         assert!(!redacts("/api/auth-requests/pending"));
         assert!(!redacts("/api/auth-requests/6f1c2b0e-0000-4000-8000-000000000001"));
+    }
+
+    /// Someone who has joined `org` as `atype`, with that status.
+    async fn joined(
+        name: &str,
+        atype: crate::db::models::MembershipType,
+        status: crate::db::models::MembershipStatus,
+        org: &crate::db::models::OrganizationId,
+        conn: &DbConn,
+    ) -> User {
+        let mut user = User::new(&format!("{name}@contoso.example.test"), None);
+        user.save(conn).await.unwrap();
+        let mut member = crate::db::models::Membership::new(user.uuid.clone(), org.clone(), None);
+        member.atype = atype as i32;
+        member.status = status as i32;
+        member.save(conn).await.unwrap();
+        user
+    }
+
+    #[rocket::async_test]
+    async fn an_approval_for_someone_who_must_use_single_sign_on_is_refused_with_what_to_do_instead() {
+        use crate::db::{
+            DbPool,
+            models::{MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, SsoConfig},
+        };
+        let conn = DbPool::for_test().await;
+        let org = Organization::new("Contoso".to_owned(), "billing@contoso.example.test", None, None);
+        org.save(&conn).await.unwrap();
+        let member = joined("gus", MembershipType::User, MembershipStatus::Confirmed, &org.uuid, &conn).await;
+        let accepted = joined("ana", MembershipType::Admin, MembershipStatus::Accepted, &org.uuid, &conn).await;
+        let owner = joined("owner", MembershipType::Owner, MembershipStatus::Confirmed, &org.uuid, &conn).await;
+        let invited = joined("lee", MembershipType::User, MembershipStatus::Invited, &org.uuid, &conn).await;
+        let everyone = [&member, &accepted, &owner, &invited];
+
+        // Single sign-on set up, not required: every approval is taken.
+        let mut sso = SsoConfig::new(org.uuid.clone(), "owner@contoso.example.test");
+        sso.enabled = true;
+        sso.identifier = "contoso".to_owned();
+        sso.tenant_id = "tenant".to_owned();
+        sso.client_id = "client".to_owned();
+        sso.client_secret = Some("sealed".to_owned());
+        sso.save(&conn).await.unwrap();
+        for user in everyone {
+            assert!(approval_can_sign_in(user, &conn).await.is_ok(), "{}", user.email);
+        }
+
+        // Required: members who joined are refused, with what to do instead,
+        // as a plain 400. The owner, whom it never binds, and someone only
+        // invited, still approve.
+        let mut required = OrgPolicy::new(org.uuid.clone(), OrgPolicyType::RequireSso, true, "null".to_owned());
+        required.save(&conn).await.unwrap();
+        for user in [&member, &accepted] {
+            let refused = approval_can_sign_in(user, &conn).await.unwrap_err();
+            assert_eq!(refused.message(), SSO_REQUIRED_APPROVAL, "{}", user.email);
+            assert_eq!(refused.status_code(), 400);
+        }
+        for user in [&owner, &invited] {
+            assert!(approval_can_sign_in(user, &conn).await.is_ok(), "{}", user.email);
+        }
+
+        // Single sign-on turned off, or the requirement off: taken again.
+        sso.enabled = false;
+        sso.save(&conn).await.unwrap();
+        assert!(approval_can_sign_in(&member, &conn).await.is_ok());
+        sso.enabled = true;
+        sso.save(&conn).await.unwrap();
+        assert!(approval_can_sign_in(&member, &conn).await.is_err());
+        required.enabled = false;
+        required.save(&conn).await.unwrap();
+        for user in everyone {
+            assert!(approval_can_sign_in(user, &conn).await.is_ok(), "{}", user.email);
+        }
     }
 
     #[test]
