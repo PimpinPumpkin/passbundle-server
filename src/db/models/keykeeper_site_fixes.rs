@@ -189,16 +189,8 @@ impl SiteFix {
         conn.run(move |conn| {
             crate::db::write_locked(conn, lock_reporter(&user), |conn| {
                 let now = Utc::now().naive_utc();
-                let found = site_fixes::table
-                    .filter(site_fixes::host.eq(&fix.host))
-                    .filter(site_fixes::field_id.eq(&fix.field.id))
-                    .filter(site_fixes::field_name.eq(&fix.field.name))
-                    .filter(site_fixes::field_label.eq(&fix.field.label))
-                    .filter(site_fixes::fill.eq(&fix.fill))
-                    .first::<SiteFix>(conn)
-                    .optional()?;
-                let uuid = if let Some(row) = found {
-                    row.uuid
+                let uuid = if let Some(uuid) = find_fix(conn, &fix)? {
+                    uuid
                 } else {
                     let row = SiteFix {
                         uuid: get_uuid(),
@@ -212,9 +204,29 @@ impl SiteFix {
                         last_seen: now,
                         approved_at: None,
                     };
-                    diesel::insert_into(site_fixes::table).values(&row).execute(conn)?;
-                    forget_unconfirmed(conn)?;
-                    row.uuid
+                    // Someone else may be sending the same new fix at this
+                    // moment: then this insert waits for theirs and leaves it
+                    // (site_fixes_key), and this person is counted on theirs.
+                    let inserted = crate::on_its_database!(
+                        conn,
+                        diesel::insert_into(site_fixes::table)
+                            .values(&row)
+                            .on_conflict((
+                                site_fixes::host,
+                                site_fixes::field_id,
+                                site_fixes::field_name,
+                                site_fixes::field_label,
+                                site_fixes::fill,
+                            ))
+                            .do_nothing()
+                            .execute(conn)
+                    )?;
+                    if inserted == 0 {
+                        find_fix(conn, &fix)?.ok_or(diesel::result::Error::NotFound)?
+                    } else {
+                        forget_unconfirmed(conn)?;
+                        row.uuid
+                    }
                 };
                 let hash = reporter_hash(key, &user, &uuid);
                 let seen = site_fix_reporters::table
@@ -293,13 +305,26 @@ impl SiteFix {
     }
 }
 
+/// The id of the fix stored as `fix`, if there's one.
+fn find_fix(conn: &mut crate::db::DbConnInner, fix: &Fix) -> Result<Option<String>, diesel::result::Error> {
+    site_fixes::table
+        .filter(site_fixes::host.eq(&fix.host))
+        .filter(site_fixes::field_id.eq(&fix.field.id))
+        .filter(site_fixes::field_name.eq(&fix.field.name))
+        .filter(site_fixes::field_label.eq(&fix.field.label))
+        .filter(site_fixes::fill.eq(&fix.fill))
+        .select(site_fixes::uuid)
+        .first::<String>(conn)
+        .optional()
+}
+
 /// `SiteFix::record`'s lock on PostgreSQL: the reporter's own account row,
 /// locked for update, so one person's reports go one at a time and count
 /// them once, even when their apps send the same fix at the same moment. A
 /// fix nobody has sent yet has no row to lock: two people sending the same
-/// new fix at the same moment can still meet its unique key there, and the
-/// second is answered with an error. On SQLite the transaction holds the
-/// write lock already.
+/// new fix at the same moment both insert it, and the second's insert waits
+/// for the first's and leaves it (`record`). On SQLite the transaction holds
+/// the write lock already.
 fn lock_reporter(user: &UserId) -> impl FnOnce(&mut crate::db::DbConnInner) -> Result<(), diesel::result::Error> + '_ {
     move |conn| {
         #[cfg(not(postgresql))]
@@ -749,4 +774,47 @@ mod record_tests {
         let reporters = conn.run(|conn| site_fixes::table.select(site_fixes::reporters).load::<i32>(conn)).await;
         assert_eq!(reporters.unwrap(), [1]);
     }
+}
+
+/// Recording a new fix while someone else sends the same one.
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use crate::db::{DbPool, models::User};
+
+    /// How long the other request takes to commit: far longer than recording
+    /// a fix takes, and far less than SQLite's busy timeout (5 seconds).
+    const ANOTHER_SEND: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Two people send the same fix nobody had sent, at the same moment: one
+    /// has recorded it and hasn't committed yet when the other comes. The
+    /// second waits for the first and is counted on the same fix, instead of
+    /// failing with "Error recording a site fix": on PostgreSQL, both found
+    /// no such fix, both inserted it, and the second met the first's key
+    /// (site_fixes_key).
+    async fn two_people_send_a_new_fix_at_once(pool: DbPool) {
+        let v: Value = serde_json::from_str(include_str!("vectors/server-derived-keys-v1.json")).unwrap();
+        init_reporter_key(&data_encoding::BASE64.decode(v["rsaPkcs1Der"].as_str().unwrap().as_bytes()).unwrap());
+        let conn = pool.get().await.unwrap();
+        let mut ana = User::new("ana@example.test", None);
+        ana.save(&conn).await.unwrap();
+        let mut ben = User::new("ben@example.test", None);
+        ben.save(&conn).await.unwrap();
+        let field = FixField {
+            id: "custno".into(),
+            ..FixField::default()
+        };
+        let fix = Fix::checked("bank.example.com", &field, "username").unwrap();
+
+        let other = pool.another_request().await;
+        SiteFix::record(&fix, &ana.uuid, &other).await.unwrap();
+        let committed = other.commit_after(ANOTHER_SEND);
+        let recorded = SiteFix::record(&fix, &ben.uuid, &conn).await;
+        committed.await.unwrap();
+        recorded.map_err(|e| e.message().to_owned()).expect("the second waits for the first, and is counted");
+        let reporters = conn.run(|conn| site_fixes::table.select(site_fixes::reporters).load::<i32>(conn)).await;
+        assert_eq!(reporters.unwrap(), [2], "one fix, sent by two people");
+    }
+
+    crate::on_each_database!(a_new_fix_sent_twice_at_once, 2, two_people_send_a_new_fix_at_once);
 }
