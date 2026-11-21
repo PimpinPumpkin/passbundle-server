@@ -3,7 +3,7 @@ A sign-in on a new device was denied
 {{#if wrong_number}}A sign-in to your PassBundle account on a new device was denied, because the number typed on your other device didn't match.{{else}}A sign-in to your PassBundle account on a new device was denied from one of your devices.{{/if}}
 
 * Device: {{device}}
-* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}
+{{#if location_database}}* Where: {{#if location}}{{location}} (address {{ip}}){{else}}Unknown location (address {{ip}}){{/if}}{{else}}* Address: {{ip}}{{/if}}
 * When: {{datetime}}
 {{#if location_source}}
 

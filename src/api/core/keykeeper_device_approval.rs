@@ -13,6 +13,7 @@ use rocket::{
     Request,
     request::{FromRequest, Outcome},
 };
+use serde_json::Value;
 
 use crate::{
     api::{
@@ -103,6 +104,20 @@ pub fn valid_approval_key(key: &str) -> bool {
     key.strip_prefix("4.")
         .and_then(|b64| BASE64.decode(b64.as_bytes()).ok())
         .is_some_and(|ciphertext| (128..=512).contains(&ciphertext.len()))
+}
+
+/// A request's answer to the account's own devices, with where the request
+/// comes from added for their prompts, in the new-device check's fields and
+/// words: `location`, roughly where its address is ("Berlin, Germany", or
+/// null for an address the database doesn't have, or a private one), and
+/// `locationSource`, who to credit beside it. Both null without the
+/// server's own location database (`keykeeper_location::shown`), the only
+/// source: no other service is asked. A hint for the person, never a check:
+/// nothing is refused because of it. Upstream's fields stay as they are.
+pub fn with_location(mut answer: Value, (location, source): (Option<String>, Option<Value>)) -> Value {
+    answer["location"] = json!(location);
+    answer["locationSource"] = json!(source);
+    answer
 }
 
 /// Whether a sign-in with an approved request comes from the device that
@@ -211,6 +226,44 @@ mod tests {
         assert!(!is_requesting_device(&request, Some(&other), 9));
         assert!(!is_requesting_device(&request, Some(&phone), 10));
         assert!(!is_requesting_device(&request, None, 9));
+    }
+
+    #[test]
+    fn a_requests_answer_says_where_it_comes_from_only_with_a_location_file() {
+        use crate::keykeeper_location::{shown_from, tests::TestFile};
+        let upstream = json!({
+            "id": "6f1c2b0e-0000-4000-8000-000000000001",
+            "requestDeviceType": "Chrome",
+            "requestIpAddress": "203.0.113.7",
+            "object": "auth-request",
+        });
+        let file = TestFile::new("device-approval");
+        let credit = json!({ "name": "IP Geolocation by DB-IP", "url": "https://db-ip.com" });
+
+        let located = with_location(upstream.clone(), shown_from(file.path(), "203.0.113.7"));
+        assert_eq!(located["location"], json!("Berlin, Germany"));
+        assert_eq!(located["locationSource"], credit);
+        // Upstream's fields stay as they were, and upstream's own country
+        // field isn't filled: its dialog would show it without the credit.
+        for field in ["id", "requestDeviceType", "requestIpAddress", "object"] {
+            assert_eq!(located[field], upstream[field], "{field}");
+        }
+        assert!(located.get("requestCountryName").is_none());
+
+        // An address the database can't place: no location, still the credit.
+        let private = with_location(upstream.clone(), shown_from(file.path(), "10.1.2.3"));
+        assert_eq!(private["location"], Value::Null);
+        assert_eq!(private["locationSource"], credit);
+
+        // No location file: both null, and nothing else changes.
+        let missing = file.path().with_file_name("missing.mmdb");
+        let without = with_location(upstream.clone(), shown_from(&missing, "203.0.113.7"));
+        assert_eq!(without["location"], Value::Null);
+        assert_eq!(without["locationSource"], Value::Null);
+        let mut rest = without.as_object().unwrap().clone();
+        rest.remove("location");
+        rest.remove("locationSource");
+        assert_eq!(Value::Object(rest), upstream);
     }
 
     #[test]

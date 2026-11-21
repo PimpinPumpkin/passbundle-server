@@ -32,7 +32,7 @@ use crate::{
 
 use super::{
     ciphers::{CipherData, update_cipher_from_data},
-    keykeeper_device_approval::{SignInMethod, valid_access_code, valid_approval_key, valid_public_key},
+    keykeeper_device_approval::{SignInMethod, valid_access_code, valid_approval_key, valid_public_key, with_location},
     sends::SendData,
 };
 
@@ -1899,21 +1899,26 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
 
     let response_date_utc = auth_request.response_date.map(|response_date| format_date(&response_date));
 
-    Ok(Json(json!({
-        "id": &auth_request_id,
-        "publicKey": auth_request.public_key,
-        "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
-        "requestDeviceIdentifier": auth_request.request_device_identifier,
-        "requestIpAddress": auth_request.request_ip,
-        "key": auth_request.enc_key,
-        // Keykeeper: never a master password hash.
-        "masterPasswordHash": null,
-        "creationDate": format_date(&auth_request.creation_date),
-        "responseDate": response_date_utc,
-        "requestApproved": auth_request.approved,
-        "origin": CONFIG.domain_origin(),
-        "object":"auth-request"
-    })))
+    // Keykeeper: and where it comes from, for the approval prompt
+    // (keykeeper_device_approval::with_location).
+    Ok(Json(with_location(
+        json!({
+            "id": &auth_request_id,
+            "publicKey": auth_request.public_key,
+            "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
+            "requestDeviceIdentifier": auth_request.request_device_identifier,
+            "requestIpAddress": auth_request.request_ip,
+            "key": auth_request.enc_key,
+            // Keykeeper: never a master password hash.
+            "masterPasswordHash": null,
+            "creationDate": format_date(&auth_request.creation_date),
+            "responseDate": response_date_utc,
+            "requestApproved": auth_request.approved,
+            "origin": CONFIG.domain_origin(),
+            "object":"auth-request"
+        }),
+        crate::keykeeper_location::shown(&auth_request.request_ip),
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2085,20 +2090,25 @@ async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult
             .map(|request| {
             let response_date_utc = request.response_date.map(|response_date| format_date(&response_date));
 
-            json!({
-                "id": request.uuid,
-                "publicKey": request.public_key,
-                "requestDeviceType": DeviceType::from_i32(request.device_type).to_string(),
-                "requestDeviceIdentifier": request.request_device_identifier,
-                "requestIpAddress": request.request_ip,
-                "key": request.enc_key,
-                "masterPasswordHash": null,
-                "creationDate": format_date(&request.creation_date),
-                "responseDate": response_date_utc,
-                "requestApproved": request.approved,
-                "origin": CONFIG.domain_origin(),
-                "object":"auth-request"
-            })
+            // Keykeeper: and where each comes from, for the approval prompt
+            // (keykeeper_device_approval::with_location).
+            with_location(
+                json!({
+                    "id": request.uuid,
+                    "publicKey": request.public_key,
+                    "requestDeviceType": DeviceType::from_i32(request.device_type).to_string(),
+                    "requestDeviceIdentifier": request.request_device_identifier,
+                    "requestIpAddress": request.request_ip,
+                    "key": request.enc_key,
+                    "masterPasswordHash": null,
+                    "creationDate": format_date(&request.creation_date),
+                    "responseDate": response_date_utc,
+                    "requestApproved": request.approved,
+                    "origin": CONFIG.domain_origin(),
+                    "object":"auth-request"
+                }),
+                crate::keykeeper_location::shown(&request.request_ip),
+            )
         }).collect::<Vec<Value>>(),
         "continuationToken": null,
         "object": "list"

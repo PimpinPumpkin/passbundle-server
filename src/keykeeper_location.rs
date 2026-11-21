@@ -1,7 +1,8 @@
 //! PassBundle: roughly where an address is (country, and city when known),
 //! from an IP-to-location database file on this server's own disk, for the
-//! new-device check's prompt, its emails, and the event log (DESIGN.md,
-//! "New-device check", "Where a sign-in comes from").
+//! new-device check's prompt, its emails, the event log, and "Sign in with a
+//! device" requests (DESIGN.md, "New-device check", "Where a sign-in comes
+//! from").
 //!
 //! Nothing is ever asked of another service: without the file
 //! (`IP_LOCATION_DATABASE`) there's no location, and nothing else changes.
@@ -59,36 +60,31 @@ pub fn describe(ip: &str) -> Option<String> {
 
 /// Where this address is, or None.
 pub fn locate(ip: &IpAddr) -> Option<Location> {
-    let ip = unmapped(ip);
-    if unknown_range(&ip) {
-        return None;
-    }
-    let mut state = STATE.lock().ok()?;
-    state.refresh(Path::new(&CONFIG.ip_location_database()));
-    if let Some(found) = state.cache.get(&ip) {
-        return found.clone();
-    }
-    let found = state.db.as_ref().and_then(|db| db.lookup(&ip).ok().flatten());
-    if state.cache.len() >= CACHE_SIZE {
-        state.cache.clear();
-    }
-    state.cache.insert(ip, found.clone());
-    found
+    STATE.lock().ok()?.locate(Path::new(&CONFIG.ip_location_database()), ip)
 }
 
 /// Who the locations come from, to credit next to each one shown
 /// (`IP_LOCATION_ATTRIBUTION` and `_URL`, DB-IP's by default, as its CC BY
 /// 4.0 license asks), or None when there's no database.
 pub fn attribution() -> Option<Value> {
-    let mut state = STATE.lock().ok()?;
-    state.refresh(Path::new(&CONFIG.ip_location_database()));
-    state.db.as_ref()?;
-    let name = CONFIG.ip_location_attribution();
-    if name.trim().is_empty() {
-        return None;
+    STATE.lock().ok()?.attribution(Path::new(&CONFIG.ip_location_database()))
+}
+
+/// Where an address is, in words, and who to credit for it, as an answer to
+/// the account's own devices gives them (`location` and `locationSource`):
+/// the location is None for an address the database doesn't have, or a
+/// private one, and both are None without a database.
+pub fn shown(ip: &str) -> (Option<String>, Option<Value>) {
+    match STATE.lock() {
+        Ok(mut state) => state.shown(Path::new(&CONFIG.ip_location_database()), ip),
+        Err(_) => (None, None),
     }
-    let url = CONFIG.ip_location_attribution_url();
-    Some(json!({ "name": name, "url": if url.trim().is_empty() { None } else { Some(url) } }))
+}
+
+/// `shown`, from the database at `path` instead of the server's, for tests.
+#[cfg(test)]
+pub fn shown_from(path: &Path, ip: &str) -> (Option<String>, Option<Value>) {
+    State::new().shown(path, ip)
 }
 
 /// An IPv4-mapped IPv6 address as its IPv4 address.
@@ -148,17 +144,55 @@ struct State {
     cache: HashMap<IpAddr, Option<Location>>,
 }
 
-static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
-    Mutex::new(State {
-        db: None,
-        path: PathBuf::new(),
-        stamp: None,
-        checked: None,
-        cache: HashMap::new(),
-    })
-});
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::new()));
 
 impl State {
+    fn new() -> Self {
+        State {
+            db: None,
+            path: PathBuf::new(),
+            stamp: None,
+            checked: None,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Where this address is, from the database at `path`, or None.
+    fn locate(&mut self, path: &Path, ip: &IpAddr) -> Option<Location> {
+        let ip = unmapped(ip);
+        if unknown_range(&ip) {
+            return None;
+        }
+        self.refresh(path);
+        if let Some(found) = self.cache.get(&ip) {
+            return found.clone();
+        }
+        let found = self.db.as_ref().and_then(|db| db.lookup(&ip).ok().flatten());
+        if self.cache.len() >= CACHE_SIZE {
+            self.cache.clear();
+        }
+        self.cache.insert(ip, found.clone());
+        found
+    }
+
+    /// Who to credit, when there's a database at `path`.
+    fn attribution(&mut self, path: &Path) -> Option<Value> {
+        self.refresh(path);
+        self.db.as_ref()?;
+        let name = CONFIG.ip_location_attribution();
+        if name.trim().is_empty() {
+            return None;
+        }
+        let url = CONFIG.ip_location_attribution_url();
+        Some(json!({ "name": name, "url": if url.trim().is_empty() { None } else { Some(url) } }))
+    }
+
+    /// Where `ip` is, in words, and who to credit, from the database at `path`.
+    fn shown(&mut self, path: &Path, ip: &str) -> (Option<String>, Option<Value>) {
+        let location = ip.trim().parse().ok().and_then(|ip: IpAddr| self.locate(path, &ip));
+        (location.map(|l| l.display()), self.attribution(path))
+    }
+
     /// Opens the database, or a new one in its place, at most once a minute.
     fn refresh(&mut self, path: &Path) {
         if self.path == path && self.checked.is_some_and(|at| at.elapsed() < RECHECK) {
@@ -967,5 +1001,46 @@ pub mod tests {
         assert_eq!(db.lookup(&ip("203.0.113.9")).unwrap().unwrap().display(), "Berlin, Germany");
         std::fs::remove_dir_all(&dir).ok();
         assert!(Database::open(&dir.join("missing.mmdb")).is_err());
+    }
+
+    /// A database file at `name` in a folder of its own, removed with it.
+    pub struct TestFile(PathBuf);
+
+    impl TestFile {
+        pub fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("kk-location-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("ip-location.mmdb");
+            std::fs::write(&path, build(&sample(), 6, 28)).unwrap();
+            TestFile(path)
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                std::fs::remove_dir_all(dir).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn what_an_answer_shows_comes_from_the_file_and_credits_it() {
+        let file = TestFile::new("shown");
+        let credit = json!({ "name": "IP Geolocation by DB-IP", "url": "https://db-ip.com" });
+        assert_eq!(shown_from(file.path(), "203.0.113.7"), (Some("Berlin, Germany".into()), Some(credit.clone())));
+        assert_eq!(shown_from(file.path(), "198.51.100.4"), (Some("Canada".into()), Some(credit.clone())));
+        // An address it doesn't have, a private one, and what isn't an
+        // address: no location, but the credit, since there's a database.
+        for ip in ["192.0.2.1", "10.1.2.3", "127.0.0.1", "not an address", ""] {
+            assert_eq!(shown_from(file.path(), ip), (None, Some(credit.clone())), "{ip}");
+        }
+        // Without the file: nothing.
+        let missing = file.path().with_file_name("missing.mmdb");
+        assert_eq!(shown_from(&missing, "203.0.113.7"), (None, None));
     }
 }
